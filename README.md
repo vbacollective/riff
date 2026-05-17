@@ -19,6 +19,8 @@
   <img src="https://img.shields.io/badge/Assembly-x86%20%26%20x64%20Thunks-red.svg" alt="Assembly" />
   <img src="https://img.shields.io/badge/dependencies-none-success.svg" alt="Dependencies" />
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
+  <img src="https://img.shields.io/github/v/release/uesleibros/riff" alt="Latest Version" />
+  <img src="https://img.shields.io/github/stars/uesleibros/riff?style=flat&color=gold" alt="Stars" />
 </p>
 
 > [!NOTE]
