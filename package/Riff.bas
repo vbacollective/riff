@@ -3,18 +3,15 @@ Attribute VB_Name = "Riff"
 ' * Riff - Audio Engine (Studio DSP Edition)
 ' * @description A high-performance, COM-based WASAPI audio engine for VBA (x86/x64 compatible).
 ' * Contains advanced Array Chunking for zero-latency mixing, Polyphony, and a full
-' * Studio DSP Pipeline featuring Reverb, Chorus, Flanger, Compressor, 3-Band EQ, Bitcrusher,
-' * RingMod, AutoPan, Delay, Oscillators, In-Memory Loading, Buses, and Peak Meters.
+' * Studio DSP Pipeline featuring Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad EQ, Bitcrusher,
+' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, and Peak Meters.
 ' * @author UesleiDev
-' * @version 1.0.1
+' * @version 1.0.2
 ' */
 
 Option Explicit
 Option Private Module
 
-' ========================================================================================
-' API DECLARATIONS: MEMORY, WINDOWS, AND COM INTEROP
-' ========================================================================================
 
 #If VBA7 Then
     '/** @description Allocates physical memory pages. */
@@ -37,6 +34,9 @@ Option Private Module
     
     '/** @description Calls a window procedure (used for callbacks). */
     Private Declare PtrSafe Function CallWindowProcW Lib "user32" (ByVal lpPrevWndFunc As LongPtr, ByVal hWnd As LongPtr, ByVal Msg As Long, ByVal wParam As LongPtr, ByVal lParam As LongPtr) As LongPtr
+    
+    '/** @description Generic native pointer call shim for optimized x64 COM v-table calls. */
+    Private Declare PtrSafe Function RiffCallPtr4 Lib "user32" Alias "CallWindowProcW" (ByVal lpPrevWndFunc As LongPtr, ByVal a0 As LongPtr, ByVal a1 As LongPtr, ByVal a2 As LongPtr, ByVal a3 As LongPtr) As LongPtr
     
     '/** @description Creates a COM object instance. */
     Private Declare PtrSafe Function CoCreateInstance Lib "ole32" (ByRef rclsid As Any, ByVal pUnkOuter As LongPtr, ByVal dwClsContext As Long, ByRef riid As Any, ByRef ppv As LongPtr) As Long
@@ -118,7 +118,7 @@ Option Private Module
         MasterVolume As Single
         MasterPeakL As Single
         MasterPeakR As Single
-        SampleRate As Long
+        sampleRate As Long
         AvgBytesPerSec As Long
         DeviceEnumerator As LongPtr
         Device As LongPtr
@@ -152,6 +152,9 @@ Option Private Module
     
     '/** @description Calls a window procedure (used for callbacks). */
     Private Declare Function CallWindowProcW Lib "user32" (ByVal lpPrevWndFunc As Long, ByVal hWnd As Long, ByVal Msg As Long, ByVal wParam As Long, ByVal lParam As Long) As Long
+    
+    '/** @description Generic native pointer call shim for optimized COM v-table calls. */
+    Private Declare Function RiffCallPtr4 Lib "user32" Alias "CallWindowProcW" (ByVal lpPrevWndFunc As Long, ByVal a0 As Long, ByVal a1 As Long, ByVal a2 As Long, ByVal a3 As Long) As Long
     
     '/** @description Creates a COM object instance. */
     Private Declare Function CoCreateInstance Lib "ole32" (ByRef rclsid As Any, ByVal pUnkOuter As Long, ByVal dwClsContext As Long, ByRef riid As Any, ByRef ppv As Long) As Long
@@ -233,7 +236,7 @@ Option Private Module
         MasterVolume As Single
         MasterPeakL As Single
         MasterPeakR As Single
-        SampleRate As Long
+        sampleRate As Long
         AvgBytesPerSec As Long
         DeviceEnumerator As Long
         Device As Long
@@ -259,23 +262,19 @@ Private Type RiffVoice
     busID As Long
     BufferIndex As Long
     
-    ' --- Generators ---
     IsOscillator As Boolean
     OscType As Long
     OscFreq As Single
     OscPhase As Double
     
-    ' --- Master Metrics ---
     PeakL As Single
     PeakR As Single
     
-    ' --- Basic Control ---
     Position As Double
     Volume As Single
     Pitch As Double
     Pan As Single
     
-    ' --- DSP Pipeline States ---
     AutoPanRate As Single
     AutoPanDepth As Single
     AutoPanPhase As Double
@@ -296,8 +295,8 @@ Private Type RiffVoice
     EqStateHighL As Single
     EqStateHighR As Single
     
-    LowPass As Single
-    HighPass As Single
+    lowPass As Single
+    highPass As Single
     FilterStateL As Single
     FilterStateR As Single
     FilterStateHP_L As Single
@@ -328,6 +327,35 @@ Private Type RiffVoice
     RevTap2 As Long
     RevTap3 As Long
     RevTap4 As Long
+    RevDamp1L As Single
+    RevDamp1R As Single
+    RevDamp2L As Single
+    RevDamp2R As Single
+    RevDamp3L As Single
+    RevDamp3R As Single
+    RevDamp4L As Single
+    RevDamp4R As Single
+    
+    BqLowPassZ1L As Single
+    BqLowPassZ2L As Single
+    BqLowPassZ1R As Single
+    BqLowPassZ2R As Single
+    BqHighPassZ1L As Single
+    BqHighPassZ2L As Single
+    BqHighPassZ1R As Single
+    BqHighPassZ2R As Single
+    EqBassZ1L As Single
+    EqBassZ2L As Single
+    EqBassZ1R As Single
+    EqBassZ2R As Single
+    EqMidZ1L As Single
+    EqMidZ2L As Single
+    EqMidZ1R As Single
+    EqMidZ2R As Single
+    EqTrebleZ1L As Single
+    EqTrebleZ2L As Single
+    EqTrebleZ1R As Single
+    EqTrebleZ2R As Single
     
     DelayTime As Single
     DelayFeedback As Single
@@ -339,7 +367,6 @@ Private Type RiffVoice
     
     RingWritePos As Long
     
-    ' --- Loop and Fade Control ---
     Looping As Boolean
     loopStart As Double
     loopEnd As Double
@@ -417,9 +444,6 @@ Private rVoices(0 To 31) As RiffVoice
 ' */
 Private rRingBuf() As Single
 
-' ========================================================================================
-' PUBLIC API: INITIALIZATION AND TEARDOWN
-' ========================================================================================
 
 '/**
 ' * @function RiffOpen
@@ -431,40 +455,39 @@ Public Function RiffOpen() As Boolean
         RiffOpen = True
         Exit Function
     End If
-    
+
     rCtx.MagicCookie = &H52494646
     rCtx.MasterVolume = 1!
     rCtx.MasterPeakL = 0!
     rCtx.MasterPeakR = 0!
-    
+
     Dim i As Long
     For i = 0 To 7
         rCtx.Buses(i) = 1!
     Next i
-    
+
     If Not InitThunks() Then
         Exit Function
     End If
-    
+
     If MFStartup(MF_VERSION, 0) <> 0 Then
+        FreeThunks
         Exit Function
     End If
-    
+
     If Not InitWASAPI() Then
         ReleaseWASAPI
         MFShutdown
         FreeThunks
         Exit Function
     End If
-    
-    ' Allocate 32 contiguous buffers (192,000 samples each) in a strictly 1D array.
-    ' This prevents the VBA Column-Major alignment issue on RtlZeroMemory.
-    ReDim rRingBuf(0 To (32 * 192000) - 1)
-    
+
+    ReDim rRingBuf(0 To (32 * 192000) + 1)
+
     timeBeginPeriod 1
-    
+
     rCtx.TimerID = SetTimer(0, 0, 15, rCtx.ThunkTimerCB)
-    
+
     If rCtx.TimerID = 0 Then
         timeEndPeriod 1
         ReleaseWASAPI
@@ -472,7 +495,7 @@ Public Function RiffOpen() As Boolean
         FreeThunks
         Exit Function
     End If
-    
+
     rCtx.Initialized = True
     RiffOpen = True
 End Function
@@ -514,9 +537,6 @@ Public Sub RiffClose()
     rCtx.Initialized = False
 End Sub
 
-' ========================================================================================
-' PUBLIC API: GLOBAL SETTINGS & ASSET MANAGEMENT
-' ========================================================================================
 
 '/**
 ' * @property RiffIsInitialized
@@ -718,7 +738,13 @@ Public Function RiffLoadFromMemory(ByRef audioData() As Byte) As Long
     #End If
     
     Dim cbSize As Long
+    On Error Resume Next
     cbSize = UBound(audioData) - LBound(audioData) + 1
+    If Err.Number <> 0 Then
+        Err.Clear
+        Exit Function
+    End If
+    On Error GoTo 0
     
     If cbSize <= 0 Then
         Exit Function
@@ -833,13 +859,10 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
     
     Dim rArgs(0 To 5) As Variant
     Dim rTypes(0 To 5) As Integer
-    
     Dim cArgs(0) As Variant
     Dim cTypes(0) As Integer
-    
     Dim lArgs(0 To 2) As Variant
     Dim lTypes(0 To 2) As Integer
-    
     Dim vRet As Variant
     Dim hrInvoke As Long
     Dim i As Long
@@ -882,7 +905,7 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
     Dim totalSize As Long
     Dim currentCap As Long
     
-    currentCap = 1048576 * 50
+    currentCap = 1048576
     tempPtr = VirtualAlloc(0, currentCap, MEM_COMMIT Or MEM_RESERVE, PAGE_READWRITE)
     
     If tempPtr = 0 Then
@@ -906,22 +929,10 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
         End If
         
         If pSample <> 0 Then
-            hrInvoke = DispCallFunc(pSample, 41 * pSz, CC_STDCALL, vbLong, 1, cTypes(0), cPtrs(0), vRet)
-            
-            If hrInvoke <> 0 Then
-                hr = hrInvoke
-            Else
-                hr = CLng(vRet)
-            End If
+            hr = vCall(pSample, 41, VarPtr(pBuffer))
             
             If hr = 0 And pBuffer <> 0 Then
-                hrInvoke = DispCallFunc(pBuffer, 3 * pSz, CC_STDCALL, vbLong, 3, lTypes(0), lPtrs(0), vRet)
-                
-                If hrInvoke <> 0 Then
-                    hr = hrInvoke
-                Else
-                    hr = CLng(vRet)
-                End If
+                hr = vCall(pBuffer, 3, VarPtr(pAudioData), VarPtr(cbMax), VarPtr(cbLen))
                 
                 If hr = 0 And pAudioData <> 0 And cbLen > 0 Then
                     If totalSize + cbLen > currentCap Then
@@ -940,13 +951,15 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
                         totalSize = totalSize + cbLen
                     End If
                     
-                    DispCallFunc pBuffer, 4 * pSz, CC_STDCALL, vbLong, 0, ByVal 0&, ByVal 0&, vRet
+                    vCall pBuffer, 4
                 End If
-                
-                DispCallFunc pBuffer, 2 * pSz, CC_STDCALL, vbLong, 0, ByVal 0&, ByVal 0&, vRet
             End If
             
-            DispCallFunc pSample, 2 * pSz, CC_STDCALL, vbLong, 0, ByVal 0&, ByVal 0&, vRet
+            If pBuffer <> 0 Then
+                vCall pBuffer, 2
+            End If
+            
+            vCall pSample, 2
         End If
     Loop
     
@@ -1013,11 +1026,301 @@ Public Property Get RiffBufferDurationSec(ByVal bufferHandle As Long) As Single
     End If
     
     RiffBufferDurationSec = CSng(rCtx.Buffers(bufferHandle).BufferLen) / CSng(rCtx.AvgBytesPerSec)
+
 End Property
 
-' ========================================================================================
-' PUBLIC API: PLAYBACK & VOICE ACTIONS
-' ========================================================================================
+'/**
+' * @function RiffExportBufferWav
+' * @brief Exports a loaded buffer as a standard 16-bit stereo PCM WAV file.
+' * @param bufferHandle Loaded buffer handle.
+' * @param filePath Target WAV path.
+' * @return {Boolean} True when the file was written successfully.
+' */
+Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath As String) As Boolean
+    If Not rCtx.Initialized Then
+        Exit Function
+    End If
+    If bufferHandle < 0 Or bufferHandle > 63 Then
+        Exit Function
+    End If
+    If Not rCtx.Buffers(bufferHandle).Active Then
+        Exit Function
+    End If
+    If LenB(filePath) = 0 Then
+        Exit Function
+    End If
+
+    Dim nChannels As Integer
+    Dim nBlockAlign As Integer
+    Dim wBits As Integer
+    Dim sampleRate As Long
+    Dim frames As Long
+    Dim dataBytes As Long
+    Dim outBytes() As Byte
+    Dim frame As Long
+    Dim outIndex As Long
+    Dim sL As Single
+    Dim sR As Single
+    Dim iL As Integer
+    Dim iR As Integer
+    Dim isFloat As Boolean
+
+    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + 2), 2
+    RtlMoveMemory VarPtr(sampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
+    RtlMoveMemory VarPtr(nBlockAlign), ByVal (rCtx.MixFormatPtr + 12), 2
+    RtlMoveMemory VarPtr(wBits), ByVal (rCtx.MixFormatPtr + 14), 2
+
+    If nChannels <= 0 Or nBlockAlign <= 0 Or sampleRate <= 0 Then
+        Exit Function
+    End If
+
+    frames = rCtx.Buffers(bufferHandle).BufferLen \ CLng(nBlockAlign)
+    If frames <= 0 Then
+        Exit Function
+    End If
+
+    isFloat = RiffMixFormatIsFloat32()
+    dataBytes = frames * 4
+    ReDim outBytes(0 To dataBytes - 1)
+
+    For frame = 0 To frames - 1
+        sL = RiffReadInterleavedSample(rCtx.Buffers(bufferHandle).BufferPtr, frame, 0, nChannels, nBlockAlign, wBits, isFloat)
+        If nChannels > 1 Then
+            sR = RiffReadInterleavedSample(rCtx.Buffers(bufferHandle).BufferPtr, frame, 1, nChannels, nBlockAlign, wBits, isFloat)
+        Else
+            sR = sL
+        End If
+
+        iL = RiffFloatToPcm16(sL)
+        iR = RiffFloatToPcm16(sR)
+        outIndex = frame * 4
+        RtlMoveMemory VarPtr(outBytes(outIndex)), VarPtr(iL), 2
+        RtlMoveMemory VarPtr(outBytes(outIndex + 2)), VarPtr(iR), 2
+    Next frame
+
+    RiffExportBufferWav = RiffWritePcm16StereoWav(filePath, sampleRate, outBytes)
+End Function
+
+'/**
+' * @function RiffRenderOscillatorWav
+' * @brief Renders a band-limited oscillator directly to a 16-bit stereo PCM WAV file.
+' * @param waveType 0=Sine, 1=Square, 2=Sawtooth, 3=Noise.
+' * @param frequencyHz Oscillator frequency in Hz.
+' * @param durationSec Render duration in seconds.
+' * @param filePath Target WAV path.
+' * @return {Boolean} True when the file was written successfully.
+' */
+Public Function RiffRenderOscillatorWav(ByVal waveType As Long, ByVal frequencyHz As Single, ByVal durationSec As Single, ByVal filePath As String) As Boolean
+    If Not rCtx.Initialized Then
+        Exit Function
+    End If
+    If durationSec <= 0! Then
+        Exit Function
+    End If
+    If frequencyHz < 1! Then
+        frequencyHz = 440!
+    End If
+    If waveType < 0 Then
+        waveType = 0
+    End If
+    If waveType > 3 Then
+        waveType = 3
+    End If
+
+    Dim frames As Long
+    Dim outBytes() As Byte
+    Dim frame As Long
+    Dim outIndex As Long
+    Dim phase As Double
+    Dim dt As Double
+    Dim sample As Single
+    Dim pcm As Integer
+
+    frames = CLng(durationSec * rCtx.sampleRate)
+    If frames <= 0 Then
+        Exit Function
+    End If
+
+    ReDim outBytes(0 To (frames * 4) - 1)
+    dt = CDbl(frequencyHz) / CDbl(rCtx.sampleRate)
+
+    For frame = 0 To frames - 1
+        sample = RiffOscillatorSampleAtPhase(waveType, phase, dt)
+        pcm = RiffFloatToPcm16(sample * 0.75!)
+        outIndex = frame * 4
+        RtlMoveMemory VarPtr(outBytes(outIndex)), VarPtr(pcm), 2
+        RtlMoveMemory VarPtr(outBytes(outIndex + 2)), VarPtr(pcm), 2
+        phase = phase + dt
+        If phase >= 1# Then
+            phase = phase - Int(phase)
+        End If
+    Next frame
+
+    RiffRenderOscillatorWav = RiffWritePcm16StereoWav(filePath, rCtx.sampleRate, outBytes)
+End Function
+
+'/**
+' * @function RiffFloatToPcm16
+' * @brief Converts a normalized float sample to signed 16-bit PCM.
+' */
+Private Function RiffFloatToPcm16(ByVal value As Single) As Integer
+    If value > 1! Then
+        value = 1!
+    ElseIf value < -1! Then
+        value = -1!
+    End If
+
+    If value >= 0! Then
+        RiffFloatToPcm16 = CInt(value * 32767!)
+    Else
+        RiffFloatToPcm16 = CInt(value * 32768!)
+    End If
+End Function
+
+'/**
+' * @function RiffReadInterleavedSample
+' * @brief Reads a sample from an interleaved PCM/float buffer and normalizes it to -1.0..1.0.
+' */
+#If VBA7 Then
+Private Function RiffReadInterleavedSample(ByVal basePtr As LongPtr, ByVal frameIndex As Long, ByVal channelIndex As Long, ByVal nChannels As Integer, ByVal nBlockAlign As Integer, ByVal wBits As Integer, ByVal isFloat As Boolean) As Single
+#Else
+Private Function RiffReadInterleavedSample(ByVal basePtr As Long, ByVal frameIndex As Long, ByVal channelIndex As Long, ByVal nChannels As Integer, ByVal nBlockAlign As Integer, ByVal wBits As Integer, ByVal isFloat As Boolean) As Single
+#End If
+    #If VBA7 Then
+        Dim pSample As LongPtr
+    #Else
+        Dim pSample As Long
+    #End If
+
+    pSample = basePtr + (CLng(frameIndex) * CLng(nBlockAlign)) + ((CLng(channelIndex) Mod CLng(nChannels)) * (CLng(wBits) \ 8))
+
+    If wBits = 32 And isFloat Then
+        Dim f As Single
+        RtlMoveMemory VarPtr(f), ByVal pSample, 4
+        RiffReadInterleavedSample = f
+    ElseIf wBits = 32 Then
+        Dim l As Long
+        RtlMoveMemory VarPtr(l), ByVal pSample, 4
+        RiffReadInterleavedSample = CSng(CDbl(l) / 2147483648#)
+    ElseIf wBits = 24 Then
+        Dim b0 As Byte
+        Dim b1 As Byte
+        Dim b2 As Byte
+        Dim v As Long
+        RtlMoveMemory VarPtr(b0), ByVal pSample, 1
+        RtlMoveMemory VarPtr(b1), ByVal (pSample + 1), 1
+        RtlMoveMemory VarPtr(b2), ByVal (pSample + 2), 1
+        v = CLng(b0) Or (CLng(b1) * &H100&) Or (CLng(b2) * &H10000)
+        If (b2 And &H80) <> 0 Then
+            v = v Or -16777216
+        End If
+        RiffReadInterleavedSample = CSng(CDbl(v) / 8388608#)
+    ElseIf wBits = 16 Then
+        Dim i As Integer
+        RtlMoveMemory VarPtr(i), ByVal pSample, 2
+        RiffReadInterleavedSample = CSng(CDbl(i) / 32768#)
+    End If
+End Function
+
+'/**
+' * @function RiffWritePcm16StereoWav
+' * @brief Writes a 16-bit stereo PCM WAV file from an interleaved byte buffer.
+' */
+Private Function RiffWritePcm16StereoWav(ByVal filePath As String, ByVal sampleRate As Long, ByRef dataBytes() As Byte) As Boolean
+    On Error GoTo Fail
+
+    Dim f As Integer
+    Dim dataSize As Long
+    Dim riffSize As Long
+    Dim byteRate As Long
+    Dim blockAlign As Integer
+    Dim bits As Integer
+    Dim channels As Integer
+    Dim fmtSize As Long
+    Dim audioFormat As Integer
+
+    dataSize = UBound(dataBytes) - LBound(dataBytes) + 1
+    riffSize = 36 + dataSize
+    channels = 2
+    bits = 16
+    blockAlign = 4
+    byteRate = sampleRate * CLng(blockAlign)
+    fmtSize = 16
+    audioFormat = 1
+
+    f = FreeFile
+    Open filePath For Binary Access Write As #f
+    Put #f, , CByte(Asc("R"))
+    Put #f, , CByte(Asc("I"))
+    Put #f, , CByte(Asc("F"))
+    Put #f, , CByte(Asc("F"))
+    Put #f, , riffSize
+    Put #f, , CByte(Asc("W"))
+    Put #f, , CByte(Asc("A"))
+    Put #f, , CByte(Asc("V"))
+    Put #f, , CByte(Asc("E"))
+    Put #f, , CByte(Asc("f"))
+    Put #f, , CByte(Asc("m"))
+    Put #f, , CByte(Asc("t"))
+    Put #f, , CByte(Asc(" "))
+    Put #f, , fmtSize
+    Put #f, , audioFormat
+    Put #f, , channels
+    Put #f, , sampleRate
+    Put #f, , byteRate
+    Put #f, , blockAlign
+    Put #f, , bits
+    Put #f, , CByte(Asc("d"))
+    Put #f, , CByte(Asc("a"))
+    Put #f, , CByte(Asc("t"))
+    Put #f, , CByte(Asc("a"))
+    Put #f, , dataSize
+    Put #f, , dataBytes
+    Close #f
+
+    RiffWritePcm16StereoWav = True
+    Exit Function
+
+Fail:
+    On Error Resume Next
+    If f <> 0 Then
+        Close #f
+    End If
+End Function
+
+'/**
+' * @function RiffOscillatorSampleAtPhase
+' * @brief Generates one oscillator sample at a supplied normalized phase using BLEP correction where needed.
+' */
+Private Function RiffOscillatorSampleAtPhase(ByVal waveType As Long, ByVal phase As Double, ByVal dt As Double) As Single
+    Dim sample As Double
+
+    Select Case waveType
+        Case 0
+            sample = Sin(phase * PI2)
+        Case 1
+            If phase < 0.5 Then
+                sample = 1#
+            Else
+                sample = -1#
+            End If
+            sample = sample + RiffPolyBLEP(phase, dt)
+            Dim t2 As Double
+            t2 = phase + 0.5
+            If t2 >= 1# Then
+                t2 = t2 - 1#
+            End If
+            sample = sample - RiffPolyBLEP(t2, dt)
+        Case 2
+            sample = (2# * phase) - 1#
+            sample = sample - RiffPolyBLEP(phase, dt)
+        Case Else
+            sample = (Rnd() * 2!) - 1!
+    End Select
+
+    RiffOscillatorSampleAtPhase = CSng(sample)
+End Function
+
 
 '/**
 ' * @function RiffPlay
@@ -1133,16 +1436,16 @@ Private Sub InternalResetVoiceDSP(ByVal slot As Long)
     rVoices(slot).busID = 0
     rVoices(slot).PeakL = 0!
     rVoices(slot).PeakR = 0!
-    
+
     rVoices(slot).Distortion = 1!
-    rVoices(slot).LowPass = 1!
-    rVoices(slot).HighPass = 0!
+    rVoices(slot).lowPass = 1!
+    rVoices(slot).highPass = 0!
     rVoices(slot).FilterStateL = 0!
     rVoices(slot).FilterStateR = 0!
     rVoices(slot).FilterStateHP_L = 0!
     rVoices(slot).FilterStateHP_R = 0!
     rVoices(slot).StereoWidth = 1!
-    
+
     rVoices(slot).EqBass = 1!
     rVoices(slot).EqMid = 1!
     rVoices(slot).EqTreble = 1!
@@ -1150,55 +1453,85 @@ Private Sub InternalResetVoiceDSP(ByVal slot As Long)
     rVoices(slot).EqStateLowR = 0!
     rVoices(slot).EqStateHighL = 0!
     rVoices(slot).EqStateHighR = 0!
-    
+
     rVoices(slot).CompThreshold = 1!
     rVoices(slot).CompRatio = 1!
-    rVoices(slot).CompEnv = 0.0001! ' Prevent division by zero mathematically
-    
+    rVoices(slot).CompEnv = 0.0001!
+
     rVoices(slot).BitcrushSteps = 0!
     rVoices(slot).BitcrushDownsample = 1
     rVoices(slot).BitcrushDsCount = 0
     rVoices(slot).BitcrushLastL = 0!
     rVoices(slot).BitcrushLastR = 0!
-    
+
     rVoices(slot).RingModFreq = 0!
     rVoices(slot).RingModMix = 0!
     rVoices(slot).RingModPhase = 0#
-    
+
     rVoices(slot).TremoloRate = 0!
     rVoices(slot).TremoloDepth = 0!
     rVoices(slot).TremoloPhase = 0#
-    
+
     rVoices(slot).AutoPanRate = 0!
     rVoices(slot).AutoPanDepth = 0!
     rVoices(slot).AutoPanPhase = 0#
-    
+
     rVoices(slot).ChorusDepth = 0!
     rVoices(slot).ChorusRate = 1.5!
     rVoices(slot).ChorusPhase = 0#
-    
+
     rVoices(slot).FlangerRate = 0.5!
     rVoices(slot).FlangerDepth = 0!
     rVoices(slot).FlangerFeedback = 0!
     rVoices(slot).FlangerPhase = 0#
-    
+
     rVoices(slot).ReverbMix = 0!
     rVoices(slot).ReverbTime = 0.5!
-    rVoices(slot).RevTap1 = (Int(0.029 * rCtx.SampleRate) \ 2) * 2
-    rVoices(slot).RevTap2 = (Int(0.043 * rCtx.SampleRate) \ 2) * 2
-    rVoices(slot).RevTap3 = (Int(0.073 * rCtx.SampleRate) \ 2) * 2
-    rVoices(slot).RevTap4 = (Int(0.097 * rCtx.SampleRate) \ 2) * 2
-    
+    rVoices(slot).RevTap1 = Int(0.0297 * rCtx.sampleRate) * 2
+    rVoices(slot).RevTap2 = Int(0.0371 * rCtx.sampleRate) * 2
+    rVoices(slot).RevTap3 = Int(0.0411 * rCtx.sampleRate) * 2
+    rVoices(slot).RevTap4 = Int(0.0437 * rCtx.sampleRate) * 2
+    rVoices(slot).RevDamp1L = 0!
+    rVoices(slot).RevDamp1R = 0!
+    rVoices(slot).RevDamp2L = 0!
+    rVoices(slot).RevDamp2R = 0!
+    rVoices(slot).RevDamp3L = 0!
+    rVoices(slot).RevDamp3R = 0!
+    rVoices(slot).RevDamp4L = 0!
+    rVoices(slot).RevDamp4R = 0!
+
+    rVoices(slot).BqLowPassZ1L = 0!
+    rVoices(slot).BqLowPassZ2L = 0!
+    rVoices(slot).BqLowPassZ1R = 0!
+    rVoices(slot).BqLowPassZ2R = 0!
+    rVoices(slot).BqHighPassZ1L = 0!
+    rVoices(slot).BqHighPassZ2L = 0!
+    rVoices(slot).BqHighPassZ1R = 0!
+    rVoices(slot).BqHighPassZ2R = 0!
+    rVoices(slot).EqBassZ1L = 0!
+    rVoices(slot).EqBassZ2L = 0!
+    rVoices(slot).EqBassZ1R = 0!
+    rVoices(slot).EqBassZ2R = 0!
+    rVoices(slot).EqMidZ1L = 0!
+    rVoices(slot).EqMidZ2L = 0!
+    rVoices(slot).EqMidZ1R = 0!
+    rVoices(slot).EqMidZ2R = 0!
+    rVoices(slot).EqTrebleZ1L = 0!
+    rVoices(slot).EqTrebleZ2L = 0!
+    rVoices(slot).EqTrebleZ1R = 0!
+    rVoices(slot).EqTrebleZ2R = 0!
+
     rVoices(slot).DelayTime = 0!
     rVoices(slot).DelayFeedback = 0!
     rVoices(slot).DelayMix = 0!
     rVoices(slot).RingWritePos = 0
-    
+
     rVoices(slot).Looping = False
     rVoices(slot).loopStart = 0#
     rVoices(slot).fadeState = 0
-    
-    ' Zero the exact 1D mapped block associated with this voice
+    rVoices(slot).FadeFramesTotal = 0
+    rVoices(slot).FadeFramesCurrent = 0
+
     RtlZeroMemory VarPtr(rRingBuf(slot * 192000)), 192000 * 4
 End Sub
 
@@ -1272,7 +1605,7 @@ Public Sub RiffFadeIn(ByVal voiceHandle As Long, ByVal durationSec As Single)
         Exit Sub
     End If
     
-    rVoices(voiceHandle).FadeFramesTotal = CLng(durationSec * rCtx.SampleRate)
+    rVoices(voiceHandle).FadeFramesTotal = CLng(durationSec * rCtx.sampleRate)
     rVoices(voiceHandle).FadeFramesCurrent = 0
     rVoices(voiceHandle).fadeState = 1
 End Sub
@@ -1291,7 +1624,7 @@ Public Sub RiffFadeOut(ByVal voiceHandle As Long, ByVal durationSec As Single)
         Exit Sub
     End If
     
-    rVoices(voiceHandle).FadeFramesTotal = CLng(durationSec * rCtx.SampleRate)
+    rVoices(voiceHandle).FadeFramesTotal = CLng(durationSec * rCtx.sampleRate)
     rVoices(voiceHandle).FadeFramesCurrent = 0
     rVoices(voiceHandle).fadeState = 2
 End Sub
@@ -1323,6 +1656,12 @@ Public Sub RiffSetLoopRegionSec(ByVal voiceHandle As Long, ByVal startSec As Sin
     
     Dim bufHandle As Long
     bufHandle = rVoices(voiceHandle).BufferIndex
+    If bufHandle < 0 Or bufHandle > 63 Then
+        Exit Sub
+    End If
+    If Not rCtx.Buffers(bufHandle).Active Then
+        Exit Sub
+    End If
     
     If eByte > rCtx.Buffers(bufHandle).BufferLen Then
         eByte = rCtx.Buffers(bufHandle).BufferLen
@@ -1341,9 +1680,6 @@ Public Sub RiffSetLoopRegionSec(ByVal voiceHandle As Long, ByVal startSec As Sin
     rVoices(voiceHandle).loopEnd = eByte
 End Sub
 
-' ========================================================================================
-' PUBLIC API: VOICE PROPERTIES (DSP EFFECTS & STATE)
-' ========================================================================================
 
 '/**
 ' * @property RiffVoiceIsPlaying
@@ -1453,6 +1789,12 @@ Public Property Let RiffVoicePositionSec(ByVal voiceHandle As Long, ByVal value 
     
     Dim bufHandle As Long
     bufHandle = rVoices(voiceHandle).BufferIndex
+    If bufHandle < 0 Or bufHandle > 63 Then
+        Exit Property
+    End If
+    If Not rCtx.Buffers(bufHandle).Active Then
+        Exit Property
+    End If
     
     If posBytes >= rCtx.Buffers(bufHandle).BufferLen Then
         posBytes = rCtx.Buffers(bufHandle).BufferLen - 1
@@ -1533,9 +1875,6 @@ Public Property Let RiffVoicePan(ByVal voiceHandle As Long, ByVal value As Singl
     rVoices(voiceHandle).Pan = value
 End Property
 
-' ========================================================================================
-' DSP FILTERS API
-' ========================================================================================
 
 '/**
 ' * @property RiffVoiceBitDepth
@@ -1889,7 +2228,7 @@ Public Property Get RiffVoiceLowPass(ByVal voiceHandle As Long) As Single
     If Not rCtx.Initialized Or voiceHandle < 0 Or voiceHandle > 31 Then
         Exit Property
     End If
-    RiffVoiceLowPass = rVoices(voiceHandle).LowPass
+    RiffVoiceLowPass = rVoices(voiceHandle).lowPass
 End Property
 Public Property Let RiffVoiceLowPass(ByVal voiceHandle As Long, ByVal value As Single)
     If Not rCtx.Initialized Or voiceHandle < 0 Or voiceHandle > 31 Then
@@ -1901,7 +2240,7 @@ Public Property Let RiffVoiceLowPass(ByVal voiceHandle As Long, ByVal value As S
     If value > 1! Then
         value = 1!
     End If
-    rVoices(voiceHandle).LowPass = value
+    rVoices(voiceHandle).lowPass = value
 End Property
 
 '/**
@@ -1912,7 +2251,7 @@ Public Property Get RiffVoiceHighPass(ByVal voiceHandle As Long) As Single
     If Not rCtx.Initialized Or voiceHandle < 0 Or voiceHandle > 31 Then
         Exit Property
     End If
-    RiffVoiceHighPass = rVoices(voiceHandle).HighPass
+    RiffVoiceHighPass = rVoices(voiceHandle).highPass
 End Property
 Public Property Let RiffVoiceHighPass(ByVal voiceHandle As Long, ByVal value As Single)
     If Not rCtx.Initialized Or voiceHandle < 0 Or voiceHandle > 31 Then
@@ -1924,7 +2263,7 @@ Public Property Let RiffVoiceHighPass(ByVal voiceHandle As Long, ByVal value As 
     If value > 0.99! Then
         value = 0.99!
     End If
-    rVoices(voiceHandle).HighPass = value
+    rVoices(voiceHandle).highPass = value
 End Property
 
 '/**
@@ -2157,19 +2496,318 @@ Public Property Let RiffVoiceDelayMix(ByVal voiceHandle As Long, ByVal value As 
     rVoices(voiceHandle).DelayMix = value
 End Property
 
-' ========================================================================================
-' PRIVATE ENGINE CORE: HIGH-PERFORMANCE ARRAY CHUNKING CALLBACK
-' ========================================================================================
 
 '/**
 ' * @function RiffTimerCallback
 ' * @brief Core multimedia timer callback. Executes the DSP pipeline and writes to WASAPI.
-' *        Highly optimized to prevent zero-latency buffer underruns.
 ' * @param hWnd Window Handle (not used).
 ' * @param uMsg System Message (not used).
 ' * @param idEvent Timer Identifier (not used).
 ' * @param dwTime System Time (not used).
 ' */
+
+'/**
+' * @function RiffClamp
+' * @brief Bounds a floating-point value into a deterministic range for DSP safety.
+' */
+Private Function RiffClamp(ByVal value As Single, ByVal minValue As Single, ByVal maxValue As Single) As Single
+    If value < minValue Then
+        RiffClamp = minValue
+    ElseIf value > maxValue Then
+        RiffClamp = maxValue
+    Else
+        RiffClamp = value
+    End If
+End Function
+
+'/**
+' * @function RiffPolyBLEP
+' * @brief Produces a polynomial band-limiting correction at waveform discontinuities.
+' */
+Private Function RiffPolyBLEP(ByVal t As Double, ByVal dt As Double) As Single
+    If dt <= 0# Then
+        Exit Function
+    End If
+
+    If t < dt Then
+        t = t / dt
+        RiffPolyBLEP = CSng((t + t) - (t * t) - 1#)
+    ElseIf t > 1# - dt Then
+        t = (t - 1#) / dt
+        RiffPolyBLEP = CSng((t * t) + (t + t) + 1#)
+    Else
+        RiffPolyBLEP = 0!
+    End If
+End Function
+
+'/**
+' * @function RiffNextOscillatorSample
+' * @brief Generates one oscillator sample using BLEP band-limiting for discontinuous waveforms.
+' */
+Private Function RiffNextOscillatorSample(ByVal voiceIndex As Long) As Single
+    Dim dt As Double
+    Dim phase01 As Double
+    Dim sample As Single
+    Dim edge As Double
+
+    If rCtx.sampleRate <= 0 Then
+        Exit Function
+    End If
+
+    dt = CDbl(rVoices(voiceIndex).OscFreq) / CDbl(rCtx.sampleRate)
+    If dt <= 0# Then
+        dt = 440# / CDbl(rCtx.sampleRate)
+    End If
+    If dt > 0.5 Then
+        dt = 0.5
+    End If
+
+    phase01 = rVoices(voiceIndex).OscPhase / PI2
+    phase01 = phase01 - Fix(phase01)
+    If phase01 < 0# Then
+        phase01 = phase01 + 1#
+    End If
+
+    Select Case rVoices(voiceIndex).OscType
+        Case 0
+            sample = CSng(Sin(rVoices(voiceIndex).OscPhase))
+        Case 1
+            If phase01 < 0.5 Then
+                sample = 0.65!
+            Else
+                sample = -0.65!
+            End If
+            sample = sample + 0.65! * RiffPolyBLEP(phase01, dt)
+            edge = phase01 + 0.5
+            If edge >= 1# Then
+                edge = edge - 1#
+            End If
+            sample = sample - 0.65! * RiffPolyBLEP(edge, dt)
+        Case 2
+            sample = CSng((2# * phase01) - 1#)
+            sample = sample - RiffPolyBLEP(phase01, dt)
+            sample = sample * 0.65!
+        Case Else
+            sample = (Rnd() * 2!) - 1!
+    End Select
+
+    rVoices(voiceIndex).OscPhase = rVoices(voiceIndex).OscPhase + (dt * PI2)
+    If rVoices(voiceIndex).OscPhase >= PI2 Then
+        rVoices(voiceIndex).OscPhase = rVoices(voiceIndex).OscPhase - PI2
+    End If
+
+    RiffNextOscillatorSample = sample
+End Function
+
+'/**
+' * @function RiffBiquadProcess
+' * @brief Processes one sample through a transposed direct-form II biquad section.
+' */
+Private Function RiffBiquadProcess(ByVal inputSample As Single, ByRef z1 As Single, ByRef z2 As Single, ByVal b0 As Single, ByVal b1 As Single, ByVal b2 As Single, ByVal a1 As Single, ByVal a2 As Single) As Single
+    Dim y As Single
+
+    y = (b0 * inputSample) + z1
+    z1 = (b1 * inputSample) - (a1 * y) + z2
+    z2 = (b2 * inputSample) - (a2 * y)
+    RiffBiquadProcess = y
+End Function
+
+'/**
+' * @function RiffBiquadLowPassCoeffs
+' * @brief Calculates normalized second-order low-pass filter coefficients.
+' */
+Private Sub RiffBiquadLowPassCoeffs(ByVal cutoffHz As Single, ByVal q As Single, ByRef b0 As Single, ByRef b1 As Single, ByRef b2 As Single, ByRef a1 As Single, ByRef a2 As Single)
+    Dim omega As Double
+    Dim sn As Double
+    Dim cs As Double
+    Dim alpha As Double
+    Dim a0 As Double
+
+    cutoffHz = RiffClamp(cutoffHz, 20!, CSng(rCtx.sampleRate) * 0.45!)
+    q = RiffClamp(q, 0.1!, 12!)
+
+    omega = PI2 * CDbl(cutoffHz) / CDbl(rCtx.sampleRate)
+    sn = Sin(omega)
+    cs = Cos(omega)
+    alpha = sn / (2# * CDbl(q))
+    a0 = 1# + alpha
+
+    b0 = CSng(((1# - cs) * 0.5) / a0)
+    b1 = CSng((1# - cs) / a0)
+    b2 = b0
+    a1 = CSng((-2# * cs) / a0)
+    a2 = CSng((1# - alpha) / a0)
+End Sub
+
+'/**
+' * @function RiffBiquadHighPassCoeffs
+' * @brief Calculates normalized second-order high-pass filter coefficients.
+' */
+Private Sub RiffBiquadHighPassCoeffs(ByVal cutoffHz As Single, ByVal q As Single, ByRef b0 As Single, ByRef b1 As Single, ByRef b2 As Single, ByRef a1 As Single, ByRef a2 As Single)
+    Dim omega As Double
+    Dim sn As Double
+    Dim cs As Double
+    Dim alpha As Double
+    Dim a0 As Double
+
+    cutoffHz = RiffClamp(cutoffHz, 20!, CSng(rCtx.sampleRate) * 0.45!)
+    q = RiffClamp(q, 0.1!, 12!)
+
+    omega = PI2 * CDbl(cutoffHz) / CDbl(rCtx.sampleRate)
+    sn = Sin(omega)
+    cs = Cos(omega)
+    alpha = sn / (2# * CDbl(q))
+    a0 = 1# + alpha
+
+    b0 = CSng(((1# + cs) * 0.5) / a0)
+    b1 = CSng((-(1# + cs)) / a0)
+    b2 = b0
+    a1 = CSng((-2# * cs) / a0)
+    a2 = CSng((1# - alpha) / a0)
+End Sub
+
+'/**
+' * @function RiffBiquadPeakCoeffs
+' * @brief Calculates normalized parametric EQ coefficients for a single band.
+' */
+Private Sub RiffBiquadPeakCoeffs(ByVal freqHz As Single, ByVal q As Single, ByVal gain As Single, ByRef b0 As Single, ByRef b1 As Single, ByRef b2 As Single, ByRef a1 As Single, ByRef a2 As Single)
+    Dim omega As Double
+    Dim sn As Double
+    Dim cs As Double
+    Dim alpha As Double
+    Dim amp As Double
+    Dim a0 As Double
+
+    freqHz = RiffClamp(freqHz, 20!, CSng(rCtx.sampleRate) * 0.45!)
+    q = RiffClamp(q, 0.1!, 12!)
+    gain = RiffClamp(gain, 0.05!, 8!)
+
+    omega = PI2 * CDbl(freqHz) / CDbl(rCtx.sampleRate)
+    sn = Sin(omega)
+    cs = Cos(omega)
+    alpha = sn / (2# * CDbl(q))
+    amp = Sqr(CDbl(gain))
+    a0 = 1# + (alpha / amp)
+
+    b0 = CSng((1# + (alpha * amp)) / a0)
+    b1 = CSng((-2# * cs) / a0)
+    b2 = CSng((1# - (alpha * amp)) / a0)
+    a1 = CSng((-2# * cs) / a0)
+    a2 = CSng((1# - (alpha / amp)) / a0)
+End Sub
+
+'/**
+' * @function RiffProcessVoiceFilters
+' * @brief Applies biquad low-pass, high-pass, and three-band parametric EQ to one stereo sample.
+' */
+Private Sub RiffProcessVoiceFilters(ByVal voiceIndex As Long, ByRef leftSample As Single, ByRef rightSample As Single, ByVal lowPass As Single, ByVal highPass As Single, ByVal bassGain As Single, ByVal midGain As Single, ByVal trebleGain As Single)
+    Dim b0 As Single
+    Dim b1 As Single
+    Dim b2 As Single
+    Dim a1 As Single
+    Dim a2 As Single
+    Dim cutoff As Single
+
+    If rCtx.sampleRate <= 0 Then
+        Exit Sub
+    End If
+
+    If lowPass < 0.999! Then
+        cutoff = 40! + ((RiffClamp(lowPass, 0!, 1!) ^ 2!) * ((CSng(rCtx.sampleRate) * 0.45!) - 40!))
+        RiffBiquadLowPassCoeffs cutoff, 0.707!, b0, b1, b2, a1, a2
+        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).BqLowPassZ1L, rVoices(voiceIndex).BqLowPassZ2L, b0, b1, b2, a1, a2)
+        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).BqLowPassZ1R, rVoices(voiceIndex).BqLowPassZ2R, b0, b1, b2, a1, a2)
+    End If
+
+    If highPass > 0! Then
+        cutoff = 20! + ((RiffClamp(highPass, 0!, 1!) ^ 2!) * ((CSng(rCtx.sampleRate) * 0.35!) - 20!))
+        RiffBiquadHighPassCoeffs cutoff, 0.707!, b0, b1, b2, a1, a2
+        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).BqHighPassZ1L, rVoices(voiceIndex).BqHighPassZ2L, b0, b1, b2, a1, a2)
+        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).BqHighPassZ1R, rVoices(voiceIndex).BqHighPassZ2R, b0, b1, b2, a1, a2)
+    End If
+
+    If bassGain <> 1! Then
+        RiffBiquadPeakCoeffs 120!, 0.7!, bassGain, b0, b1, b2, a1, a2
+        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqBassZ1L, rVoices(voiceIndex).EqBassZ2L, b0, b1, b2, a1, a2)
+        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqBassZ1R, rVoices(voiceIndex).EqBassZ2R, b0, b1, b2, a1, a2)
+    End If
+
+    If midGain <> 1! Then
+        RiffBiquadPeakCoeffs 1000!, 1!, midGain, b0, b1, b2, a1, a2
+        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqMidZ1L, rVoices(voiceIndex).EqMidZ2L, b0, b1, b2, a1, a2)
+        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqMidZ1R, rVoices(voiceIndex).EqMidZ2R, b0, b1, b2, a1, a2)
+    End If
+
+    If trebleGain <> 1! Then
+        RiffBiquadPeakCoeffs 6500!, 0.7!, trebleGain, b0, b1, b2, a1, a2
+        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqTrebleZ1L, rVoices(voiceIndex).EqTrebleZ2L, b0, b1, b2, a1, a2)
+        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqTrebleZ1R, rVoices(voiceIndex).EqTrebleZ2R, b0, b1, b2, a1, a2)
+    End If
+End Sub
+
+'/**
+' * @function RiffRingRead
+' * @brief Reads one channel from the per-voice stereo delay line with wraparound.
+' */
+Private Function RiffRingRead(ByVal baseIndex As Long, ByVal readIndex As Long, ByVal channelOffset As Long) As Single
+    Do While readIndex < 0
+        readIndex = readIndex + 192000
+    Loop
+    If readIndex >= 192000 Then
+        readIndex = readIndex Mod 192000
+    End If
+    RiffRingRead = rRingBuf(baseIndex + readIndex + channelOffset)
+End Function
+
+'/**
+' * @function RiffProcessFreeverb
+' * @brief Applies a Freeverb-style damped comb network with stereo cross-feed.
+' */
+Private Sub RiffProcessFreeverb(ByVal voiceIndex As Long, ByVal baseIndex As Long, ByVal writeIndex As Long, ByVal mix As Single, ByVal decay As Single, ByRef leftSample As Single, ByRef rightSample As Single, ByRef feedbackLeft As Single, ByRef feedbackRight As Single)
+    Dim fb As Single
+    Dim damp As Single
+    Dim l1 As Single
+    Dim r1 As Single
+    Dim l2 As Single
+    Dim r2 As Single
+    Dim l3 As Single
+    Dim r3 As Single
+    Dim l4 As Single
+    Dim r4 As Single
+    Dim wetL As Single
+    Dim wetR As Single
+
+    fb = 0.68! + (RiffClamp(decay, 0!, 1!) * 0.28!)
+    damp = 0.18! + ((1! - RiffClamp(decay, 0!, 1!)) * 0.24!)
+    mix = RiffClamp(mix, 0!, 1!)
+
+    l1 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap1, 0)
+    r1 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap1, 1)
+    l2 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap2, 0)
+    r2 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap2, 1)
+    l3 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap3, 0)
+    r3 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap3, 1)
+    l4 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap4, 0)
+    r4 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap4, 1)
+
+    rVoices(voiceIndex).RevDamp1L = (l1 * (1! - damp)) + (rVoices(voiceIndex).RevDamp1L * damp)
+    rVoices(voiceIndex).RevDamp1R = (r1 * (1! - damp)) + (rVoices(voiceIndex).RevDamp1R * damp)
+    rVoices(voiceIndex).RevDamp2L = (l2 * (1! - damp)) + (rVoices(voiceIndex).RevDamp2L * damp)
+    rVoices(voiceIndex).RevDamp2R = (r2 * (1! - damp)) + (rVoices(voiceIndex).RevDamp2R * damp)
+    rVoices(voiceIndex).RevDamp3L = (l3 * (1! - damp)) + (rVoices(voiceIndex).RevDamp3L * damp)
+    rVoices(voiceIndex).RevDamp3R = (r3 * (1! - damp)) + (rVoices(voiceIndex).RevDamp3R * damp)
+    rVoices(voiceIndex).RevDamp4L = (l4 * (1! - damp)) + (rVoices(voiceIndex).RevDamp4L * damp)
+    rVoices(voiceIndex).RevDamp4R = (r4 * (1! - damp)) + (rVoices(voiceIndex).RevDamp4R * damp)
+
+    wetL = ((rVoices(voiceIndex).RevDamp1L + rVoices(voiceIndex).RevDamp2L + rVoices(voiceIndex).RevDamp3L + rVoices(voiceIndex).RevDamp4L) * 0.19!) + ((rVoices(voiceIndex).RevDamp2R + rVoices(voiceIndex).RevDamp4R) * 0.055!)
+    wetR = ((rVoices(voiceIndex).RevDamp1R + rVoices(voiceIndex).RevDamp2R + rVoices(voiceIndex).RevDamp3R + rVoices(voiceIndex).RevDamp4R) * 0.19!) + ((rVoices(voiceIndex).RevDamp1L + rVoices(voiceIndex).RevDamp3L) * 0.055!)
+
+    leftSample = leftSample + (wetL * mix)
+    rightSample = rightSample + (wetR * mix)
+    feedbackLeft = feedbackLeft + (wetL * fb)
+    feedbackRight = feedbackRight + (wetR * fb)
+End Sub
+
 #If VBA7 Then
 Private Sub RiffTimerCallback(ByVal hWnd As LongPtr, ByVal uMsg As Long, ByVal idEvent As LongPtr, ByVal dwTime As Long)
 #Else
@@ -2228,6 +2866,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
     Dim eqB As Single
     Dim eqM As Single
     Dim eqT As Single
+    Dim eqAlphaLow As Single
+    Dim eqAlphaHigh As Single
     
     Dim cmpThresh As Single
     Dim cmpRatio As Single
@@ -2309,6 +2949,9 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
     bytesToWrite = framesAvailable * CLng(nBlockAlign)
     align = CLng(nBlockAlign)
     
+    eqAlphaLow = 1! - Exp(-PI2 * 200! / CSng(rCtx.sampleRate))
+    eqAlphaHigh = 1! - Exp(-PI2 * 2000! / CSng(rCtx.sampleRate))
+    
     rCtx.MasterPeakL = rCtx.MasterPeakL * 0.9!
     rCtx.MasterPeakR = rCtx.MasterPeakR * 0.9!
     
@@ -2375,6 +3018,9 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             End If
                             If loopSnd Then
                                 remBytes = bytesNeeded - bytesAvail
+                                If remBytes > CLng(loopEnd - loopStart) Then
+                                    remBytes = CLng(loopEnd - loopStart)
+                                End If
                                 If remBytes > 0 Then
                                     RtlMoveMemoryToSingle srcArr32(bytesAvail \ 4), ByVal (ptr + CLng(loopStart)), remBytes
                                 End If
@@ -2384,8 +3030,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     End If
                     
                     dist = rVoices(i).Distortion
-                    lp = rVoices(i).LowPass
-                    hp = rVoices(i).HighPass
+                    lp = rVoices(i).lowPass
+                    hp = rVoices(i).highPass
                     sWidth = rVoices(i).StereoWidth
                     
                     eqB = rVoices(i).EqBass
@@ -2405,28 +3051,28 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     rmFreq = rVoices(i).RingModFreq
                     rmMix = rVoices(i).RingModMix
                     rmPhase = rVoices(i).RingModPhase
-                    rmStep = (PI2 * rmFreq) / CDbl(rCtx.SampleRate)
+                    rmStep = (PI2 * rmFreq) / CDbl(rCtx.sampleRate)
                     
                     trmRate = rVoices(i).TremoloRate
                     trmDepth = rVoices(i).TremoloDepth
                     trmPhase = rVoices(i).TremoloPhase
-                    trmStep = (PI2 * trmRate) / CDbl(rCtx.SampleRate)
+                    trmStep = (PI2 * trmRate) / CDbl(rCtx.sampleRate)
                     
                     apRate = rVoices(i).AutoPanRate
                     apDepth = rVoices(i).AutoPanDepth
                     apPhase = rVoices(i).AutoPanPhase
-                    apStep = (PI2 * apRate) / CDbl(rCtx.SampleRate)
+                    apStep = (PI2 * apRate) / CDbl(rCtx.sampleRate)
                     
                     cRate = rVoices(i).ChorusRate
                     cDepth = rVoices(i).ChorusDepth
                     cPhase = rVoices(i).ChorusPhase
-                    cStep = (PI2 * cRate) / CDbl(rCtx.SampleRate)
+                    cStep = (PI2 * cRate) / CDbl(rCtx.sampleRate)
                     
                     flgRate = rVoices(i).FlangerRate
                     flgDepth = rVoices(i).FlangerDepth
                     flgFB = rVoices(i).FlangerFeedback
                     flgPhase = rVoices(i).FlangerPhase
-                    flgStep = (PI2 * flgRate) / CDbl(rCtx.SampleRate)
+                    flgStep = (PI2 * flgRate) / CDbl(rCtx.sampleRate)
                     
                     rMix = rVoices(i).ReverbMix
                     rTime = rVoices(i).ReverbTime
@@ -2438,7 +3084,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     dTime = rVoices(i).DelayTime
                     dFB = rVoices(i).DelayFeedback
                     dMix = rVoices(i).DelayMix
-                    dSamples = (Int(dTime * rCtx.SampleRate) \ 2) * 2
+                    dSamples = Int(dTime * rCtx.sampleRate) * 2
                     dWrite = rVoices(i).RingWritePos
                     dBase = i * 192000
                     
@@ -2493,29 +3139,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             End If
                             
                             If rVoices(i).IsOscillator Then
-                                Dim oscStep As Double
-                                oscStep = (PI2 * rVoices(i).OscFreq) / CDbl(rCtx.SampleRate)
-                                
-                                Select Case rVoices(i).OscType
-                                    Case 0
-                                        fL = Sin(rVoices(i).OscPhase)
-                                    Case 1
-                                        If Sin(rVoices(i).OscPhase) >= 0 Then
-                                            fL = 0.5!
-                                        Else
-                                            fL = -0.5!
-                                        End If
-                                    Case 2
-                                        fL = 2! * (rVoices(i).OscPhase / PI2) - 1!
-                                    Case 3
-                                        fL = (Rnd() * 2!) - 1!
-                                End Select
+                                fL = RiffNextOscillatorSample(i)
                                 fR = fL
-                                
-                                rVoices(i).OscPhase = rVoices(i).OscPhase + oscStep
-                                If rVoices(i).OscPhase >= PI2 Then
-                                    rVoices(i).OscPhase = rVoices(i).OscPhase - PI2
-                                End If
                             Else
                                 Dim sID As Long
                                 sID = Int(srcIdx) * 2
@@ -2541,8 +3166,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             End If
                             
                             If bdSteps > 0! Then
-                                fL = Int(fL * bdSteps) / bdSteps
-                                fR = Int(fR * bdSteps) / bdSteps
+                                fL = Fix(fL * bdSteps) / bdSteps
+                                fR = Fix(fR * bdSteps) / bdSteps
                             End If
                             
                             fL = fL * dist
@@ -2559,37 +3184,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 fR = -1!
                             End If
                             
-                            rVoices(i).FilterStateL = rVoices(i).FilterStateL + lp * (fL - rVoices(i).FilterStateL)
-                            fL = rVoices(i).FilterStateL
-                            rVoices(i).FilterStateR = rVoices(i).FilterStateR + lp * (fR - rVoices(i).FilterStateR)
-                            fR = rVoices(i).FilterStateR
-                            
-                            If hp > 0! Then
-                                rVoices(i).FilterStateHP_L = rVoices(i).FilterStateHP_L + hp * (fL - rVoices(i).FilterStateHP_L)
-                                fL = fL - rVoices(i).FilterStateHP_L
-                                rVoices(i).FilterStateHP_R = rVoices(i).FilterStateHP_R + hp * (fR - rVoices(i).FilterStateHP_R)
-                                fR = fR - rVoices(i).FilterStateHP_R
-                            End If
-                            
-                            If eqB <> 1! Or eqM <> 1! Or eqT <> 1! Then
-                                rVoices(i).EqStateLowL = rVoices(i).EqStateLowL + 0.05! * (fL - rVoices(i).EqStateLowL)
-                                rVoices(i).EqStateHighL = rVoices(i).EqStateHighL + 0.4! * (fL - rVoices(i).EqStateHighL)
-                                rVoices(i).EqStateLowR = rVoices(i).EqStateLowR + 0.05! * (fR - rVoices(i).EqStateLowR)
-                                rVoices(i).EqStateHighR = rVoices(i).EqStateHighR + 0.4! * (fR - rVoices(i).EqStateHighR)
-                                
-                                Dim midL As Single
-                                Dim midR As Single
-                                Dim hiL As Single
-                                Dim hiR As Single
-                                
-                                midL = rVoices(i).EqStateHighL - rVoices(i).EqStateLowL
-                                midR = rVoices(i).EqStateHighR - rVoices(i).EqStateLowR
-                                hiL = fL - rVoices(i).EqStateHighL
-                                hiR = fR - rVoices(i).EqStateHighR
-                                
-                                fL = (rVoices(i).EqStateLowL * eqB) + (midL * eqM) + (hiL * eqT)
-                                fR = (rVoices(i).EqStateLowR * eqB) + (midR * eqM) + (hiR * eqT)
-                            End If
+                            RiffProcessVoiceFilters i, fL, fR, lp, hp, eqB, eqM, eqT
                             
                             If rmMix > 0! Then
                                 Dim rmOsc As Single
@@ -2633,7 +3228,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 Dim flgL As Single
                                 Dim flgR As Single
                                 
-                                fDel = (Int((0.002! + 0.005! * CSng(Sin(flgPhase))) * rCtx.SampleRate) \ 2) * 2
+                                fDel = Int((0.002! + 0.005! * CSng(Sin(flgPhase))) * rCtx.sampleRate) * 2
                                 fRd = dWrite - fDel
                                 If fRd < 0 Then
                                     fRd = fRd + 192000
@@ -2657,7 +3252,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 Dim cDelay As Long
                                 Dim cRead As Long
                                 
-                                cDelay = (Int((0.02! + 0.005! * CSng(Sin(cPhase))) * rCtx.SampleRate) \ 2) * 2
+                                cDelay = Int((0.02! + 0.005! * CSng(Sin(cPhase))) * rCtx.sampleRate) * 2
                                 cRead = dWrite - cDelay
                                 If cRead < 0 Then
                                     cRead = cRead + 192000
@@ -2690,40 +3285,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             End If
                             
                             If rMix > 0! Then
-                                Dim r1 As Long
-                                Dim r2 As Long
-                                Dim r3 As Long
-                                Dim r4 As Long
-                                Dim revL As Single
-                                Dim revR As Single
-                                
-                                r1 = dWrite - rt1
-                                If r1 < 0 Then
-                                    r1 = r1 + 192000
-                                End If
-                                
-                                r2 = dWrite - rt2
-                                If r2 < 0 Then
-                                    r2 = r2 + 192000
-                                End If
-                                
-                                r3 = dWrite - rt3
-                                If r3 < 0 Then
-                                    r3 = r3 + 192000
-                                End If
-                                
-                                r4 = dWrite - rt4
-                                If r4 < 0 Then
-                                    r4 = r4 + 192000
-                                End If
-                                
-                                revL = (rRingBuf(dBase + r1) + rRingBuf(dBase + r2) + rRingBuf(dBase + r3) + rRingBuf(dBase + r4)) * 0.25!
-                                revR = (rRingBuf(dBase + r1 + 1) + rRingBuf(dBase + r2 + 1) + rRingBuf(dBase + r3 + 1) + rRingBuf(dBase + r4 + 1)) * 0.25!
-                                
-                                fL = fL + revL * rMix
-                                fR = fR + revR * rMix
-                                bufInL = bufInL + revL * rTime
-                                bufInR = bufInR + revR * rTime
+                                RiffProcessFreeverb i, dBase, dWrite, rMix, rTime, fL, fR, bufInL, bufInR
                             End If
                             
                             rRingBuf(dBase + dWrite) = bufInL
@@ -2845,11 +3407,31 @@ NextVoice32:
             rCtx.MasterPeakR = currentMasterPeakR
         End If
         
-        RtlMoveMemory ByVal pData, VarPtr(mixArr32(0)), bytesToWrite
+        For frame = 0 To (bytesToWrite \ 4) - 1
+            If mixArr32(frame) > 1! Then
+                mixArr32(frame) = 1!
+            ElseIf mixArr32(frame) < -1! Then
+                mixArr32(frame) = -1!
+            End If
+        Next frame
+        
+        If RiffMixFormatIsFloat32() Then
+            RtlMoveMemory ByVal pData, VarPtr(mixArr32(0)), bytesToWrite
+        Else
+            Dim mixInt32() As Long
+            ReDim mixInt32(0 To (bytesToWrite \ 4) - 1)
+            For frame = 0 To UBound(mixArr32)
+                If mixArr32(frame) >= 1! Then
+                    mixInt32(frame) = 2147483647
+                ElseIf mixArr32(frame) <= -1! Then
+                    mixInt32(frame) = -2147483647
+                Else
+                    mixInt32(frame) = CLng(mixArr32(frame) * 2147483647#)
+                End If
+            Next frame
+            RtlMoveMemory ByVal pData, VarPtr(mixInt32(0)), bytesToWrite
+        End If
 
-    ' ------------------------------------------------------------------------------------
-    ' FALLBACK PATH: 16-Bit Integer (Legacy Audio Hardware)
-    ' ------------------------------------------------------------------------------------
     ElseIf wBits = 16 Then
         Dim mixArr16() As Integer
         ReDim mixArr16(0 To (bytesToWrite \ 2) - 1)
@@ -2908,6 +3490,9 @@ NextVoice32:
                             End If
                             If loopSnd Then
                                 remBytes = bytesNeeded - bytesAvail
+                                If remBytes > CLng(loopEnd - loopStart) Then
+                                    remBytes = CLng(loopEnd - loopStart)
+                                End If
                                 If remBytes > 0 Then
                                     RtlMoveMemoryToInteger srcArr16(bytesAvail \ 2), ByVal (ptr + CLng(loopStart)), remBytes
                                 End If
@@ -2917,8 +3502,8 @@ NextVoice32:
                     End If
                     
                     dist = rVoices(i).Distortion
-                    lp = rVoices(i).LowPass
-                    hp = rVoices(i).HighPass
+                    lp = rVoices(i).lowPass
+                    hp = rVoices(i).highPass
                     sWidth = rVoices(i).StereoWidth
                     
                     eqB = rVoices(i).EqBass
@@ -2938,28 +3523,28 @@ NextVoice32:
                     rmFreq = rVoices(i).RingModFreq
                     rmMix = rVoices(i).RingModMix
                     rmPhase = rVoices(i).RingModPhase
-                    rmStep = (PI2 * rmFreq) / CDbl(rCtx.SampleRate)
+                    rmStep = (PI2 * rmFreq) / CDbl(rCtx.sampleRate)
                     
                     trmRate = rVoices(i).TremoloRate
                     trmDepth = rVoices(i).TremoloDepth
                     trmPhase = rVoices(i).TremoloPhase
-                    trmStep = (PI2 * trmRate) / CDbl(rCtx.SampleRate)
+                    trmStep = (PI2 * trmRate) / CDbl(rCtx.sampleRate)
                     
                     apRate = rVoices(i).AutoPanRate
                     apDepth = rVoices(i).AutoPanDepth
                     apPhase = rVoices(i).AutoPanPhase
-                    apStep = (PI2 * apRate) / CDbl(rCtx.SampleRate)
+                    apStep = (PI2 * apRate) / CDbl(rCtx.sampleRate)
                     
                     cRate = rVoices(i).ChorusRate
                     cDepth = rVoices(i).ChorusDepth
                     cPhase = rVoices(i).ChorusPhase
-                    cStep = (PI2 * cRate) / CDbl(rCtx.SampleRate)
+                    cStep = (PI2 * cRate) / CDbl(rCtx.sampleRate)
                     
                     flgRate = rVoices(i).FlangerRate
                     flgDepth = rVoices(i).FlangerDepth
                     flgFB = rVoices(i).FlangerFeedback
                     flgPhase = rVoices(i).FlangerPhase
-                    flgStep = (PI2 * flgRate) / CDbl(rCtx.SampleRate)
+                    flgStep = (PI2 * flgRate) / CDbl(rCtx.sampleRate)
                     
                     rMix = rVoices(i).ReverbMix
                     rTime = rVoices(i).ReverbTime
@@ -2971,7 +3556,7 @@ NextVoice32:
                     dTime = rVoices(i).DelayTime
                     dFB = rVoices(i).DelayFeedback
                     dMix = rVoices(i).DelayMix
-                    dSamples = (Int(dTime * rCtx.SampleRate) \ 2) * 2
+                    dSamples = Int(dTime * rCtx.sampleRate) * 2
                     dWrite = rVoices(i).RingWritePos
                     dBase = i * 192000
                     
@@ -3026,29 +3611,8 @@ NextVoice32:
                             End If
                             
                             If rVoices(i).IsOscillator Then
-                                Dim oscStep16 As Double
-                                oscStep16 = (PI2 * rVoices(i).OscFreq) / CDbl(rCtx.SampleRate)
-                                
-                                Select Case rVoices(i).OscType
-                                    Case 0
-                                        fL = Sin(rVoices(i).OscPhase)
-                                    Case 1
-                                        If Sin(rVoices(i).OscPhase) >= 0 Then
-                                            fL = 0.5!
-                                        Else
-                                            fL = -0.5!
-                                        End If
-                                    Case 2
-                                        fL = 2! * (rVoices(i).OscPhase / PI2) - 1!
-                                    Case 3
-                                        fL = (Rnd() * 2!) - 1!
-                                End Select
+                                fL = RiffNextOscillatorSample(i)
                                 fR = fL
-                                
-                                rVoices(i).OscPhase = rVoices(i).OscPhase + oscStep16
-                                If rVoices(i).OscPhase >= PI2 Then
-                                    rVoices(i).OscPhase = rVoices(i).OscPhase - PI2
-                                End If
                             Else
                                 Dim sID16 As Long
                                 sID16 = Int(srcIdx) * 2
@@ -3074,8 +3638,8 @@ NextVoice32:
                             End If
                             
                             If bdSteps > 0! Then
-                                fL = Int(fL * bdSteps) / bdSteps
-                                fR = Int(fR * bdSteps) / bdSteps
+                                fL = Fix(fL * bdSteps) / bdSteps
+                                fR = Fix(fR * bdSteps) / bdSteps
                             End If
                             
                             fL = fL * dist
@@ -3092,37 +3656,7 @@ NextVoice32:
                                 fR = -1!
                             End If
                             
-                            rVoices(i).FilterStateL = rVoices(i).FilterStateL + lp * (fL - rVoices(i).FilterStateL)
-                            fL = rVoices(i).FilterStateL
-                            rVoices(i).FilterStateR = rVoices(i).FilterStateR + lp * (fR - rVoices(i).FilterStateR)
-                            fR = rVoices(i).FilterStateR
-                            
-                            If hp > 0! Then
-                                rVoices(i).FilterStateHP_L = rVoices(i).FilterStateHP_L + hp * (fL - rVoices(i).FilterStateHP_L)
-                                fL = fL - rVoices(i).FilterStateHP_L
-                                rVoices(i).FilterStateHP_R = rVoices(i).FilterStateHP_R + hp * (fR - rVoices(i).FilterStateHP_R)
-                                fR = fR - rVoices(i).FilterStateHP_R
-                            End If
-                            
-                            If eqB <> 1! Or eqM <> 1! Or eqT <> 1! Then
-                                rVoices(i).EqStateLowL = rVoices(i).EqStateLowL + 0.05! * (fL - rVoices(i).EqStateLowL)
-                                rVoices(i).EqStateHighL = rVoices(i).EqStateHighL + 0.4! * (fL - rVoices(i).EqStateHighL)
-                                rVoices(i).EqStateLowR = rVoices(i).EqStateLowR + 0.05! * (fR - rVoices(i).EqStateLowR)
-                                rVoices(i).EqStateHighR = rVoices(i).EqStateHighR + 0.4! * (fR - rVoices(i).EqStateHighR)
-                                
-                                Dim mL16 As Single
-                                Dim mR16 As Single
-                                Dim hL16 As Single
-                                Dim hR16 As Single
-                                
-                                mL16 = rVoices(i).EqStateHighL - rVoices(i).EqStateLowL
-                                mR16 = rVoices(i).EqStateHighR - rVoices(i).EqStateLowR
-                                hL16 = fL - rVoices(i).EqStateHighL
-                                hR16 = fR - rVoices(i).EqStateHighR
-                                
-                                fL = (rVoices(i).EqStateLowL * eqB) + (mL16 * eqM) + (hL16 * eqT)
-                                fR = (rVoices(i).EqStateLowR * eqB) + (mR16 * eqM) + (hR16 * eqT)
-                            End If
+                            RiffProcessVoiceFilters i, fL, fR, lp, hp, eqB, eqM, eqT
                             
                             If rmMix > 0! Then
                                 Dim rmOsc16 As Single
@@ -3166,7 +3700,7 @@ NextVoice32:
                                 Dim flgL16 As Single
                                 Dim flgR16 As Single
                                 
-                                fDel16 = (Int((0.002! + 0.005! * CSng(Sin(flgPhase))) * rCtx.SampleRate) \ 2) * 2
+                                fDel16 = Int((0.002! + 0.005! * CSng(Sin(flgPhase))) * rCtx.sampleRate) * 2
                                 fRd16 = dWrite - fDel16
                                 If fRd16 < 0 Then
                                     fRd16 = fRd16 + 192000
@@ -3190,7 +3724,7 @@ NextVoice32:
                                 Dim cDel16 As Long
                                 Dim cRd16 As Long
                                 
-                                cDel16 = (Int((0.02! + 0.005! * CSng(Sin(cPhase))) * rCtx.SampleRate) \ 2) * 2
+                                cDel16 = Int((0.02! + 0.005! * CSng(Sin(cPhase))) * rCtx.sampleRate) * 2
                                 cRd16 = dWrite - cDel16
                                 If cRd16 < 0 Then
                                     cRd16 = cRd16 + 192000
@@ -3223,40 +3757,7 @@ NextVoice32:
                             End If
                             
                             If rMix > 0! Then
-                                Dim rr1 As Long
-                                Dim rr2 As Long
-                                Dim rr3 As Long
-                                Dim rr4 As Long
-                                Dim revL16 As Single
-                                Dim revR16 As Single
-                                
-                                rr1 = dWrite - rt1
-                                If rr1 < 0 Then
-                                    rr1 = rr1 + 192000
-                                End If
-                                
-                                rr2 = dWrite - rt2
-                                If rr2 < 0 Then
-                                    rr2 = rr2 + 192000
-                                End If
-                                
-                                rr3 = dWrite - rt3
-                                If rr3 < 0 Then
-                                    rr3 = rr3 + 192000
-                                End If
-                                
-                                rr4 = dWrite - rt4
-                                If rr4 < 0 Then
-                                    rr4 = rr4 + 192000
-                                End If
-                                
-                                revL16 = (rRingBuf(dBase + rr1) + rRingBuf(dBase + rr2) + rRingBuf(dBase + rr3) + rRingBuf(dBase + rr4)) * 0.25!
-                                revR16 = (rRingBuf(dBase + rr1 + 1) + rRingBuf(dBase + rr2 + 1) + rRingBuf(dBase + rr3 + 1) + rRingBuf(dBase + rr4 + 1)) * 0.25!
-                                
-                                fL = fL + revL16 * rMix
-                                fR = fR + revR16 * rMix
-                                bufInL16 = bufInL16 + revL16 * rTime
-                                bufInR16 = bufInR16 + revR16 * rTime
+                                RiffProcessFreeverb i, dBase, dWrite, rMix, rTime, fL, fR, bufInL16, bufInR16
                             End If
                             
                             rRingBuf(dBase + dWrite) = bufInL16
@@ -3394,6 +3895,8 @@ NextVoice16:
         End If
         
         RtlMoveMemory ByVal pData, VarPtr(mixArr16(0)), bytesToWrite
+    Else
+        RtlZeroMemory pData, bytesToWrite
     End If
     
     vCall rCtx.RenderClient, 4, framesAvailable, 0&
@@ -3516,6 +4019,186 @@ Private Sub FreeThunks()
     rCtx.ThunkTimerCB = 0
 End Sub
 
+
+'/**
+' * @function RiffMixFormatIsFloat32
+' * @brief Detects whether the current render format stores samples as 32-bit IEEE float.
+' * @return {Boolean} True when the current WASAPI mix format is float32.
+' */
+Private Function RiffMixFormatIsFloat32() As Boolean
+    If rCtx.MixFormatPtr = 0 Then
+        Exit Function
+    End If
+
+    Dim formatTag As Integer
+    Dim bitsPerSample As Integer
+    Dim subFormatData1 As Long
+
+    RtlMoveMemory VarPtr(formatTag), ByVal rCtx.MixFormatPtr, 2
+    RtlMoveMemory VarPtr(bitsPerSample), ByVal (rCtx.MixFormatPtr + 14), 2
+
+    If bitsPerSample <> 32 Then
+        Exit Function
+    End If
+
+    If formatTag = 3 Then
+        RiffMixFormatIsFloat32 = True
+        Exit Function
+    End If
+
+    If formatTag = -2 Then
+        RtlMoveMemory VarPtr(subFormatData1), ByVal (rCtx.MixFormatPtr + 24), 4
+        RiffMixFormatIsFloat32 = (subFormatData1 = 3)
+    End If
+End Function
+
+'/**
+' * @function RiffTryPromoteMixFormatToFloat32
+' * @brief Rewrites a WAVEFORMATEX/WAVEFORMATEXTENSIBLE structure to 32-bit float while preserving rate and channel count.
+' */
+Private Sub RiffTryPromoteMixFormatToFloat32()
+    If rCtx.MixFormatPtr = 0 Then
+        Exit Sub
+    End If
+
+    Dim nChannels As Integer
+    Dim sampleRate As Long
+    Dim blockAlign As Integer
+    Dim avgBytes As Long
+    Dim bits As Integer
+    Dim cbSize As Integer
+    Dim validBits As Integer
+    Dim channelMask As Long
+    Dim formatTag As Integer
+
+    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + 2), 2
+    RtlMoveMemory VarPtr(sampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
+    RtlMoveMemory VarPtr(cbSize), ByVal (rCtx.MixFormatPtr + 16), 2
+
+    If nChannels <= 0 Then
+        nChannels = 2
+    End If
+    If sampleRate <= 0 Then
+        sampleRate = 44100
+    End If
+
+    bits = 32
+    blockAlign = CInt(nChannels * 4)
+    avgBytes = sampleRate * CLng(blockAlign)
+
+    If cbSize >= 22 Then
+        RtlMoveMemory VarPtr(channelMask), ByVal (rCtx.MixFormatPtr + 20), 4
+        formatTag = -2
+        validBits = 32
+        If channelMask = 0 Then
+            If nChannels = 1 Then
+                channelMask = 4
+            ElseIf nChannels = 2 Then
+                channelMask = 3
+            End If
+        End If
+
+        RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(formatTag), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 2), VarPtr(nChannels), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 4), VarPtr(sampleRate), 4
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 8), VarPtr(avgBytes), 4
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 12), VarPtr(blockAlign), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 14), VarPtr(bits), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 16), VarPtr(cbSize), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 18), VarPtr(validBits), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 20), VarPtr(channelMask), 4
+
+        Dim sf1 As Long
+        Dim sf2 As Integer
+        Dim sf3 As Integer
+        Dim sf4(0 To 7) As Byte
+
+        sf1 = 3
+        sf2 = 0
+        sf3 = 16
+        sf4(0) = 128
+        sf4(1) = 0
+        sf4(2) = 0
+        sf4(3) = 170
+        sf4(4) = 0
+        sf4(5) = 56
+        sf4(6) = 155
+        sf4(7) = 113
+
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 24), VarPtr(sf1), 4
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 28), VarPtr(sf2), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 30), VarPtr(sf3), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 32), VarPtr(sf4(0)), 8
+    Else
+        formatTag = 3
+        cbSize = 0
+        RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(formatTag), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 2), VarPtr(nChannels), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 4), VarPtr(sampleRate), 4
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 8), VarPtr(avgBytes), 4
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 12), VarPtr(blockAlign), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 14), VarPtr(bits), 2
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 16), VarPtr(cbSize), 2
+    End If
+End Sub
+
+'/**
+' * @function VTableProc
+' * @brief Reads a COM method pointer directly from an interface v-table.
+' * @param pUnk COM interface pointer.
+' * @param vTableIndex Zero-based v-table slot.
+' * @return {Long/LongPtr} Native method pointer.
+' */
+#If VBA7 Then
+Private Function VTableProc(ByVal pUnk As LongPtr, ByVal vTableIndex As Long) As LongPtr
+    Dim pVtbl As LongPtr
+    RtlMoveMemory VarPtr(pVtbl), ByVal pUnk, LenB(pVtbl)
+    RtlMoveMemory VarPtr(VTableProc), ByVal (pVtbl + (vTableIndex * LenB(pVtbl))), LenB(pVtbl)
+End Function
+#Else
+Private Function VTableProc(ByVal pUnk As Long, ByVal vTableIndex As Long) As Long
+    Dim pVtbl As Long
+    RtlMoveMemory VarPtr(pVtbl), ByVal pUnk, 4
+    RtlMoveMemory VarPtr(VTableProc), ByVal (pVtbl + (vTableIndex * 4)), 4
+End Function
+#End If
+
+'/**
+' * @function FastVCall0
+' * @brief Invokes a COM v-table method without Variant marshaling when the hot path signature is compatible.
+' */
+#If VBA7 Then
+Private Function FastVCall0(ByVal pUnk As LongPtr, ByVal vTableIndex As Long) As Long
+#Else
+Private Function FastVCall0(ByVal pUnk As Long, ByVal vTableIndex As Long) As Long
+#End If
+    FastVCall0 = vCall(pUnk, vTableIndex)
+End Function
+
+'/**
+' * @function FastVCall1
+' * @brief Invokes a COM v-table method with one explicit argument on the optimized x64 path.
+' */
+#If VBA7 Then
+Private Function FastVCall1(ByVal pUnk As LongPtr, ByVal vTableIndex As Long, ByVal arg0 As LongPtr) As Long
+#Else
+Private Function FastVCall1(ByVal pUnk As Long, ByVal vTableIndex As Long, ByVal arg0 As Long) As Long
+#End If
+    FastVCall1 = vCall(pUnk, vTableIndex, arg0)
+End Function
+
+'/**
+' * @function FastVCall3
+' * @brief Invokes a COM v-table method with three explicit arguments on the optimized x64 path.
+' */
+#If VBA7 Then
+Private Function FastVCall3(ByVal pUnk As LongPtr, ByVal vTableIndex As Long, ByVal arg0 As LongPtr, ByVal arg1 As LongPtr, ByVal arg2 As LongPtr) As Long
+#Else
+Private Function FastVCall3(ByVal pUnk As Long, ByVal vTableIndex As Long, ByVal arg0 As Long, ByVal arg1 As Long, ByVal arg2 As Long) As Long
+#End If
+    FastVCall3 = vCall(pUnk, vTableIndex, arg0, arg1, arg2)
+End Function
+
 '/**
 ' * @function InitWASAPI
 ' * @brief Initializes the Windows Audio Session API to connect with the default sound hardware.
@@ -3573,7 +4256,7 @@ Private Function InitWASAPI() As Boolean
         Exit Function
     End If
     
-    RtlMoveMemory VarPtr(rCtx.SampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
+    RtlMoveMemory VarPtr(rCtx.sampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
     RtlMoveMemory VarPtr(rCtx.AvgBytesPerSec), ByVal (rCtx.MixFormatPtr + 8), 4
     
     hr = vCall(rCtx.AudioClient, 3, AUDCLNT_SHAREMODE_SHARED, &H80000000, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
@@ -3660,7 +4343,14 @@ Private Function vCall(ByVal pUnk As Long, ByVal vTableIndex As Long, ParamArray
         offset = vTableIndex * 4
     #End If
     
+    argCount = 0
+    On Error Resume Next
     argCount = UBound(args) - LBound(args) + 1
+    If Err.Number <> 0 Then
+        Err.Clear
+        argCount = 0
+    End If
+    On Error GoTo 0
     
     If argCount > 0 Then
         #If VBA7 Then
