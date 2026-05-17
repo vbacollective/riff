@@ -1,6 +1,6 @@
 # Riff API Reference
 
-This document describes the complete public interface of **Riff.bas**, a high-performance, COM-based WASAPI audio engine for VBA (x86/x64 compatible). It implements real-time audio playback through Windows Audio Session API (WASAPI), decodes audio files via Media Foundation, and provides a full Studio DSP Pipeline including Reverb, Chorus, Flanger, Compressor, 3-Band EQ, Bitcrusher, Ring Modulator, Auto-Pan, Delay, Oscillators, In-Memory Loading, Audio Buses, and Peak Meters.
+This document describes the complete public interface of **Riff.bas**, a high-performance, COM-based WASAPI audio engine for VBA (x86/x64 compatible). It implements real-time audio playback through Windows Audio Session API (WASAPI), decodes audio files via Media Foundation, and provides a full Studio DSP Pipeline including Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad 3-Band EQ, Bitcrusher, Ring Modulator, Auto-Pan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, Audio Buses, and Peak Meters.
 
 ## Table of Contents
 
@@ -9,11 +9,13 @@ This document describes the complete public interface of **Riff.bas**, a high-pe
   - [Buffer Pool](#buffer-pool)
   - [Voice Pool and Polyphony](#voice-pool-and-polyphony)
   - [Audio Buses](#audio-buses)
+  - [WAV Export](#wav-export)
   - [DSP Pipeline](#dsp-pipeline)
   - [Timer and Callback Architecture](#timer-and-callback-architecture)
   - [Platform Compatibility](#platform-compatibility)
 - [Initialization and Teardown](#initialization-and-teardown)
 - [Global Settings and Asset Management](#global-settings-and-asset-management)
+- [Export and Offline Rendering](#export-and-offline-rendering)
 - [Playback and Voice Actions](#playback-and-voice-actions)
 - [Voice Properties](#voice-properties)
 - [DSP Filters and Effects](#dsp-filters-and-effects)
@@ -66,7 +68,7 @@ Riff maintains an internal pool of up to **64 static audio buffers** (indices `0
 `RiffLoad` and `RiffLoadFromMemory` decode a source file (WAV, MP3, or any format supported by Media Foundation) into a free slot and return its integer handle. This handle is used to instantiate playback voices.
 
 > [!NOTE]
-> Decoded audio is converted to the device's native mix format at load time. The engine performs no format conversion at playback, which is what enables zero-latency voice spawning.
+> Decoded audio is converted to the device's native mix format at load time. The engine performs no format conversion at playback, which is what enables zero-latency voice spawning. Export helpers convert loaded buffers back to standard 16-bit stereo PCM WAV when writing files.
 
 ### Voice Pool and Polyphony
 
@@ -107,30 +109,45 @@ Bus volume is applied as a multiplier after the individual voice volume and befo
 finalGain = VoiceVolume × BusVolume × MasterVolume
 ```
 
+### WAV Export
+
+Riff can write audio back to disk as standard **16-bit stereo PCM WAV**. Loaded buffers can be exported with `RiffExportBufferWav`, and oscillators can be rendered directly with `RiffRenderOscillatorWav`.
+
+Export is intentionally conservative: the output format is always stereo PCM16 for maximum compatibility with DAWs, video editors, game tools, and Windows media players. When exporting a loaded buffer, Riff reads the current decoded mix format and converts supported source layouts to stereo PCM16.
+
+```vb
+Dim buf As Long
+buf = RiffLoad("C:\Sounds\theme.mp3")
+
+If buf >= 0 Then
+    RiffExportBufferWav buf, "C:\Sounds\theme_export.wav"
+End If
+```
+
 ### DSP Pipeline
 
 Every voice processes audio through a fixed pipeline applied in the following order per sample:
 
-1. **Source Read** — Buffer lookup with pitch-adjusted index or oscillator generation.
-2. **Sample Rate Reduction** — Bitcrusher downsampling (hold N frames).
-3. **Bit Depth Reduction** — Bitcrusher quantization.
-4. **Distortion** — Soft-clip multiplication and hard clamp.
-5. **Low-Pass Filter** — One-pole IIR smoothing filter.
-6. **High-Pass Filter** — DC-blocking one-pole subtraction.
-7. **3-Band EQ** — Bass shelf, mid band, treble shelf using two cascaded one-pole filters.
-8. **Ring Modulator** — Sine oscillator multiplication with wet mix blend.
-9. **Tremolo** — Volume LFO modulation.
-10. **Stereo Width** — Mid/side processing.
-11. **Flanger** — Short comb filter with LFO-swept delay tap from the ring buffer.
-12. **Chorus** — Modulated delay tap blend from the ring buffer.
-13. **Echo/Delay** — Fixed-time delay tap with feedback from the ring buffer.
-14. **Reverb** — Four-tap comb filter with decay coefficient from the ring buffer.
-15. **Ring Buffer Write** — Stores the pre-compressor wet signal for spatial effect feedback.
-16. **Compressor** — Envelope follower with threshold and ratio gain reduction.
-17. **Auto-Pan** — LFO-modulated pan position applied to final L/R gain.
-18. **Volume and Master Gain** — Voice, bus, and master multipliers applied.
-19. **Fade** — Smooth linear fade-in or fade-out multiplier.
-20. **Mix Accumulation** — Output added to the shared mix buffer.
+1. **Source Read**: Buffer lookup with pitch-adjusted index or oscillator generation.
+2. **Sample Rate Reduction**: Bitcrusher downsampling (hold N frames).
+3. **Bit Depth Reduction**: Bitcrusher quantization.
+4. **Distortion**: Soft-clip multiplication and hard clamp.
+5. **Low-Pass Filter**: Biquad low-pass filtering for smoother cutoff behavior.
+6. **High-Pass Filter**: Biquad high-pass filtering for controlled low-frequency removal.
+7. **3-Band EQ**: Biquad bass, mid, and treble bands using per-voice filter state.
+8. **Ring Modulator**: Sine oscillator multiplication with wet mix blend.
+9. **Tremolo**: Volume LFO modulation.
+10. **Stereo Width**: Mid/side processing.
+11. **Flanger**: Short comb filter with LFO-swept delay tap from the ring buffer.
+12. **Chorus**: Modulated delay tap blend from the ring buffer.
+13. **Echo/Delay**: Fixed-time delay tap with feedback from the ring buffer.
+14. **Reverb**: Freeverb-style comb network with damping and stereo spread.
+15. **Ring Buffer Write**: Stores the pre-compressor wet signal for spatial effect feedback.
+16. **Compressor**: Envelope follower with threshold and ratio gain reduction.
+17. **Auto-Pan**: LFO-modulated pan position applied to final L/R gain.
+18. **Volume and Master Gain**: Voice, bus, and master multipliers applied.
+19. **Fade**: Smooth linear fade-in or fade-out multiplier.
+20. **Mix Accumulation**: Output added to the shared mix buffer.
 
 > [!NOTE]
 > The ring buffer used for Flanger, Chorus, Delay, and Reverb is per-voice and 192,000 samples long (approximately 4 seconds at 48 kHz). Effects with long delay times may produce silence initially until the buffer fills.
@@ -144,7 +161,7 @@ Riff uses a native machine-code thunk (`InitThunks`) compiled at runtime into ex
 
 ### Platform Compatibility
 
-Riff is fully compatible with both **32-bit VBA** (Office x86) and **64-bit VBA** (Office x64). All pointer types are declared conditionally with `#If VBA7` / `#If Win64` compiler directives. The DSP engine paths for 32-bit integer (16-bit PCM hardware) and 32-bit float (modern WASAPI Shared Mode) are both implemented.
+Riff is fully compatible with both **32-bit VBA** (Office x86) and **64-bit VBA** (Office x64). All pointer types are declared conditionally with `#If VBA7` / `#If Win64` compiler directives. The DSP engine paths for 16-bit PCM and 32-bit float WASAPI output are implemented, with conservative handling for unsupported formats to avoid writing invalid output data.
 
 ## Initialization and Teardown
 
@@ -319,6 +336,67 @@ Returns the total duration in seconds of a loaded static buffer, calculated from
 Debug.Print "Duration:", RiffBufferDurationSec(myBuffer), "seconds"
 ```
 
+## Export and Offline Rendering
+
+### RiffExportBufferWav
+
+```vb
+Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath As String) As Boolean
+```
+
+Exports a loaded buffer to a standard **16-bit stereo PCM WAV** file. The source buffer must already be loaded with `RiffLoad` or `RiffLoadFromMemory`. Mono sources are duplicated to stereo during export. Stereo sources are preserved as stereo.
+
+**Parameters:**
+
+`bufferHandle`: A valid buffer handle from the static buffer pool.
+
+`filePath`: Destination path for the WAV file. Existing files may be overwritten by VBA's binary file output path.
+
+**Returns:** `True` if the WAV file was written successfully. `False` if the engine is not initialized, the buffer handle is invalid, the buffer is empty, or the output path cannot be written.
+
+```vb
+Dim buf As Long
+buf = RiffLoad("C:\Sounds\voice.ogg")
+
+If buf >= 0 Then
+    If Not RiffExportBufferWav(buf, "C:\Sounds\voice_export.wav") Then
+        Debug.Print "Export failed."
+    End If
+End If
+```
+
+> [!NOTE]
+> Export writes PCM16 stereo WAV for compatibility. It does not encode MP3, OGG, AAC, or FLAC. Use an external encoder if compressed output is required.
+
+### RiffRenderOscillatorWav
+
+```vb
+Public Function RiffRenderOscillatorWav(ByVal waveType As Long, ByVal frequencyHz As Single, ByVal durationSec As Single, ByVal filePath As String) As Boolean
+```
+
+Renders a generated oscillator directly to a **16-bit stereo PCM WAV** file without creating a playback voice. This is useful for generating test tones, UI beeps, retro SFX, and waveform assets directly from VBA.
+
+**Parameters:**
+
+`waveType`: Oscillator waveform. `0` = Sine, `1` = Square, `2` = Sawtooth, `3` = Noise. Square and sawtooth are band-limited with BLEP to reduce high-frequency aliasing.
+
+`frequencyHz`: Oscillator frequency in Hz. Values below `1.0` are normalized to `440.0`.
+
+`durationSec`: Render duration in seconds. Must be greater than `0`.
+
+`filePath`: Destination path for the WAV file.
+
+**Returns:** `True` if the WAV file was written successfully. `False` if the engine is not initialized, the duration is invalid, or the output path cannot be written.
+
+```vb
+RiffRenderOscillatorWav 0, 440, 2, "C:\Tones\sine_a4.wav"
+RiffRenderOscillatorWav 1, 220, 1, "C:\Tones\square_a3.wav"
+RiffRenderOscillatorWav 2, 110, 1, "C:\Tones\saw_a2.wav"
+```
+
+> [!NOTE]
+> Offline oscillator rendering writes a dry oscillator signal. It does not run the per-voice real-time DSP chain, because it does not allocate a `RiffVoice`.
+
 ## Playback and Voice Actions
 
 ### RiffPlay
@@ -351,7 +429,7 @@ End If
 Public Function RiffPlayOscillator(ByVal waveType As Long, ByVal frequencyHz As Single) As Long
 ```
 
-Spawns a voice that generates audio mathematically from a waveform oscillator instead of reading from a buffer. The oscillator runs indefinitely until stopped manually, since it has no natural end point.
+Spawns a voice that generates audio mathematically from a waveform oscillator instead of reading from a buffer. The oscillator runs indefinitely until stopped manually, since it has no natural end point. Square and sawtooth oscillators use BLEP band-limiting to reduce aliasing at high frequencies.
 
 **Parameters:**
 
@@ -359,10 +437,10 @@ Spawns a voice that generates audio mathematically from a waveform oscillator in
 
 | Value | Waveform |
 |:---|:---|
-| `0` | Sine — smooth, pure tone |
-| `1` | Square — hollow, buzzy tone at half amplitude |
-| `2` | Sawtooth — bright, aggressive ramp wave |
-| `3` | Noise — random white noise |
+| `0` | Sine: smooth, pure tone |
+| `1` | Square: hollow, buzzy tone at half amplitude |
+| `2` | Sawtooth: bright, aggressive ramp wave |
+| `3` | Noise: random white noise |
 
 `frequencyHz`: The pitch in Hz. Minimum value is `1.0`. Defaults to `440.0` Hz (concert A) if a value below `1.0` is passed.
 
@@ -657,7 +735,7 @@ Public Property Get RiffVoiceLowPass(ByVal voiceHandle As Long) As Single
 Public Property Let RiffVoiceLowPass(ByVal voiceHandle As Long, ByVal value As Single)
 ```
 
-Controls the cutoff coefficient of a one-pole IIR low-pass filter. `1.0` (default) passes the full spectrum. Lower values increasingly attenuate high frequencies, producing a muffled or underwater effect. Minimum effective value is `0.01`. Valid range: `0.01` to `1.0`.
+Controls the normalized cutoff amount for the per-voice biquad low-pass filter. `1.0` (default) bypasses the filter and passes the full spectrum. Lower values increasingly attenuate high frequencies with a smoother, higher-quality response than the previous one-pole filter. Valid range: `0.01` to `1.0`.
 
 ```vb
 RiffVoiceLowPass(v) = 0.05  ' Very muffled
@@ -671,7 +749,7 @@ Public Property Get RiffVoiceHighPass(ByVal voiceHandle As Long) As Single
 Public Property Let RiffVoiceHighPass(ByVal voiceHandle As Long, ByVal value As Single)
 ```
 
-Controls the coefficient of a one-pole high-pass filter that removes low frequencies. `0.0` (default) disables the filter. Higher values increasingly attenuate bass and low-mid content, producing a thin or telephone-like quality. Valid range: `0.0` to `0.99`.
+Controls the normalized cutoff amount for the per-voice biquad high-pass filter. `0.0` (default) bypasses the filter. Higher values increasingly attenuate bass and low-mid content, producing a thinner or telephone-like quality. Valid range: `0.0` to `0.99`.
 
 ```vb
 RiffVoiceHighPass(v) = 0.8  ' Thin, radio-like sound
@@ -679,7 +757,7 @@ RiffVoiceHighPass(v) = 0.8  ' Thin, radio-like sound
 
 ### 3-Band EQ
 
-The 3-Band EQ uses two cascaded one-pole filters to separate bass, mid, and treble bands. Each band gain is a linear multiplier, where `1.0` is flat (no boost or cut).
+The 3-Band EQ uses biquad filters with independent per-voice state for bass, mid, and treble processing. Each band gain is a linear multiplier, where `1.0` is flat (no boost or cut).
 
 #### RiffVoiceEqBass
 
@@ -916,7 +994,7 @@ RiffVoiceFlangerFeedback(v) = 0.6
 
 ### Reverb
 
-Reverb simulates spatial reflections using a four-tap comb filter network reading from the voice's ring buffer.
+Reverb simulates spatial reflections using a Freeverb-style comb network with damping and stereo spread. It is still lightweight enough for the VBA real-time callback, but produces smoother spatial tails than the previous simple tap-based reverb.
 
 #### RiffVoiceReverbMix
 
@@ -1068,13 +1146,43 @@ Sub SetMusicIntensity(ByVal intensity As Single)
 End Sub
 ```
 
+### Export a Loaded Buffer
+
+```vb
+Sub ExportLoadedAudio()
+    If Not RiffOpen() Then Exit Sub
+
+    Dim buf As Long
+    buf = RiffLoad("C:\Sounds\line_reading.mp3")
+
+    If buf >= 0 Then
+        If RiffExportBufferWav(buf, "C:\Sounds\line_reading.wav") Then
+            Debug.Print "Export complete."
+        Else
+            Debug.Print "Export failed."
+        End If
+    End If
+End Sub
+```
+
+### Render a Test Tone
+
+```vb
+Sub RenderTone()
+    If Not RiffOpen() Then Exit Sub
+
+    RiffRenderOscillatorWav 0, 440, 3, "C:\Tones\a4_sine.wav"
+    RiffRenderOscillatorWav 1, 220, 1, "C:\Tones\a3_square.wav"
+End Sub
+```
+
 ## Operational Caveats
 
 > [!WARNING]
 > Always call `RiffClose` before resetting the VBA project or closing the workbook. The native timer thunk points into the VBA runtime. Resetting without cleanup will crash Excel.
 
 > [!WARNING]
-> Riff operates entirely on the Windows timer thread calling back into the VBA runtime via a machine-code thunk. The DSP callback fires every 15 ms regardless of what your VBA code is doing. Do not access `rVoices` or `rCtx` directly from user code — all interactions must go through the public API.
+> Riff operates entirely on the Windows timer thread calling back into the VBA runtime via a machine-code thunk. The DSP callback fires every 15 ms regardless of what your VBA code is doing. Do not access `rVoices` or `rCtx` directly from user code: all interactions must go through the public API.
 
 > [!CAUTION]
 > The voice pool is limited to 32 simultaneous voices. In high-density scenarios (many rapid one-shots), consider stopping or reusing voices explicitly rather than relying solely on natural playback completion.
@@ -1084,6 +1192,9 @@ End Sub
 
 > [!NOTE]
 > Audio loading via `RiffLoad` and `RiffLoadFromMemory` is synchronous and may introduce a brief pause for large or heavily compressed files. Decode all assets during an initialization phase rather than during gameplay or interaction.
+
+> [!NOTE]
+> WAV export is also synchronous. Large buffers may briefly block the host while PCM data is converted and written to disk.
 
 > [!NOTE]
 > The 3-Band EQ processing is bypassed automatically when all three band gains are exactly `1.0`. Similarly, each DSP stage with a depth or mix parameter set to `0.0` is skipped. Setting parameters back to their defaults recovers the CPU cost of those stages.
