@@ -26,7 +26,13 @@
 > [!NOTE]
 > **Supported Applications**
 >
-> Excel, Word, PowerPoint, Access, Outlook, and any Microsoft Office VBA host.
+> ![](resources/svg/ms-powerpoint.svg)
+> ![](resources/svg/ms-excel.svg)
+> ![](resources/svg/ms-word.svg)
+> ![](resources/svg/ms-outlook.svg)
+> ![](resources/svg/ms-access.svg)
+> **and any** ![](resources/svg/ms-office.svg) **VBA host**
+
 
 > [!IMPORTANT]
 > **Platform**
@@ -282,16 +288,17 @@ Riff uses only native Windows DLLs present on every version of Windows since Vis
 
 | Environment | Support |
 |---|---|
-| Excel 32-bit | Supported |
-| Excel 64-bit | Supported |
-| Word 32-bit | Supported |
-| Word 64-bit | Supported |
-| PowerPoint 32-bit | Supported |
-| PowerPoint 64-bit | Supported |
-| Access 32-bit | Supported |
-| Access 64-bit | Supported |
-| Any VBA7 host (Office 2010+) | Supported |
-| VBA6 (Office 2007 and earlier) | Supported |
+| ![](resources/svg/ms-excel.svg) Excel 32-bit | Supported |
+| ![](resources/svg/ms-excel.svg) Excel 64-bit | Supported |
+| ![](resources/svg/ms-word.svg) Word 32-bit | Supported |
+| ![](resources/svg/ms-word.svg) Word 64-bit | Supported |
+| ![](resources/svg/ms-powerpoint.svg) PowerPoint 32-bit | Supported |
+| ![](resources/svg/ms-powerpoint.svg) PowerPoint 64-bit | Supported |
+| ![](resources/svg/ms-access.svg) Access 32-bit | Supported |
+| ![](resources/svg/ms-access.svg) Access 64-bit | Supported |
+| ![](resources/svg/ms-office.svg) Any VBA7 host (Office 2010+) | Supported |
+| ![](resources/svg/ms-office.svg) VBA6 (Office 2007 and earlier) | Supported |
+
 
 32-bit and 64-bit compatibility is handled transparently through `#If VBA7` and `#If Win64` conditional compilation across all API declarations and assembly thunks.
 
