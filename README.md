@@ -5,7 +5,7 @@
 <h1 align="center">Riff - VBA Audio Engine</h1>
 
 <p align="center">
-  <b>A complete WASAPI audio engine for Microsoft Office. No DLLs, no dependencies, no installation.</b>
+  <b>A complete WASAPI audio engine for Microsoft Office with studio DSP and WAV export. No DLLs, no dependencies, no installation.</b>
 </p>
 
 <p align="center">
@@ -16,6 +16,8 @@
   <img src="https://img.shields.io/badge/Media%20Foundation-Decoding-orange.svg" alt="Media Foundation" />
   <img src="https://img.shields.io/badge/Polyphony-32%20Voices-blueviolet.svg" alt="Polyphony" />
   <img src="https://img.shields.io/badge/DSP-Studio%20Pipeline-critical.svg" alt="DSP" />
+  <img src="https://img.shields.io/badge/Export-WAV%2016--bit-success.svg" alt="WAV Export" />
+  <img src="https://img.shields.io/badge/Oscillators-BLEP-purple.svg" alt="BLEP Oscillators" />
   <img src="https://img.shields.io/badge/Assembly-x86%20%26%20x64%20Thunks-red.svg" alt="Assembly" />
   <img src="https://img.shields.io/badge/dependencies-none-success.svg" alt="Dependencies" />
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
@@ -56,7 +58,7 @@
 
 ## What is Riff
 
-Riff is a single `.bas` module that brings real audio to any Microsoft Office VBA host. Load audio files from disk or directly from memory, synthesize waveforms, and apply a full studio DSP pipeline per voice, all in real time, with zero external dependencies and no configuration required.
+Riff is a single `.bas` module that brings real audio to any Microsoft Office VBA host. Load audio files from disk or directly from memory, synthesize waveforms, export buffers to WAV, and apply a full studio DSP pipeline per voice, all in real time, with zero external dependencies and no configuration required.
 
 It talks directly to WASAPI through hand-rolled COM vtable calls, decodes any format Windows supports through Media Foundation, and drives the audio callback through a runtime-compiled x86/x64 assembly thunk that fires independently of the VBA execution thread.
 
@@ -114,6 +116,23 @@ buf = RiffLoadFromMemory(data)
 RiffPlay buf
 ```
 
+### Export a loaded buffer to WAV
+
+```vb
+Dim buf As Long
+buf = RiffLoad("C:\sounds\music.ogg")
+
+RiffExportBufferWav buf, "C:\sounds\music_export.wav"
+```
+
+### Render an oscillator to WAV
+
+```vb
+RiffRenderOscillatorWav 0, 440, 3, "C:\sounds\sine.wav"
+RiffRenderOscillatorWav 1, 110, 2, "C:\sounds\square.wav"
+RiffRenderOscillatorWav 2, 220, 2, "C:\sounds\saw.wav"
+```
+
 ## Architecture
 
 ### Why a Standard Module
@@ -157,17 +176,21 @@ vCall rCtx.AudioClient, 3, AUDCLNT_SHAREMODE_SHARED, 0&, hnsDur, hnsPer, rCtx.Mi
 
 This eliminates all dependency on typelib-bound interface wrappers and makes the entire WASAPI stack self-contained inside the module. The same technique is used for Media Foundation's `IMFSourceReader` during audio decoding.
 
+Direct vtable call optimization for the decoding loop remains a planned performance path. It requires dedicated native thunks per method signature to remain stable across Office x86/x64 hosts, so the current release intentionally keeps the safer `DispCallFunc` route.
+
 ### The DSP Pipeline
 
-Each of the 32 polyphonic voices runs a full per-voice DSP chain on every audio frame. The pipeline processes samples in this order:
+Each of the 32 polyphonic voices runs a full per-voice DSP chain on every audio frame. Low Pass, High Pass, and EQ use biquad filters for higher quality tone shaping, square and saw oscillators use BLEP correction to reduce aliasing at high frequencies, and the reverb path uses a Freeverb-style comb/damping design for improved spatial depth.
 
-**Source** (buffer PCM or oscillator) > **Bitcrusher** > **Sample Rate Reduction** > **Distortion** > **Low Pass Filter** > **High Pass Filter** > **3-Band EQ** > **Ring Modulator** > **Tremolo** > **Stereo Width** > **Flanger** > **Chorus** > **Delay** > **Reverb** > **Compressor** > **AutoPan** > **Volume / Pan / Bus** > **Fade** > **Master Mix**
+The pipeline processes samples in this order:
+
+**Source** (buffer PCM or BLEP oscillator) > **Bitcrusher** > **Sample Rate Reduction** > **Distortion** > **Biquad Low Pass Filter** > **Biquad High Pass Filter** > **Biquad 3-Band EQ** > **Ring Modulator** > **Tremolo** > **Stereo Width** > **Flanger** > **Chorus** > **Delay** > **Freeverb-style Reverb** > **Compressor** > **AutoPan** > **Volume / Pan / Bus** > **Fade** > **Master Mix**
 
 All modulated effects (Chorus, Flanger, Tremolo, AutoPan, RingMod) use LFO phase accumulators that persist across frames, producing continuous and smooth modulation without clicks or resets.
 
 The ring buffer backing Chorus, Flanger, Delay, and Reverb is a single contiguous 1D array of `32 * 192000` floats. This avoids the Column-Major 2D array wipe issue inherent to VBA's memory layout when using `RtlZeroMemory` on multi-dimensional arrays.
 
-Riff supports both 32-bit float and 16-bit integer WASAPI output formats and detects the active format automatically from the device's mix format at initialization.
+Riff supports common WASAPI shared-mode output formats, with primary support for 32-bit float and 16-bit integer output. Unsupported output layouts are handled conservatively to avoid writing invalid audio data into the device buffer.
 
 ## Features
 
@@ -175,13 +198,16 @@ Riff supports both 32-bit float and 16-bit integer WASAPI output formats and det
 - **64 static audio buffers** decoded into physical memory via `VirtualAlloc`
 - **In-memory loading** via `RiffLoadFromMemory`, enabling audio embedded directly in the VBA project
 - **Built-in oscillators**: Sine, Square, Sawtooth, Triangle, Noise
+- **BLEP band-limited square and saw oscillators** for reduced high-frequency aliasing
 - **8 audio buses** with independent volume control for grouping voices (music, SFX, voice, etc.)
-- **Per-voice DSP pipeline** with Reverb, Chorus, Flanger, Delay, Compressor, 3-Band EQ, Low Pass, High Pass, Distortion, Bitcrusher, Sample Rate Reduction, Ring Modulator, Tremolo, AutoPan, Stereo Width
+- **Per-voice DSP pipeline** with Freeverb-style Reverb, Chorus, Flanger, Delay, Compressor, Biquad 3-Band EQ, Biquad Low Pass, Biquad High Pass, Distortion, Bitcrusher, Sample Rate Reduction, Ring Modulator, Tremolo, AutoPan, Stereo Width
+- **WAV export** for loaded audio buffers via `RiffExportBufferWav`
+- **Oscillator-to-WAV rendering** via `RiffRenderOscillatorWav`
 - **Fade in / Fade out** with frame-accurate interpolation
 - **Loop regions** with sub-second precision via `RiffSetLoopRegionSec`
 - **Pitch shifting** via playback rate control
 - **VU meters** at voice and master level via peak amplitude tracking
-- **32-bit float and 16-bit integer** WASAPI output, auto-detected
+- **32-bit float and 16-bit integer** WASAPI output, auto-detected with conservative handling for unsupported layouts
 - **x86 and x64** support via `#If VBA7` and `#If Win64` conditional compilation
 - **IDE-safe timer thunk** with `EbMode` liveness check to prevent crashes on VBE reset
 
@@ -217,6 +243,25 @@ voice = RiffPlayOscillator(1, 440)
 RiffVoiceBitDepth(voice) = 4
 RiffVoiceSampleRateReduction(voice) = 8
 ```
+
+### Export a decoded audio file to WAV
+
+```vb
+Dim buf As Long
+buf = RiffLoad("C:\sounds\voice.ogg")
+
+If buf <> -1 Then
+    RiffExportBufferWav buf, "C:\sounds\voice_export.wav"
+End If
+```
+
+### Render a BLEP oscillator to WAV
+
+```vb
+RiffRenderOscillatorWav 1, 110, 2.5, "C:\sounds\blep_square.wav"
+RiffRenderOscillatorWav 2, 220, 2.5, "C:\sounds\blep_saw.wav"
+```
+
 
 ### Game audio with buses
 
@@ -321,15 +366,22 @@ Riff uses only native Windows DLLs present on every version of Windows since Vis
 - [x] IDE-safe timer thunk with `EbMode` liveness guard
 - [x] x86 and x64 assembly thunks with correct calling conventions
 - [x] `#If VBA7` and `#If Win64` full conditional compilation
+- [x] Biquad filters for higher quality EQ and Low/High Pass
+- [x] Band-limited oscillators (BLEP) to reduce aliasing at high frequencies
+- [x] Freeverb-style reverb for improved spatial quality
+- [x] WAV export for loaded audio buffers via `RiffExportBufferWav`
+- [x] Oscillator-to-WAV rendering via `RiffRenderOscillatorWav`
+- [x] Safer buffer, loop-region, seek, and memory-loading validation
 
 ### ![](resources/svg/planning.svg) Planned
 
 - [ ] `RiffLoadAsync` with Win32 thread and callback on completion
-- [ ] Direct vtable calls inside the decoding loop to eliminate `DispCallFunc` overhead
-- [ ] Biquad filters for higher quality EQ and Low/High Pass
-- [ ] Band-limited oscillators (BLEP) to eliminate aliasing at high frequencies
-- [ ] Freeverb-style reverb for significantly improved spatial quality
+- [ ] Direct vtable calls inside the decoding loop through dedicated ABI-safe thunks
 - [ ] macOS support via CoreAudio and AudioToolbox
+
+### Deferred
+
+- Direct vtable optimization with generic `CallWindowProcW` dispatch was tested and deferred because unstable signatures can crash the Office host. Future work should use dedicated native thunks per COM method signature instead of unsafe generic dispatch.
 
 ## License
 
