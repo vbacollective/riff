@@ -381,7 +381,7 @@ Riff uses only native Windows DLLs present on every version of Windows since Vis
 
 ## Roadmap
 
-### Completed
+### ![](resources/svg/completed.svg) Completed
 
 - [x] WASAPI Shared Mode output with automatic format detection (32-bit float and 16-bit integer)
 - [x] Media Foundation decoding via `IMFSourceReader` with COM vtable dispatch
@@ -399,7 +399,7 @@ Riff uses only native Windows DLLs present on every version of Windows since Vis
 - [x] x86 and x64 assembly thunks with correct calling conventions
 - [x] `#If VBA7` and `#If Win64` full conditional compilation
 
-### Planned
+### ![](resources/svg/planning.svg) Planned
 
 - [ ] `RiffLoadAsync` with Win32 thread and callback on completion
 - [ ] Direct vtable calls inside the decoding loop to eliminate `DispCallFunc` overhead
