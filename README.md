@@ -379,10 +379,6 @@ Riff uses only native Windows DLLs present on every version of Windows since Vis
 - [ ] Direct vtable calls inside the decoding loop through dedicated ABI-safe thunks
 - [ ] macOS support via CoreAudio and AudioToolbox
 
-### Deferred
-
-- Direct vtable optimization with generic `CallWindowProcW` dispatch was tested and deferred because unstable signatures can crash the Office host. Future work should use dedicated native thunks per COM method signature instead of unsafe generic dispatch.
-
 ## License
 
 MIT, free for personal and commercial use. See [LICENSE](LICENSE).
