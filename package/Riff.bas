@@ -1,4 +1,3 @@
-Attribute VB_Name = "Riff"
 '/**
 ' * Riff - Audio Engine (Studio DSP Edition)
 ' * @description A high-performance, COM-based WASAPI audio engine for VBA (x86/x64 compatible).
@@ -6,7 +5,7 @@ Attribute VB_Name = "Riff"
 ' * Studio DSP Pipeline featuring Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad EQ, Bitcrusher,
 ' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, and Peak Meters.
 ' * @author UesleiDev
-' * @version 1.0.2
+' * @version 1.0.3
 ' */
 
 Option Explicit
@@ -128,6 +127,8 @@ Option Private Module
         BufferSize As Long
         ThunkTimerCB As LongPtr
         TimerID As LongPtr
+        RenderPeriodMs As Long
+        MaxWriteFrames As Long
         Buffers(0 To 63) As RiffBuffer
         Buses(0 To 7) As Single
     End Type
@@ -246,6 +247,8 @@ Option Private Module
         BufferSize As Long
         ThunkTimerCB As Long
         TimerID As Long
+        RenderPeriodMs As Long
+        MaxWriteFrames As Long
         Buffers(0 To 63) As RiffBuffer
         Buses(0 To 7) As Single
     End Type
@@ -432,6 +435,15 @@ Private Const PI As Double = 3.14159265358979
 '/** @description Mathematical constant 2 * Pi. */
 Private Const PI2 As Double = 6.28318530717958
 
+'/** @description Low-latency render tick interval in milliseconds. */
+Private Const RIFF_RENDER_PERIOD_MS As Long = 10
+
+'/** @description Maximum audio chunk written per timer tick in milliseconds. Keeps enough headroom to avoid chopped playback. */
+Private Const RIFF_MAX_WRITE_MS As Long = 25
+
+'/** @description Requested WASAPI shared buffer duration in milliseconds. Avoids underruns while still preventing a long silent queue. */
+Private Const RIFF_DEVICE_BUFFER_MS As Long = 100
+
 '/** @description Global state holding hardware info and context. */
 Private rCtx As RiffContext
 
@@ -460,6 +472,8 @@ Public Function RiffOpen() As Boolean
     rCtx.MasterVolume = 1!
     rCtx.MasterPeakL = 0!
     rCtx.MasterPeakR = 0!
+    rCtx.RenderPeriodMs = RIFF_RENDER_PERIOD_MS
+    rCtx.MaxWriteFrames = 0
 
     Dim i As Long
     For i = 0 To 7
@@ -486,7 +500,7 @@ Public Function RiffOpen() As Boolean
 
     timeBeginPeriod 1
 
-    rCtx.TimerID = SetTimer(0, 0, 15, rCtx.ThunkTimerCB)
+    rCtx.TimerID = SetTimer(0, 0, rCtx.RenderPeriodMs, rCtx.ThunkTimerCB)
 
     If rCtx.TimerID = 0 Then
         timeEndPeriod 1
@@ -2600,6 +2614,32 @@ Private Function RiffNextOscillatorSample(ByVal voiceIndex As Long) As Single
 End Function
 
 '/**
+' * @function RiffEngineHasActivePlayback
+' * @brief Returns True only when at least one voice can produce audible samples.
+' * Prevents the render loop from continuously queuing silence while the engine is idle.
+' */
+Private Function RiffEngineHasActivePlayback() As Boolean
+    Dim i As Long
+
+    For i = 0 To 31
+        If rVoices(i).Active And rVoices(i).Playing And Not rVoices(i).Paused Then
+            If rVoices(i).IsOscillator Then
+                RiffEngineHasActivePlayback = True
+                Exit Function
+            End If
+
+            If rVoices(i).BufferIndex >= 0 And rVoices(i).BufferIndex <= 63 Then
+                If rCtx.Buffers(rVoices(i).BufferIndex).Active Then
+                    RiffEngineHasActivePlayback = True
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+
+'/**
 ' * @function RiffBiquadProcess
 ' * @brief Processes one sample through a transposed direct-form II biquad section.
 ' */
@@ -2926,6 +2966,12 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
         Dim pData As Long
         Dim ptr As Long
     #End If
+
+    If Not RiffEngineHasActivePlayback() Then
+        rCtx.MasterPeakL = rCtx.MasterPeakL * 0.85!
+        rCtx.MasterPeakR = rCtx.MasterPeakR * 0.85!
+        Exit Sub
+    End If
     
     hr = vCall(rCtx.AudioClient, 6, VarPtr(padding))
     If hr <> 0 Then
@@ -2935,6 +2981,12 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
     framesAvailable = rCtx.BufferSize - padding
     If framesAvailable <= 0 Then
         Exit Sub
+    End If
+
+    If rCtx.MaxWriteFrames > 0 Then
+        If framesAvailable > rCtx.MaxWriteFrames Then
+            framesAvailable = rCtx.MaxWriteFrames
+        End If
     End If
     
     hr = vCall(rCtx.RenderClient, 3, framesAvailable, VarPtr(pData))
@@ -4216,7 +4268,7 @@ Private Function InitWASAPI() As Boolean
         Dim hnsDur As LongLong
         Dim hnsPer As LongLong
         pNullPtr = CLngLng(0)
-        hnsDur = CLngLng(1500000)
+        hnsDur = CLngLng(RIFF_DEVICE_BUFFER_MS) * CLngLng(10000)
         hnsPer = CLngLng(0)
     #Else
         #If VBA7 Then
@@ -4227,7 +4279,7 @@ Private Function InitWASAPI() As Boolean
         Dim hnsDur As Currency
         Dim hnsPer As Currency
         pNullPtr = CLng(0)
-        hnsDur = CCur(150)
+        hnsDur = CCur(RIFF_DEVICE_BUFFER_MS)
         hnsPer = CCur(0)
     #End If
     
@@ -4258,6 +4310,11 @@ Private Function InitWASAPI() As Boolean
     
     RtlMoveMemory VarPtr(rCtx.sampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
     RtlMoveMemory VarPtr(rCtx.AvgBytesPerSec), ByVal (rCtx.MixFormatPtr + 8), 4
+
+    rCtx.MaxWriteFrames = (rCtx.sampleRate * RIFF_MAX_WRITE_MS) \ 1000
+    If rCtx.MaxWriteFrames < 1 Then
+        rCtx.MaxWriteFrames = 1
+    End If
     
     hr = vCall(rCtx.AudioClient, 3, AUDCLNT_SHAREMODE_SHARED, &H80000000, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
     If hr <> 0 Then
