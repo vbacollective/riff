@@ -358,9 +358,9 @@ For oscillator voices (`IsOscillator = True`), no buffer reading occurs. Instead
 | `OscType` | Waveform | Formula |
 |:---|:---|:---|
 | 0 | Sine | `Sin(OscPhase)` |
-| 1 | Square | `IIf(Sin(OscPhase) >= 0, 0.5, -0.5)` |
-| 2 | Sawtooth | `2 × (OscPhase / PI2) - 1` |
-| 3 | Noise | `(Rnd() × 2) - 1` |
+| 1 | Square | `IIf(Phase < 0.5, 1.0, -1.0) + BLEP` |
+| 2 | Sawtooth | `(2.0 × Phase) - 1.0 - BLEP` |
+| 3 | Noise | `(Rnd() × 2.0) - 1.0` |
 
 The phase advances by `oscStep = (PI2 × OscFreq) / SampleRate` per frame and wraps modulo `PI2`. The same value is written to both `fL` and `fR` before pan and width processing, producing a mono-center oscillator that can be spread with `RiffVoiceStereoWidth`.
 
@@ -376,9 +376,9 @@ graph TD
     B["Sample Rate Reduction<br/>(Bitcrusher downsampler)"]
     C["Bit Depth Reduction<br/>(Bitcrusher quantizer)"]
     D["Distortion<br/>(multiply + hard clip)"]
-    E["Low-Pass Filter<br/>(one-pole IIR)"]
-    F["High-Pass Filter<br/>(one-pole subtraction)"]
-    G["3-Band EQ<br/>(two cascaded one-poles → bass/mid/treble)"]
+    E["Low-Pass Filter<br/>(biquad IIR)"]
+    F["High-Pass Filter<br/>(biquad IIR)"]
+    G["3-Band EQ<br/>(three cascaded biquads → bass/mid/treble)"]
     H["Ring Modulator<br/>(sine oscillator × signal)"]
     I["Tremolo<br/>(volume LFO)"]
     J["Stereo Width<br/>(mid/side processing)"]
@@ -436,40 +436,34 @@ At `dist = 1.0` the signal is unchanged. At high values (e.g. `10.0`), nearly th
 
 ### Low-Pass and High-Pass Filters
 
-Both filters are one-pole IIR (infinite impulse response) designs, the simplest possible digital filters. The low-pass uses an exponential moving average:
+Both filters are implemented as Direct Form 1 biquad filters. A biquad filter uses two previous input samples and two previous output samples (the Z1 and Z2 state variables) to create a steep, resonant, or smooth cutoff depending on its Q factor.
 
 ```
-FilterStateL = FilterStateL + lp × (fL - FilterStateL)
-fL = FilterStateL
+fL = (fL × b0) + (Z1L × b1) + (Z2L × b2) - (Z1OutL × a1) - (Z2OutL × a2)
 ```
 
-The high-pass subtracts a low-pass-filtered version of the signal from the original:
-
-```
-FilterStateHP_L = FilterStateHP_L + hp × (fL - FilterStateHP_L)
-fL = fL - FilterStateHP_L
-```
-
-Both filter state variables (`FilterStateL`, `FilterStateHP_L`) are stored in the voice struct and persist across timer callback invocations, which is what makes them continuous filters rather than per-callback operations.
+The filter state variables (`BqLowPassZ1L`, `BqLowPassZ2L`, etc.) are stored in the voice struct and persist across timer callback invocations. The coefficients (`a1`, `a2`, `b0`, `b1`, `b2`) are calculated per callback based on the normalized cutoff property and the engine's sample rate.
 
 ### 3-Band EQ
 
-The EQ uses two cascaded one-pole low-pass filters with different cutoff coefficients to derive three bands:
+The EQ is implemented as three cascaded parametric biquad filters (a low shelf, a mid peaking filter, and a high shelf). Each band has its own independent per-voice state variables:
 
 ```
-EqStateLowL  += 0.05 × (fL - EqStateLowL)   ' ~800 Hz shelf
-EqStateHighL += 0.40 × (fL - EqStateHighL)  ' ~8 kHz shelf
+' Bass shelf at ~120 Hz
+fL = RiffBiquadProcess(fL, EqBassZ1L, EqBassZ2L, ...)
 
-midL  = EqStateHighL - EqStateLowL
-hiL   = fL - EqStateHighL
-fL    = (EqStateLowL × eqBass) + (midL × eqMid) + (hiL × eqTreble)
+' Mid peaking filter at ~1000 Hz
+fL = RiffBiquadProcess(fL, EqMidZ1L, EqMidZ2L, ...)
+
+' Treble shelf at ~6500 Hz
+fL = RiffBiquadProcess(fL, EqTrebleZ1L, EqTrebleZ2L, ...)
 ```
 
 The EQ computation is guarded by a check that all three gain values equal exactly `1.0`, in which case the entire block is skipped:
 
 ```
 If eqB <> 1.0 Or eqM <> 1.0 Or eqT <> 1.0 Then
-    ' ... EQ computation ...
+    ' ... Biquad cascaded EQ computation ...
 End If
 ```
 

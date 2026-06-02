@@ -226,7 +226,7 @@ End Sub
 - 64 decoded audio buffers allocated with `VirtualAlloc`.
 - File loading through `RiffLoad`.
 - In-memory loading through `RiffLoadFromMemory`.
-- Sine, square, sawtooth, triangle, and noise oscillators.
+- Sine, square, sawtooth, and noise oscillators.
 - BLEP correction for square and saw oscillators.
 - 8 audio buses with independent volume.
 - Per-voice DSP: reverb, chorus, flanger, delay, compressor, EQ, low-pass, high-pass, distortion, bitcrusher, sample-rate reduction, ring modulation, tremolo, auto-pan, stereo width, fade, pan, pitch, and looping.

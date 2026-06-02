@@ -160,6 +160,56 @@ End Sub
 
 Why it works: tremolo creates rhythmic volume movement, while shallow auto-pan adds motion without making the sound distracting on speakers.
 
+## Jet Flanger
+
+Use this for dramatic build-ups, transition sweeps, or to add movement to a static noise or pad sound.
+
+```vb
+Public Sub ApplyJetFlanger(ByVal voiceId As Long)
+    If voiceId < 0 Then Exit Sub
+
+    RiffVoiceFlangerDepth(voiceId) = 0.85
+    RiffVoiceFlangerRate(voiceId) = 0.2
+    RiffVoiceFlangerFeedback(voiceId) = 0.8
+    RiffVoiceStereoWidth(voiceId) = 1.2
+End Sub
+```
+
+Why it works: high feedback on the flanger creates a sharp, resonant comb filter. A slow rate sweeps this resonance up and down the frequency spectrum, creating the classic "jet plane" sound.
+
+## Punchy Drum Compression
+
+Use this to make percussive sounds or heavy sound effects cut through the mix without clipping the master bus.
+
+```vb
+Public Sub ApplyPunchyCompression(ByVal voiceId As Long)
+    If voiceId < 0 Then Exit Sub
+
+    RiffVoiceVolume(voiceId) = 1.0
+    RiffVoiceCompressorThreshold(voiceId) = 0.4
+    RiffVoiceCompressorRatio(voiceId) = 8.0
+    RiffVoiceEqBass(voiceId) = 1.5
+End Sub
+```
+
+Why it works: a low threshold and high ratio aggressively squash the audio, while the bass boost adds weight. The compressor keeps the boosted bass from overwhelming the overall output.
+
+## Tape Slowdown
+
+Use this to simulate a turntable losing power or a dramatic "time-stop" effect.
+
+```vb
+Public Sub ApplyTapeSlowdown(ByVal voiceId As Long)
+    If voiceId < 0 Then Exit Sub
+
+    RiffVoicePitch(voiceId) = 0.5
+    RiffVoiceLowPass(voiceId) = 0.6
+    RiffVoiceDistortion(voiceId) = 1.2
+End Sub
+```
+
+Why it works: halving the pitch drastically drops the frequency and doubles the duration, while a mild low-pass and distortion simulate the physical artifacts of an analog tape machine running out of momentum.
+
 ## Soft Ducking Approximation
 
 Riff does not include side-chain routing, but you can manually lower a music bus while a voice or dialog clip plays.
