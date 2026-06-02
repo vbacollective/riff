@@ -5,7 +5,7 @@
 ' * Studio DSP Pipeline featuring Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad EQ, Bitcrusher,
 ' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, and Peak Meters.
 ' * @author UesleiDev
-' * @version 1.0.3
+' * @version 1.0.5
 ' */
 
 Option Explicit
