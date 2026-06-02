@@ -45,11 +45,12 @@ Riff initializes the full audio stack in a single call to `RiffOpen`. Internally
 2. Calls `MFStartup` to initialize the Windows Media Foundation runtime.
 3. Creates the WASAPI device enumerator, acquires the default audio output device, and obtains an `IAudioClient` interface.
 4. Queries the device's native mix format (`GetMixFormat`) to determine sample rate, bit depth, and channel count.
-5. Initializes the audio client in Shared Mode with a 150 ms buffer.
-6. Obtains the `IAudioRenderClient` and starts the audio stream.
-7. Allocates a contiguous 1D ring buffer array (`rRingBuf`) of 32 × 192,000 `Single` samples for spatial effects.
-8. Sets the system timer resolution to 1 ms via `timeBeginPeriod`.
-9. Starts a `SetTimer` callback at 15 ms intervals to drive the DSP loop.
+5. Prefers a stereo 32-bit float shared-mode format when WASAPI reports it as supported, otherwise falls back to the original device format if it is stereo PCM16 or PCM32.
+6. Initializes the audio client in Shared Mode with a 100 ms buffer.
+7. Obtains the `IAudioRenderClient` and starts the audio stream.
+8. Allocates a contiguous 1D ring buffer array (`rRingBuf`) of 32 × 192,000 `Single` samples for spatial effects.
+9. Sets the system timer resolution to 1 ms via `timeBeginPeriod`.
+10. Starts a `SetTimer` callback at 10 ms intervals to drive the DSP loop.
 
 > [!IMPORTANT]
 > All playback, DSP, and asset operations silently exit if `RiffOpen` has not been called or if it returned `False`. Always check the return value before proceeding.
@@ -68,7 +69,7 @@ Riff maintains an internal pool of up to **64 static audio buffers** (indices `0
 `RiffLoad` and `RiffLoadFromMemory` decode a source file (WAV, MP3, or any format supported by Media Foundation) into a free slot and return its integer handle. This handle is used to instantiate playback voices.
 
 > [!NOTE]
-> Decoded audio is converted to the device's native mix format at load time. The engine performs no format conversion at playback, which is what enables zero-latency voice spawning. Export helpers convert loaded buffers back to standard 16-bit stereo PCM WAV when writing files.
+> Decoded audio is converted to Riff's active WASAPI mix format at load time. Riff prefers stereo float32 output and falls back only to stereo PCM16/PCM32 formats that its renderer supports. Export helpers convert loaded buffers back to standard 16-bit stereo PCM WAV when writing files.
 
 ### Voice Pool and Polyphony
 
@@ -154,14 +155,14 @@ Every voice processes audio through a fixed pipeline applied in the following or
 
 ### Timer and Callback Architecture
 
-Riff uses a native machine-code thunk (`InitThunks`) compiled at runtime into executable memory. This thunk is registered with `SetTimer` at a 15 ms interval and calls `RiffTimerCallback` on each tick. The thunk also checks `EbMode` from the VBA runtime to determine whether VBA is in a break or design state and kills the timer automatically if so, preventing crashes on project reset.
+Riff uses a native machine-code thunk (`InitThunks`) compiled at runtime into executable memory. This thunk is registered with `SetTimer` at a 10 ms interval and calls `RiffTimerCallback` on each tick. The thunk also checks `EbMode` from the VBA runtime to determine whether VBA is in a break or design state and kills the timer automatically if so, preventing crashes on project reset.
 
 > [!WARNING]
 > Always call `RiffClose` before resetting the VBA project or closing the workbook. The thunk holds a pointer into the VBA runtime. Resetting without cleanup can crash the host application.
 
 ### Platform Compatibility
 
-Riff is fully compatible with both **32-bit VBA** (Office x86) and **64-bit VBA** (Office x64). All pointer types are declared conditionally with `#If VBA7` / `#If Win64` compiler directives. The DSP engine paths for 16-bit PCM and 32-bit float WASAPI output are implemented, with conservative handling for unsupported formats to avoid writing invalid output data.
+Riff is fully compatible with both **32-bit VBA** (Office x86) and **64-bit VBA** (Office x64). All pointer types are declared conditionally with `#If VBA7` / `#If Win64` compiler directives. The DSP engine paths for stereo 16-bit PCM, stereo 32-bit PCM, and stereo 32-bit float WASAPI output are implemented, with conservative handling for unsupported formats to avoid writing invalid output data.
 
 ## Initialization and Teardown
 
@@ -268,7 +269,7 @@ Debug.Print "Master Peak L/R:", pL, pR
 Public Function RiffLoad(ByVal filePath As String) As Long
 ```
 
-Decodes an audio file from disk into physical memory using Media Foundation. Supports any format that Media Foundation can decode on the target system (WAV, MP3, AAC, FLAC, WMA, and others depending on installed codecs). The audio is resampled and converted to the device's native mix format at load time.
+Decodes an audio file from disk into physical memory using Media Foundation. Supports any format that Media Foundation can decode on the target system (WAV, MP3, AAC, FLAC, WMA, and others depending on installed codecs). The audio is resampled and converted to Riff's active WASAPI mix format at load time.
 
 **Parameters:**
 
@@ -1182,7 +1183,7 @@ End Sub
 > Always call `RiffClose` before resetting the VBA project or closing the workbook. The native timer thunk points into the VBA runtime. Resetting without cleanup will crash Excel.
 
 > [!WARNING]
-> Riff operates entirely on the Windows timer thread calling back into the VBA runtime via a machine-code thunk. The DSP callback fires every 15 ms regardless of what your VBA code is doing. Do not access `rVoices` or `rCtx` directly from user code: all interactions must go through the public API.
+> Riff operates entirely on the Windows timer thread calling back into the VBA runtime via a machine-code thunk. The DSP callback fires every 10 ms regardless of what your VBA code is doing. Do not access `rVoices` or `rCtx` directly from user code: all interactions must go through the public API.
 
 > [!CAUTION]
 > The voice pool is limited to 32 simultaneous voices. In high-density scenarios (many rapid one-shots), consider stopping or reusing voices explicitly rather than relying solely on natural playback completion.

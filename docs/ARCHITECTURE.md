@@ -225,7 +225,7 @@ graph TD
     style H fill:#c8e6c9,stroke:#2e7d32
 ```
 
-The device's native mix format is read directly from `MixFormatPtr` via `RtlMoveMemory` rather than being parsed into VBA variables at startup. This pointer remains valid for the entire session and is freed by `CoTaskMemFree` in `ReleaseWASAPI`. The fields read at runtime are `nChannels` (offset +2), `nSamplesPerSec` (offset +4), `nAvgBytesPerSec` (offset +8), `nBlockAlign` (offset +12), and `wBitsPerSample` (offset +14).
+The device's native mix format is read from `MixFormatPtr`, then Riff attempts to promote it to stereo 32-bit float and checks the candidate with `IAudioClient::IsFormatSupported`. If Windows rejects that format, Riff restores the original mix format and only proceeds if the fallback is stereo PCM16 or PCM32. The active `MixFormatPtr` remains valid for the entire session and is freed by `CoTaskMemFree` in `ReleaseWASAPI`. The fields read at runtime are `nChannels` (offset +2), `nSamplesPerSec` (offset +4), `nAvgBytesPerSec` (offset +8), `nBlockAlign` (offset +12), and `wBitsPerSample` (offset +14).
 
 ### Media Foundation Startup
 
@@ -237,7 +237,7 @@ Both `RiffLoad` and `RiffLoadFromMemory` converge on the same internal function 
 
 ### File-Based Loading
 
-`RiffLoad` calls `MFCreateSourceReaderFromURL` with the file path as a `LongPtr` to a wide-character string (`StrPtr`). Before creating the reader, it attempts to create an `MFAttributes` store and set the `MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING` attribute (GUID `{7632CB14-D379-4770-AE7D-EA24154D9298}`) to `1`. This attribute enables Media Foundation's built-in audio resampling pipeline, ensuring that the decoded audio is automatically converted to the device's native sample rate and format without manual resampling in VBA.
+`RiffLoad` calls `MFCreateSourceReaderFromURL` with the file path as a `LongPtr` to a wide-character string (`StrPtr`). Before creating the reader, it attempts to create an `MFAttributes` store and set the `MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING` attribute (GUID `{7632CB14-D379-4770-AE7D-EA24154D9298}`) to `1`. This attribute enables Media Foundation's built-in audio resampling pipeline, ensuring that the decoded audio is automatically converted to Riff's active WASAPI sample rate and format without manual resampling in VBA.
 
 ### Memory-Based Loading
 
@@ -264,13 +264,13 @@ Both `pByteStream` and `pStream` are released via `IUnknown::Release` (VTable in
 
 ### CoreProcessSourceReader
 
-`CoreProcessSourceReader` configures the `IMFSourceReader` to output audio in the device's native mix format, then reads all decoded samples into a temporary `VirtualAlloc`-ed buffer, growing it as needed.
+`CoreProcessSourceReader` configures the `IMFSourceReader` to output audio in Riff's active WASAPI mix format, then reads all decoded samples into a temporary `VirtualAlloc`-ed buffer, growing it as needed.
 
 ```mermaid
 graph TD
     A["IMFSourceReader::SetStreamSelection<br/>ALL_STREAMS → False<br/>FIRST_AUDIO_STREAM → True"]
     B["MFCreateMediaType + MFInitMediaTypeFromWaveFormatEx<br/>creates a partial type matching the device's WAVEFORMATEX"]
-    C["IMFSourceReader::SetCurrentMediaType<br/>forces output to device-native PCM format"]
+    C["IMFSourceReader::SetCurrentMediaType<br/>forces output to active WASAPI PCM/float format"]
     D["Loop: IMFSourceReader::ReadSample"]
     E["IMFSample::GetBufferByIndex(0)"]
     F["IMFMediaBuffer::Lock → get raw PCM pointer"]
@@ -296,7 +296,7 @@ All `IMFSourceReader`, `IMFSample`, and `IMFMediaBuffer` COM method calls are ma
 
 ## DSP Timer Callback
 
-`RiffTimerCallback` is the engine's heartbeat. It is called by the native thunk every 15 ms. Its job is to query how many audio frames WASAPI needs, synthesize that many frames by running the DSP pipeline across all active voices, and deliver the result to the hardware.
+`RiffTimerCallback` is the engine's heartbeat. It is called by the native thunk every 10 ms. Its job is to query how many audio frames WASAPI needs, synthesize that many frames by running the DSP pipeline across all active voices, and deliver the result to the hardware.
 
 ### WASAPI Buffer Acquisition
 
@@ -334,9 +334,9 @@ framesNeeded = Int(framesAvailable × pitch) + 2
 bytesNeeded  = framesNeeded × blockAlign
 ```
 
-The `+ 2` guard prevents off-by-one boundary reads when pitch is exactly `1.0`. The entire needed slice is copied from physical memory into a local VBA array (`srcArr32` or `srcArr16`) via `RtlMoveMemoryToSingle` or `RtlMoveMemoryToInteger` in a single call before the per-frame loop. This bulk copy avoids individual pointer arithmetic inside the hot loop.
+The `+ 2` guard leaves room for interpolation against the next stereo frame. The needed slice is copied from physical memory into reusable scratch arrays (`rSrcArr32`, `rSrcArrI32`, or `rSrcArr16`) via `RtlMoveMemory` before the per-frame loop. These arrays grow only when the current callback needs more capacity, then the active region is cleared and reused on later callbacks.
 
-Within the per-frame loop, playback advances by `srcIdx + pitch` on each frame and the buffer position advances by `ptchAlign = pitch × blockAlign`. The source sample index is computed as `Int(srcIdx) × 2` (for stereo interleaved pairs). Pitch shifting is achieved purely by index stepping — no interpolation is applied.
+Within the per-frame loop, playback advances by `srcIdx + pitch` on each frame and the buffer position advances by `ptchAlign = pitch × blockAlign`. The source sample index is computed as `Int(srcIdx) × 2` (for stereo interleaved pairs), while the fractional component is used for linear interpolation between adjacent frames. This keeps pitched playback continuous across timer callbacks.
 
 Loop boundaries are checked at the start of each frame:
 
@@ -624,7 +624,7 @@ mixArr32(writeIdx)     = mixArr32(writeIdx)     + fL
 mixArr32(writeIdx + 1) = mixArr32(writeIdx + 1) + fR
 ```
 
-For the 32-bit float path, no clipping is applied at accumulation. Clipping is only enforced at the physical DAC, which in WASAPI shared mode is handled by the audio engine itself. For the 16-bit integer path, per-sample clamping to `[-32768, 32767]` is required.
+For the 32-bit float path, accumulation happens in `Single` scratch buffers and is clamped to `[-1.0, 1.0]` before handing frames to WASAPI. For 32-bit PCM fallback, the same normalized mix is converted to signed 32-bit integers. For the 16-bit integer path, per-sample clamping to `[-32768, 32767]` is required during accumulation.
 
 ## Output Paths
 
@@ -632,23 +632,24 @@ After all voices are processed, the mix array is delivered to WASAPI via `RtlMov
 
 ### 32-Bit Float Path (Modern Hardware)
 
-For devices reporting `wBitsPerSample = 32`, Riff allocates a `Single` array:
+For devices reporting `wBitsPerSample = 32`, Riff uses reusable scratch arrays:
 
 ```vb
-ReDim mixArr32(0 To (bytesToWrite \ 4) - 1)
+RiffEnsureSingleScratch rMixArr32, rMixArr32Cap, sampleCount32
+RiffClearSingleScratch rMixArr32, sampleCount32
 ```
 
-All DSP arithmetic runs in single-precision floating point natively. At the end of the callback, the entire mix array is copied to WASAPI in a single `RtlMoveMemory` call. This is the standard code path for all modern Windows audio drivers operating in WASAPI Shared Mode.
+All DSP arithmetic runs in single-precision floating point natively. At the end of the callback, the active region of the mix buffer is copied to WASAPI as float32 or converted to PCM32 when the fallback mix format requires it.
 
 ### 16-Bit Integer Path (Legacy Hardware)
 
-For devices reporting `wBitsPerSample = 16`, Riff allocates an `Integer` array and accumulates each voice's contribution after scaling and clamping:
+For devices reporting `wBitsPerSample = 16`, Riff reuses an `Integer` scratch array and accumulates each voice's contribution after scaling and clamping:
 
 ```vb
-l1 = CLng(mixArr16(writeIdx)) + CLng(fL × 32767.0)
+l1 = CLng(rMixArr16(writeIdx)) + CLng(fL × 32767.0)
 If l1 > 32767  Then l1 = 32767
 If l1 < -32768 Then l1 = -32768
-mixArr16(writeIdx) = CInt(l1)
+rMixArr16(writeIdx) = CInt(l1)
 ```
 
 The scale factor `32767.0` maps the normalized `[-1.0, 1.0]` float range to the signed 16-bit integer range. Accumulation uses `Long` intermediates to avoid integer overflow during addition of multiple voices.
@@ -664,13 +665,13 @@ rCtx.MasterPeakL = rCtx.MasterPeakL × 0.9
 rVoices(i).PeakL = rVoices(i).PeakL × 0.9
 ```
 
-During frame processing, if the current frame's absolute amplitude exceeds the decayed peak, the peak is updated. This gives a fast-attack, gradual-release meter behavior. At 15 ms callback intervals, the master peak reaches half its value after approximately `log(0.5) / log(0.9) ≈ 6.6` callbacks, or ~100 ms — a typical meter ballistic.
+During frame processing, if the current frame's absolute amplitude exceeds the decayed peak, the peak is updated. This gives a fast-attack, gradual-release meter behavior. At 10 ms callback intervals, the master peak reaches half its value after approximately `log(0.5) / log(0.9) ≈ 6.6` callbacks, or ~66 ms.
 
 ## Audio Buses
 
 The eight buses in `rCtx.Buses(0 To 7)` are simple `Single` scalars initialized to `1.0`. Bus volume is applied in the final gain stage: `Volume × MasterVolume × BusVolume`. There is no bus mixing, routing, or effects processing at the bus level — buses are purely a gain multiplier group.
 
-Each voice's `busID` field is read from the voice struct on every timer callback. Changing a bus volume via `RiffBusVolume(busID) = value` takes effect on the next timer callback with no latency beyond the 15 ms tick.
+Each voice's `busID` field is read from the voice struct on every timer callback. Changing a bus volume via `RiffBusVolume(busID) = value` takes effect on the next timer callback with no latency beyond the 10 ms tick.
 
 ## Loop and Seek
 
@@ -695,7 +696,7 @@ FadeFramesCurrent = 0
 fadeState = 1  ' or 2
 ```
 
-The fade is computed per frame inside the inner DSP loop, not per callback. This gives sample-accurate fades regardless of the WASAPI buffer size or the 15 ms timer period. For example, a 3-second fade at 48 kHz results in 144,000 frame-level multiplier steps, each incrementing by `1 / 144,000 ≈ 6.94e-6` per frame.
+The fade is computed per frame inside the inner DSP loop, not per callback. This gives sample-accurate fades regardless of the WASAPI buffer size or the 10 ms timer period. For example, a 3-second fade at 48 kHz results in 144,000 frame-level multiplier steps, each incrementing by `1 / 144,000 ≈ 6.94e-6` per frame.
 
 ## COM VTable Dispatch
 
@@ -726,9 +727,9 @@ Where `pointerSize` is 8 on Win64 and 4 on Win32. VTable index 2 is always `IUnk
 | VTable offset stride | 4 bytes | 8 bytes |
 | Thunk opcodes | 32-bit `stdcall` push/ret sequence | 64-bit ABI with RSP alignment |
 | `LongLong` for WASAPI durations | Simulated via `Currency` | Native `LongLong` |
-| 64-bit REFERENCE_TIME | `Currency` (`CLng(150)` → 150 × 10,000 ns = 1.5ms) | `CLngLng(1500000)` (100 ns units) |
+| 64-bit REFERENCE_TIME | `Currency` (`CCur(100)` → 100 × 10,000 = 1,000,000 in 100 ns units) | `CLngLng(1000000)` (100 ns units) |
 
-The `REFERENCE_TIME` values passed to `IAudioClient::Initialize` differ by architecture. On Win64, the 150 ms buffer duration is `1,500,000` in 100-nanosecond units (`CLngLng(1500000)`). On Win32, `Currency` is used as a surrogate for 64-bit integers: the value `CCur(150)` represents `1,500,000` because `Currency` has an implicit 10,000× scaling factor.
+The `REFERENCE_TIME` values passed to `IAudioClient::Initialize` differ by architecture. On Win64, the 100 ms buffer duration is `1,000,000` in 100-nanosecond units. On Win32, `Currency` is used as a surrogate for 64-bit integers: the value `CCur(100)` represents `1,000,000` because `Currency` has an implicit 10,000× scaling factor.
 
 ## Memory Layout
 

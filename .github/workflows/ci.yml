@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  package-sanity:
+    name: Package sanity
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate package module
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f package/Riff.bas
+          grep -q "Option Explicit" package/Riff.bas
+          grep -q "Public Function RiffOpen" package/Riff.bas
+          grep -q "Public Sub RiffClose" package/Riff.bas
+          grep -q "Public Function RiffLoad" package/Riff.bas
+          grep -q "Public Function RiffPlay" package/Riff.bas
+
+      - name: Validate release asset workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f .github/workflows/release-assets.yml
+          grep -q "release:" .github/workflows/release-assets.yml
+          grep -q "package/Riff.bas" .github/workflows/release-assets.yml
+          grep -q "gh release upload" .github/workflows/release-assets.yml
