@@ -42,7 +42,7 @@ End Sub
 Private Sub LStopClean(Optional ByVal fadeSec As Single = 0.25!)
     ' Fade active voices briefly so the demo does not click/pop when stopping.
     Dim i As Long
-    For i = 0 To 63
+    For i = 0 To RiffMaxVoices - 1
         If RiffVoiceIsPlaying(i) Then RiffFadeOut i, fadeSec
     Next i
     LWait fadeSec + 0.05!
@@ -58,7 +58,7 @@ End Sub
 
 Private Sub LPlayMinorPad(ByRef v1 As Long, ByRef v2 As Long, ByRef v3 As Long, _
                           Optional ByVal rootHz As Single = 220!, _
-                          Optional ByVal waveType As Long = 0)
+                          Optional ByVal waveType As RiffWaveType = RiffWaveSine)
     ' root, minor third, fifth
     v1 = RiffPlayOscillator(waveType, rootHz)
     v2 = RiffPlayOscillator(waveType, rootHz * 1.189207!)
@@ -136,7 +136,7 @@ Public Sub Demo_DelayEcho()
     If Not LStartEngine() Then Exit Sub
 
     Dim v As Long, i As Long
-    v = RiffPlayOscillator(1, 330!) ' square wave cuts through delay better
+    v = RiffPlayOscillator(RiffWaveSquare, 330!) ' square wave cuts through delay better
     LSetVoice v, 0.1!, 0!
 
     LStatus "Delay 1/4 - Dry pulsing tone"
@@ -201,7 +201,7 @@ Public Sub Demo_FilterSweep()
     If Not LStartEngine() Then Exit Sub
 
     Dim v As Long, i As Long
-    v = RiffPlayOscillator(2, 110!) ' saw wave has lots of harmonics for filters
+    v = RiffPlayOscillator(RiffWaveSawtooth, 110!) ' saw wave has lots of harmonics for filters
     LSetVoice v, 0.12!, 0!
 
     LStatus "Filter 1/4 - Bright raw saw wave"
@@ -266,7 +266,7 @@ Public Sub Demo_DistortionBitcrusher()
     If Not LStartEngine() Then Exit Sub
 
     Dim v As Long
-    v = RiffPlayOscillator(0, 146.83!)
+    v = RiffPlayOscillator(RiffWaveSine, 146.83!)
     LSetVoice v, 0.12!, 0!
 
     LStatus "Distortion/Crusher 1/5 - Clean sine wave"
@@ -296,7 +296,7 @@ Public Sub Demo_TremoloAutoPan()
     If Not LStartEngine() Then Exit Sub
 
     Dim v As Long
-    v = RiffPlayOscillator(0, 261.63!)
+    v = RiffPlayOscillator(RiffWaveSine, 261.63!)
     LSetVoice v, 0.13!, 0!
 
     LStatus "Tremolo/AutoPan 1/4 - Plain centered tone"
@@ -325,7 +325,7 @@ Public Sub Demo_RingModMetallic()
     If Not LStartEngine() Then Exit Sub
 
     Dim v As Long
-    v = RiffPlayOscillator(0, 330!)
+    v = RiffPlayOscillator(RiffWaveSine, 330!)
     LSetVoice v, 0.12!, 0!
 
     LStatus "Ring Mod 1/4 - Clean sine tone"
@@ -353,7 +353,7 @@ Public Sub Demo_PitchFade()
     If Not LStartEngine() Then Exit Sub
 
     Dim v As Long, i As Long
-    v = RiffPlayOscillator(2, 220!)
+    v = RiffPlayOscillator(RiffWaveSawtooth, 220!)
     LSetVoice v, 0!, 0!
 
     LStatus "Pitch/Fade 1/4 - Fade in"

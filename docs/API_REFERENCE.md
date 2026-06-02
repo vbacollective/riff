@@ -14,6 +14,7 @@ This document describes the complete public interface of **Riff.bas**, a high-pe
   - [Timer and Callback Architecture](#timer-and-callback-architecture)
   - [Platform Compatibility](#platform-compatibility)
 - [Initialization and Teardown](#initialization-and-teardown)
+- [Diagnostics](#diagnostics)
 - [Global Settings and Asset Management](#global-settings-and-asset-management)
 - [Export and Offline Rendering](#export-and-offline-rendering)
 - [Playback and Voice Actions](#playback-and-voice-actions)
@@ -53,7 +54,7 @@ Riff initializes the full audio stack in a single call to `RiffOpen`. Internally
 10. Starts a `SetTimer` callback at 10 ms intervals to drive the DSP loop.
 
 > [!IMPORTANT]
-> All playback, DSP, and asset operations silently exit if `RiffOpen` has not been called or if it returned `False`. Always check the return value before proceeding.
+> Playback, DSP, and asset operations return without doing work if `RiffOpen` has not been called or if it returned `False`. Check the return value and inspect `RiffLastError` when a public API returns `False` or `-1`.
 
 ```vb
 If Not RiffOpen() Then
@@ -98,10 +99,10 @@ Riff provides **8 audio buses** (indices `0` to `7`) as an additional global vol
 
 ```vb
 ' Assign a voice to Bus 1 (SFX group)
-RiffVoiceBus(sfxVoice) = 1
+RiffVoiceBus(sfxVoice) = RiffBusSfx
 
 ' Lower the SFX bus without touching other groups
-RiffBusVolume(1) = 0.4
+RiffBusVolume(RiffBusSfx) = 0.4
 ```
 
 Bus volume is applied as a multiplier after the individual voice volume and before the master volume. The effective gain for a frame is:
@@ -217,6 +218,51 @@ If Not RiffIsInitialized Then
 End If
 ```
 
+## Diagnostics
+
+### RiffLastError
+
+```vb
+Public Property Get RiffLastError() As RiffErrorCode
+```
+
+Returns the most recent `RiffErrorCode` recorded by a public Riff API call. Successful validated calls clear it to `RiffErrorNone`.
+
+| Enum | Meaning |
+|:---|:---|
+| `RiffErrorNone` | No current Riff error. |
+| `RiffErrorNotInitialized` | The engine has not been opened successfully. |
+| `RiffErrorNoFreeBuffer` | The 64-slot buffer pool is full. |
+| `RiffErrorNoFreeVoice` | The 32-slot voice pool is full. |
+| `RiffErrorInvalidBuffer` | A buffer handle is out of range or inactive. |
+| `RiffErrorInvalidVoice` | A voice handle is out of range or cannot be used for the requested operation. |
+| `RiffErrorInvalidBus` | A bus value is invalid. |
+| `RiffErrorInvalidArgument` | A supplied argument is empty or outside the accepted range. |
+| `RiffErrorFileNotFound` | The requested source file does not exist. |
+| `RiffErrorComFailure` | A Windows COM, WASAPI, or Media Foundation call failed. |
+| `RiffErrorMemoryAllocation` | Native memory allocation failed. |
+| `RiffErrorDecodeFailed` | Media Foundation did not produce usable decoded PCM data. |
+| `RiffErrorUnsupportedFormat` | The current device/source format is not supported by this renderer. |
+
+```vb
+Dim buf As Long
+buf = RiffLoad("C:\Sounds\missing.wav")
+
+If buf = -1 Then
+    Debug.Print "Riff error:", RiffLastError
+End If
+```
+
+### RiffMaxVoices / RiffMaxBuffers / RiffMaxBuses
+
+```vb
+Public Property Get RiffMaxVoices() As Long
+Public Property Get RiffMaxBuffers() As Long
+Public Property Get RiffMaxBuses() As Long
+```
+
+Returns the engine's fixed public pool sizes: 32 voices, 64 buffers, and 8 buses. Use these properties when iterating over handles instead of hard-coding upper bounds.
+
 ## Global Settings and Asset Management
 
 ### RiffMasterVolume
@@ -235,18 +281,18 @@ RiffMasterVolume = 0.75
 ### RiffBusVolume
 
 ```vb
-Public Property Get RiffBusVolume(ByVal busID As Long) As Single
-Public Property Let RiffBusVolume(ByVal busID As Long, ByVal value As Single)
+Public Property Get RiffBusVolume(ByVal busID As RiffBusId) As Single
+Public Property Let RiffBusVolume(ByVal busID As RiffBusId, ByVal value As Single)
 ```
 
-Gets or sets the volume multiplier for the specified audio bus. `busID` must be between `0` and `7`. Valid range is `0.0` to `2.0` (values above `1.0` amplify). Values out of range are clamped.
+Gets or sets the volume multiplier for the specified audio bus. Prefer `RiffBusId` values such as `RiffBusMain`, `RiffBusSfx`, `RiffBusMusic`, `RiffBusVoice`, and `RiffBusUi`. Valid range is `0.0` to `2.0` (values above `1.0` amplify). Values out of range are clamped.
 
 ```vb
 ' Silence the music bus
-RiffBusVolume(0) = 0.0
+RiffBusVolume(RiffBusMusic) = 0.0
 
 ' Boost the SFX bus slightly
-RiffBusVolume(1) = 1.2
+RiffBusVolume(RiffBusSfx) = 1.2
 ```
 
 ### RiffMasterGetPeak
@@ -301,7 +347,7 @@ Decodes audio directly from a `Byte` array in memory, without requiring any file
 
 `audioData`: A `Byte` array containing the complete binary content of a supported audio file.
 
-**Returns:** A buffer handle (`0` to `63`) on success, or `-1` on failure.
+**Returns:** A buffer handle (`0` to `63`) on success, or `-1` when the array is uninitialized or empty, the engine cannot allocate memory, or Media Foundation cannot decode the audio. Inspect `RiffLastError` for the specific failure reason.
 
 ```vb
 Dim audioBytes() As Byte
@@ -353,7 +399,7 @@ Exports a loaded buffer to a standard **16-bit stereo PCM WAV** file. The source
 
 `filePath`: Destination path for the WAV file. Existing files may be overwritten by VBA's binary file output path.
 
-**Returns:** `True` if the WAV file was written successfully. `False` if the engine is not initialized, the buffer handle is invalid, the buffer is empty, or the output path cannot be written.
+**Returns:** `True` if the WAV file was written successfully. `False` if the engine is not initialized, the buffer handle is invalid, or the buffer is empty. File I/O failures are not swallowed by Riff and will surface as VBA runtime errors.
 
 ```vb
 Dim buf As Long
@@ -372,14 +418,14 @@ End If
 ### RiffRenderOscillatorWav
 
 ```vb
-Public Function RiffRenderOscillatorWav(ByVal waveType As Long, ByVal frequencyHz As Single, ByVal durationSec As Single, ByVal filePath As String) As Boolean
+Public Function RiffRenderOscillatorWav(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal durationSec As Single, ByVal filePath As String) As Boolean
 ```
 
 Renders a generated oscillator directly to a **16-bit stereo PCM WAV** file without creating a playback voice. This is useful for generating test tones, UI beeps, retro SFX, and waveform assets directly from VBA.
 
 **Parameters:**
 
-`waveType`: Oscillator waveform. `0` = Sine, `1` = Square, `2` = Sawtooth, `3` = Noise. Square and sawtooth are band-limited with BLEP to reduce high-frequency aliasing.
+`waveType`: Oscillator waveform. Use `RiffWaveSine`, `RiffWaveSquare`, `RiffWaveSawtooth`, or `RiffWaveNoise`. Square and sawtooth are band-limited with BLEP to reduce high-frequency aliasing.
 
 `frequencyHz`: Oscillator frequency in Hz. Values below `1.0` are normalized to `440.0`.
 
@@ -387,12 +433,12 @@ Renders a generated oscillator directly to a **16-bit stereo PCM WAV** file with
 
 `filePath`: Destination path for the WAV file.
 
-**Returns:** `True` if the WAV file was written successfully. `False` if the engine is not initialized, the duration is invalid, or the output path cannot be written.
+**Returns:** `True` if the WAV file was written successfully. `False` if the engine is not initialized or the duration is invalid. File I/O failures are not swallowed by Riff and will surface as VBA runtime errors.
 
 ```vb
-RiffRenderOscillatorWav 0, 440, 2, "C:\Tones\sine_a4.wav"
-RiffRenderOscillatorWav 1, 220, 1, "C:\Tones\square_a3.wav"
-RiffRenderOscillatorWav 2, 110, 1, "C:\Tones\saw_a2.wav"
+RiffRenderOscillatorWav RiffWaveSine, 440, 2, "C:\Tones\sine_a4.wav"
+RiffRenderOscillatorWav RiffWaveSquare, 220, 1, "C:\Tones\square_a3.wav"
+RiffRenderOscillatorWav RiffWaveSawtooth, 110, 1, "C:\Tones\saw_a2.wav"
 ```
 
 > [!NOTE]
@@ -427,7 +473,7 @@ End If
 ### RiffPlayOscillator
 
 ```vb
-Public Function RiffPlayOscillator(ByVal waveType As Long, ByVal frequencyHz As Single) As Long
+Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single) As Long
 ```
 
 Spawns a voice that generates audio mathematically from a waveform oscillator instead of reading from a buffer. The oscillator runs indefinitely until stopped manually, since it has no natural end point. Square and sawtooth oscillators use BLEP band-limiting to reduce aliasing at high frequencies.
@@ -436,12 +482,12 @@ Spawns a voice that generates audio mathematically from a waveform oscillator in
 
 `waveType`: Selects the waveform shape. Valid values:
 
-| Value | Waveform |
+| Enum | Waveform |
 |:---|:---|
-| `0` | Sine: smooth, pure tone |
-| `1` | Square: hollow, buzzy tone at half amplitude |
-| `2` | Sawtooth: bright, aggressive ramp wave |
-| `3` | Noise: random white noise |
+| `RiffWaveSine` | Sine: smooth, pure tone |
+| `RiffWaveSquare` | Square: hollow, buzzy tone at half amplitude |
+| `RiffWaveSawtooth` | Sawtooth: bright, aggressive ramp wave |
+| `RiffWaveNoise` | Noise: random white noise |
 
 `frequencyHz`: The pitch in Hz. Minimum value is `1.0`. Defaults to `440.0` Hz (concert A) if a value below `1.0` is passed.
 
@@ -449,7 +495,7 @@ Spawns a voice that generates audio mathematically from a waveform oscillator in
 
 ```vb
 Dim osc As Long
-osc = RiffPlayOscillator(0, 440.0) ' Sine at A4
+osc = RiffPlayOscillator(RiffWaveSine, 440.0)
 
 RiffVoiceVolume(osc) = 0.5
 RiffVoiceReverbMix(osc) = 0.3
@@ -580,14 +626,14 @@ Returns `True` if the voice is currently in a paused state.
 ### RiffVoiceBus
 
 ```vb
-Public Property Get RiffVoiceBus(ByVal voiceHandle As Long) As Long
-Public Property Let RiffVoiceBus(ByVal voiceHandle As Long, ByVal value As Long)
+Public Property Get RiffVoiceBus(ByVal voiceHandle As Long) As RiffBusId
+Public Property Let RiffVoiceBus(ByVal voiceHandle As Long, ByVal value As RiffBusId)
 ```
 
-Gets or sets the audio bus this voice routes to. Valid range is `0` to `7`. Defaults to `0`.
+Gets or sets the audio bus this voice routes to. Defaults to `RiffBusMain`.
 
 ```vb
-RiffVoiceBus(v) = 2  ' Route to bus 2 (e.g., "Voice" group)
+RiffVoiceBus(v) = RiffBusVoice
 ```
 
 ### RiffVoiceGetPeak
@@ -1102,10 +1148,10 @@ End Sub
 ```vb
 Sub PlayUIBeep()
     Dim v As Long
-    v = RiffPlayOscillator(0, 880.0)  ' Sine at 880 Hz
+    v = RiffPlayOscillator(RiffWaveSine, 880.0)
 
     RiffVoiceVolume(v) = 0.3
-    RiffVoiceBus(v) = 3  ' Route to UI bus
+    RiffVoiceBus(v) = RiffBusUi
     RiffFadeOut v, 0.15  ' Quick fade out
 End Sub
 ```
@@ -1127,7 +1173,7 @@ End Sub
 ```vb
 Sub PlayRetroEffect()
     Dim v As Long
-    v = RiffPlayOscillator(1, 220.0)  ' Square wave
+    v = RiffPlayOscillator(RiffWaveSquare, 220.0)
 
     RiffVoiceBitDepth(v) = 8
     RiffVoiceSampleRateReduction(v) = 3
@@ -1142,8 +1188,8 @@ End Sub
 ```vb
 Sub SetMusicIntensity(ByVal intensity As Single)
     ' intensity: 0.0 (calm) to 1.0 (full action)
-    RiffBusVolume(0) = intensity        ' Main music track
-    RiffBusVolume(1) = 1.0 - intensity  ' Soft ambient layer
+    RiffBusVolume(RiffBusMusic) = intensity
+    RiffBusVolume(RiffBusSfx) = 1.0 - intensity
 End Sub
 ```
 
@@ -1172,8 +1218,8 @@ End Sub
 Sub RenderTone()
     If Not RiffOpen() Then Exit Sub
 
-    RiffRenderOscillatorWav 0, 440, 3, "C:\Tones\a4_sine.wav"
-    RiffRenderOscillatorWav 1, 220, 1, "C:\Tones\a3_square.wav"
+    RiffRenderOscillatorWav RiffWaveSine, 440, 3, "C:\Tones\a4_sine.wav"
+    RiffRenderOscillatorWav RiffWaveSquare, 220, 1, "C:\Tones\a3_square.wav"
 End Sub
 ```
 

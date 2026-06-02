@@ -139,15 +139,25 @@ Buses are global volume groups. They are useful when your project needs independ
 
 ```vb
 Public Sub ConfigureBuses(ByVal musicVoice As Long, ByVal sfxVoice As Long)
-    Const BUS_MUSIC As Long = 0
-    Const BUS_SFX As Long = 1
+    RiffVoiceBus(musicVoice) = RiffBusMusic
+    RiffVoiceBus(sfxVoice) = RiffBusSfx
 
-    RiffVoiceBus(musicVoice) = BUS_MUSIC
-    RiffVoiceBus(sfxVoice) = BUS_SFX
-
-    RiffBusVolume(BUS_MUSIC) = 0.45
-    RiffBusVolume(BUS_SFX) = 1!
+    RiffBusVolume(RiffBusMusic) = 0.45
+    RiffBusVolume(RiffBusSfx) = 1!
 End Sub
+```
+
+### Inspect failures
+
+Functions that return `False` or `-1` update `RiffLastError`.
+
+```vb
+Dim bufferId As Long
+bufferId = RiffLoad("C:\Audio\missing.wav")
+
+If bufferId = -1 Then
+    Debug.Print "Riff error:", RiffLastError
+End If
 ```
 
 ### Create a synthesized alert tone
@@ -159,7 +169,7 @@ Public Sub PlayAlertTone()
     If Not RiffOpen() Then Exit Sub
 
     Dim voiceId As Long
-    voiceId = RiffPlayOscillator(0, 880) ' 0 = sine, frequency is in Hz.
+    voiceId = RiffPlayOscillator(RiffWaveSine, 880)
 
     If voiceId >= 0 Then
         RiffVoiceVolume(voiceId) = 0.25
@@ -206,8 +216,7 @@ Public Sub ExportExamples()
         RiffExportBufferWav bufferId, "C:\Audio\source_export.wav"
     End If
 
-    ' 1 = square oscillator, 110 Hz, 2.5 seconds.
-    RiffRenderOscillatorWav 1, 110, 2.5, "C:\Audio\square_110hz.wav"
+    RiffRenderOscillatorWav RiffWaveSquare, 110, 2.5, "C:\Audio\square_110hz.wav"
 End Sub
 ```
 
