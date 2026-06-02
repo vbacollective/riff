@@ -1,3 +1,4 @@
+Attribute VB_Name = "Riff"
 '/**
 ' * Riff - Audio Engine (Studio DSP Edition)
 ' * @description A high-performance, COM-based WASAPI audio engine for VBA (x86/x64 compatible).
@@ -5,7 +6,7 @@
 ' * Studio DSP Pipeline featuring Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad EQ, Bitcrusher,
 ' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, and Peak Meters.
 ' * @author UesleiDev
-' * @version 1.0.6
+' * @version 1.0.7
 ' */
 
 Option Explicit
@@ -24,11 +25,28 @@ Private Const RIFF_VOICE_COUNT As Long = 32
 Private Const RIFF_MAX_VOICE_INDEX As Long = RIFF_VOICE_COUNT - 1
 
 '/** @description Total audio bus slots exposed by the engine. */
-Private Const RIFF_BUS_COUNT As Long = 8
+Private Const RIFF_BUS_COUNT As Long = 16
 
 '/** @description Highest valid audio bus index. */
 Private Const RIFF_MAX_BUS_INDEX As Long = RIFF_BUS_COUNT - 1
 
+
+
+'/**
+' * @struct RiffBus
+' * @brief Mixer bus state used for grouped volume, fades, mute, solo, and peak metering.
+' */
+Private Type RiffBus
+    Volume As Single
+    targetVolume As Single
+    FadeStartVolume As Single
+    FadeFramesCurrent As Long
+    FadeFramesTotal As Long
+    PeakL As Single
+    PeakR As Single
+    Muted As Boolean
+    Solo As Boolean
+End Type
 
 #If VBA7 Then
     '/** @description Allocates physical memory pages. */
@@ -150,8 +168,13 @@ Private Const RIFF_MAX_BUS_INDEX As Long = RIFF_BUS_COUNT - 1
         TimerID As LongPtr
         RenderPeriodMs As Long
         MaxWriteFrames As Long
+        TimerResolutionActive As Boolean
+        TimerCallbackActive As Boolean
+        IdleTimerTicks As Long
+        AutoSuspendTimer As Boolean
+        HasSoloBus As Boolean
         Buffers(0 To RIFF_MAX_BUFFER_INDEX) As RiffBuffer
-        Buses(0 To RIFF_MAX_BUS_INDEX) As Single
+        Buses(0 To RIFF_MAX_BUS_INDEX) As RiffBus
     End Type
 #Else
     '/** @description Allocates physical memory pages. */
@@ -273,8 +296,13 @@ Private Const RIFF_MAX_BUS_INDEX As Long = RIFF_BUS_COUNT - 1
         TimerID As Long
         RenderPeriodMs As Long
         MaxWriteFrames As Long
+        TimerResolutionActive As Boolean
+        TimerCallbackActive As Boolean
+        IdleTimerTicks As Long
+        AutoSuspendTimer As Boolean
+        HasSoloBus As Boolean
         Buffers(0 To RIFF_MAX_BUFFER_INDEX) As RiffBuffer
-        Buses(0 To RIFF_MAX_BUS_INDEX) As Single
+        Buses(0 To RIFF_MAX_BUS_INDEX) As RiffBus
     End Type
 #End If
 
@@ -592,10 +620,13 @@ Private Const RIFF_SAFEARRAY_OFFSET_COUNT_32 As Long = 16
 Private Const RIFF_SAFEARRAY_OFFSET_COUNT_64 As Long = 24
 
 '/** @description Low-latency render tick interval in milliseconds. */
-Private Const RIFF_RENDER_PERIOD_MS As Long = 10
+Private Const RIFF_RENDER_PERIOD_MS As Long = 5
+
+'/** @description Number of idle timer ticks before the render timer suspends itself to release the VBE. */
+Private Const RIFF_IDLE_TIMER_STOP_TICKS As Long = 50
 
 '/** @description Maximum audio chunk written per timer tick in milliseconds. Keeps enough headroom to avoid chopped playback. */
-Private Const RIFF_MAX_WRITE_MS As Long = 25
+Private Const RIFF_MAX_WRITE_MS As Long = 100
 
 '/** @description Requested WASAPI shared buffer duration in milliseconds. Avoids underruns while still preventing a long silent queue. */
 Private Const RIFF_DEVICE_BUFFER_MS As Long = 100
@@ -1000,6 +1031,112 @@ Private Function RiffRequireVoiceHandle(ByVal voiceHandle As Long) As Boolean
 End Function
 
 '/**
+' * @function RiffClampBusVolume
+' * @brief Clamps a bus volume multiplier to the safe public bus range.
+' * @param value Input volume multiplier.
+' * @return {Single} Clamped volume multiplier.
+' */
+Private Function RiffClampBusVolume(ByVal value As Single) As Single
+    If value < 0! Then
+        RiffClampBusVolume = 0!
+    ElseIf value > RIFF_MAX_BUS_VOLUME Then
+        RiffClampBusVolume = RIFF_MAX_BUS_VOLUME
+    Else
+        RiffClampBusVolume = value
+    End If
+End Function
+
+'/**
+' * @function RiffResetBusState
+' * @brief Restores a bus to neutral mixer state.
+' * @param busID The target bus index.
+' */
+Private Sub RiffResetBusState(ByVal busID As Long)
+    If busID < 0 Or busID > RIFF_MAX_BUS_INDEX Then
+        Exit Sub
+    End If
+
+    rCtx.Buses(busID).Volume = RIFF_UNITY_GAIN
+    rCtx.Buses(busID).targetVolume = RIFF_UNITY_GAIN
+    rCtx.Buses(busID).FadeStartVolume = RIFF_UNITY_GAIN
+    rCtx.Buses(busID).FadeFramesCurrent = 0
+    rCtx.Buses(busID).FadeFramesTotal = 0
+    rCtx.Buses(busID).PeakL = 0!
+    rCtx.Buses(busID).PeakR = 0!
+    rCtx.Buses(busID).Muted = False
+    rCtx.Buses(busID).Solo = False
+End Sub
+
+'/**
+' * @function RiffRefreshSoloState
+' * @brief Recomputes the fast global flag used to decide whether solo routing is active.
+' */
+Private Sub RiffRefreshSoloState()
+    Dim i As Long
+
+    rCtx.HasSoloBus = False
+    For i = 0 To RIFF_MAX_BUS_INDEX
+        If rCtx.Buses(i).Solo Then
+            rCtx.HasSoloBus = True
+            Exit Sub
+        End If
+    Next i
+End Sub
+
+'/**
+' * @function RiffTickBusFades
+' * @brief Advances all active bus fades by the requested number of rendered frames.
+' * @param renderedFrames Number of audio frames being rendered this tick.
+' */
+Private Sub RiffTickBusFades(ByVal renderedFrames As Long)
+    Dim i As Long
+    Dim t As Single
+
+    If renderedFrames <= 0 Then
+        Exit Sub
+    End If
+
+    For i = 0 To RIFF_MAX_BUS_INDEX
+        If rCtx.Buses(i).FadeFramesTotal > 0 Then
+            rCtx.Buses(i).FadeFramesCurrent = rCtx.Buses(i).FadeFramesCurrent + renderedFrames
+            If rCtx.Buses(i).FadeFramesCurrent >= rCtx.Buses(i).FadeFramesTotal Then
+                rCtx.Buses(i).Volume = rCtx.Buses(i).targetVolume
+                rCtx.Buses(i).FadeFramesCurrent = 0
+                rCtx.Buses(i).FadeFramesTotal = 0
+                rCtx.Buses(i).FadeStartVolume = rCtx.Buses(i).Volume
+            Else
+                t = CSng(rCtx.Buses(i).FadeFramesCurrent) / CSng(rCtx.Buses(i).FadeFramesTotal)
+                rCtx.Buses(i).Volume = rCtx.Buses(i).FadeStartVolume + ((rCtx.Buses(i).targetVolume - rCtx.Buses(i).FadeStartVolume) * t)
+            End If
+        End If
+
+        rCtx.Buses(i).PeakL = rCtx.Buses(i).PeakL * RIFF_ACTIVE_PEAK_DECAY
+        rCtx.Buses(i).PeakR = rCtx.Buses(i).PeakR * RIFF_ACTIVE_PEAK_DECAY
+    Next i
+End Sub
+
+'/**
+' * @function RiffBusMixVolume
+' * @brief Returns the effective bus volume used by the mixer after mute and solo routing.
+' * @param busID The target bus index.
+' * @return {Single} Effective gain for this render pass.
+' */
+Private Function RiffBusMixVolume(ByVal busID As RiffBusId) As Single
+    If busID < RiffBusMain Or busID > RIFF_MAX_BUS_INDEX Then
+        RiffBusMixVolume = 0!
+        Exit Function
+    End If
+
+    If rCtx.Buses(busID).Muted Then
+        RiffBusMixVolume = 0!
+    ElseIf rCtx.HasSoloBus And Not rCtx.Buses(busID).Solo Then
+        RiffBusMixVolume = 0!
+    Else
+        RiffBusMixVolume = rCtx.Buses(busID).Volume
+    End If
+End Function
+
+'/**
 ' * @function RiffClampBusId
 ' * @brief Clamps an enum-backed bus value to the valid bus range.
 ' */
@@ -1131,8 +1268,9 @@ Public Function RiffOpen() As Boolean
 
     Dim i As Long
     For i = 0 To RIFF_MAX_BUS_INDEX
-        rCtx.Buses(i) = RIFF_UNITY_GAIN
+        RiffResetBusState i
     Next i
+    rCtx.HasSoloBus = False
 
     If Not InitThunks() Then
         RiffSetLastError RiffErrorMemoryAllocation
@@ -1155,19 +1293,6 @@ Public Function RiffOpen() As Boolean
 
     ReDim rRingBuf(0 To (RIFF_VOICE_COUNT * RIFF_RING_SAMPLES_PER_VOICE) + 1)
 
-    timeBeginPeriod RIFF_TIMER_RESOLUTION_MS
-
-    rCtx.TimerID = SetTimer(0, 0, rCtx.RenderPeriodMs, rCtx.ThunkTimerCB)
-
-    If rCtx.TimerID = 0 Then
-        timeEndPeriod RIFF_TIMER_RESOLUTION_MS
-        ReleaseWASAPI
-        MFShutdown
-        FreeThunks
-        RiffSetLastError RiffErrorComFailure
-        Exit Function
-    End If
-
     rCtx.Initialized = True
     RiffOpen = True
 End Function
@@ -1184,11 +1309,7 @@ Public Sub RiffClose()
     
     rCtx.MagicCookie = 0
     
-    If rCtx.TimerID <> 0 Then
-        KillTimer 0, rCtx.TimerID
-        rCtx.TimerID = 0
-        timeEndPeriod RIFF_TIMER_RESOLUTION_MS
-    End If
+    RiffStopRenderTimer
     
     Dim i As Long
     For i = 0 To RIFF_MAX_VOICE_INDEX
@@ -1231,6 +1352,40 @@ End Sub
 Public Property Get RiffIsInitialized() As Boolean
     RiffIsInitialized = rCtx.Initialized
 End Property
+
+'/**
+' * @property RiffAutoSuspendTimer
+' * @brief Gets or sets whether the render timer automatically stops while no voices are active.
+' */
+Public Property Get RiffAutoSuspendTimer() As Boolean
+    RiffAutoSuspendTimer = rCtx.AutoSuspendTimer
+End Property
+
+'/**
+' * @property RiffAutoSuspendTimer
+' * @brief Enables or disables automatic render timer suspension when playback is idle.
+' * @param value True to suspend the timer while idle, False to keep it alive until RiffClose.
+' */
+Public Property Let RiffAutoSuspendTimer(ByVal value As Boolean)
+    rCtx.AutoSuspendTimer = value
+End Property
+
+'/**
+' * @function RiffSuspend
+' * @brief Stops the render timer without unloading buffers or releasing WASAPI resources.
+' */
+Public Sub RiffSuspend()
+    RiffStopRenderTimer
+End Sub
+
+'/**
+' * @function RiffWake
+' * @brief Restarts the render timer when the engine is initialized and playback needs to continue.
+' * @return {Boolean} True when the timer is running or was started successfully.
+' */
+Public Function RiffWake() As Boolean
+    RiffWake = RiffEnsureRenderTimer()
+End Function
 
 '/**
 ' * @property RiffMaxVoices
@@ -1284,7 +1439,7 @@ End Property
 
 '/**
 ' * @property RiffBusVolume
-' * @brief Sets the volume multiplier for a specific Audio Bus (0 to 7).
+' * @brief Gets or sets the volume multiplier for a mixer bus.
 ' * @param busID The target bus index.
 ' */
 Public Property Get RiffBusVolume(ByVal busID As RiffBusId) As Single
@@ -1293,25 +1448,155 @@ Public Property Get RiffBusVolume(ByVal busID As RiffBusId) As Single
     End If
 
     busID = RiffClampBusId(busID)
-    
-    RiffBusVolume = rCtx.Buses(busID)
+    RiffBusVolume = rCtx.Buses(busID).Volume
 End Property
+
+'/**
+' * @property RiffBusVolume
+' * @brief Sets the volume multiplier for a mixer bus immediately and cancels any bus fade in progress.
+' * @param busID The target bus index.
+' * @param value Volume multiplier clamped to 0.0 through RIFF_MAX_BUS_VOLUME.
+' */
 Public Property Let RiffBusVolume(ByVal busID As RiffBusId, ByVal value As Single)
     If Not RiffRequireInitialized() Then
         Exit Property
     End If
 
     busID = RiffClampBusId(busID)
+    value = RiffClampBusVolume(value)
     
-    If value < 0! Then
-        value = 0!
-    End If
-    If value > RIFF_MAX_BUS_VOLUME Then
-        value = RIFF_MAX_BUS_VOLUME
-    End If
-    
-    rCtx.Buses(busID) = value
+    rCtx.Buses(busID).Volume = value
+    rCtx.Buses(busID).targetVolume = value
+    rCtx.Buses(busID).FadeStartVolume = value
+    rCtx.Buses(busID).FadeFramesCurrent = 0
+    rCtx.Buses(busID).FadeFramesTotal = 0
 End Property
+
+'/**
+' * @property RiffBusMuted
+' * @brief Gets or sets whether a mixer bus is muted without changing its stored volume.
+' * @param busID The target bus index.
+' */
+Public Property Get RiffBusMuted(ByVal busID As RiffBusId) As Boolean
+    If Not RiffRequireInitialized() Then
+        Exit Property
+    End If
+
+    busID = RiffClampBusId(busID)
+    RiffBusMuted = rCtx.Buses(busID).Muted
+End Property
+
+'/**
+' * @property RiffBusMuted
+' * @brief Mutes or unmutes a mixer bus without changing its stored volume.
+' * @param busID The target bus index.
+' * @param value True to mute the bus, False to unmute it.
+' */
+Public Property Let RiffBusMuted(ByVal busID As RiffBusId, ByVal value As Boolean)
+    If Not RiffRequireInitialized() Then
+        Exit Property
+    End If
+
+    busID = RiffClampBusId(busID)
+    rCtx.Buses(busID).Muted = value
+End Property
+
+'/**
+' * @property RiffBusSolo
+' * @brief Gets or sets whether a mixer bus is soloed.
+' * @param busID The target bus index.
+' */
+Public Property Get RiffBusSolo(ByVal busID As RiffBusId) As Boolean
+    If Not RiffRequireInitialized() Then
+        Exit Property
+    End If
+
+    busID = RiffClampBusId(busID)
+    RiffBusSolo = rCtx.Buses(busID).Solo
+End Property
+
+'/**
+' * @property RiffBusSolo
+' * @brief Solos or unsolos a mixer bus and updates the global solo routing state.
+' * @param busID The target bus index.
+' * @param value True to solo the bus, False to unsolo it.
+' */
+Public Property Let RiffBusSolo(ByVal busID As RiffBusId, ByVal value As Boolean)
+    If Not RiffRequireInitialized() Then
+        Exit Property
+    End If
+
+    busID = RiffClampBusId(busID)
+    rCtx.Buses(busID).Solo = value
+    RiffRefreshSoloState
+End Property
+
+'/**
+' * @function RiffBusFadeTo
+' * @brief Smoothly fades a mixer bus to the requested volume over a duration in milliseconds.
+' * @param busID The target bus index.
+' * @param targetVolume Destination volume multiplier.
+' * @param durationMs Fade duration in milliseconds. Values at or below zero apply immediately.
+' */
+Public Sub RiffBusFadeTo(ByVal busID As RiffBusId, ByVal targetVolume As Single, Optional ByVal durationMs As Long = 250)
+    If Not RiffRequireInitialized() Then
+        Exit Sub
+    End If
+
+    busID = RiffClampBusId(busID)
+    targetVolume = RiffClampBusVolume(targetVolume)
+
+    If durationMs <= 0 Or rCtx.sampleRate <= 0 Then
+        rCtx.Buses(busID).Volume = targetVolume
+        rCtx.Buses(busID).targetVolume = targetVolume
+        rCtx.Buses(busID).FadeStartVolume = targetVolume
+        rCtx.Buses(busID).FadeFramesCurrent = 0
+        rCtx.Buses(busID).FadeFramesTotal = 0
+        Exit Sub
+    End If
+
+    rCtx.Buses(busID).FadeStartVolume = rCtx.Buses(busID).Volume
+    rCtx.Buses(busID).targetVolume = targetVolume
+    rCtx.Buses(busID).FadeFramesCurrent = 0
+    rCtx.Buses(busID).FadeFramesTotal = CLng((CDbl(durationMs) * CDbl(rCtx.sampleRate)) / CDbl(RIFF_MS_PER_SEC))
+    If rCtx.Buses(busID).FadeFramesTotal < 1 Then
+        rCtx.Buses(busID).FadeFramesTotal = 1
+    End If
+End Sub
+
+'/**
+' * @function RiffBusGetPeak
+' * @brief Retrieves the current peak amplitude measured after bus routing for metering.
+' * @param busID The target bus index.
+' * @param peakLeft Variable to receive the left channel peak.
+' * @param peakRight Variable to receive the right channel peak.
+' */
+Public Sub RiffBusGetPeak(ByVal busID As RiffBusId, ByRef peakLeft As Single, ByRef peakRight As Single)
+    If Not RiffRequireInitialized() Then
+        peakLeft = 0!
+        peakRight = 0!
+        Exit Sub
+    End If
+
+    busID = RiffClampBusId(busID)
+    peakLeft = rCtx.Buses(busID).PeakL
+    peakRight = rCtx.Buses(busID).PeakR
+End Sub
+
+'/**
+' * @function RiffBusReset
+' * @brief Resets a mixer bus to neutral volume, no fade, no mute, no solo, and cleared peak meters.
+' * @param busID The target bus index.
+' */
+Public Sub RiffBusReset(ByVal busID As RiffBusId)
+    If Not RiffRequireInitialized() Then
+        Exit Sub
+    End If
+
+    busID = RiffClampBusId(busID)
+    RiffResetBusState busID
+    RiffRefreshSoloState
+End Sub
 
 '/**
 ' * @function RiffMasterGetPeak
@@ -1624,6 +1909,10 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
     totalSize = 0
     Do
         pSample = 0
+        pBuffer = 0
+        pAudioData = 0
+        cbMax = 0
+        cbLen = 0
         hrInvoke = DispCallFunc(pReader, VTI_MF_SOURCE_READER_READ_SAMPLE * pSz, CC_STDCALL, vbLong, 6, rTypes(0), rPtrs(0), vRet)
         
         If hrInvoke <> 0 Then
@@ -1647,11 +1936,21 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
                         currentCap = (totalSize + cbLen) * RIFF_DECODE_GROWTH_FACTOR
                         newPtr = VirtualAlloc(0, currentCap, MEM_COMMIT Or MEM_RESERVE, PAGE_READWRITE)
                         
-                        If newPtr <> 0 Then
-                            RtlMoveMemory ByVal newPtr, ByVal tempPtr, totalSize
-                            VirtualFree tempPtr, 0, MEM_RELEASE
-                            tempPtr = newPtr
+                        If newPtr = 0 Then
+                            vCall0 pBuffer, VTI_MF_MEDIA_BUFFER_UNLOCK
+                            vCall0 pBuffer, VTI_IUNKNOWN_RELEASE
+                            vCall0 pSample, VTI_IUNKNOWN_RELEASE
+                            vCall0 pReader, VTI_IUNKNOWN_RELEASE
+                            If tempPtr <> 0 Then
+                                VirtualFree tempPtr, 0, MEM_RELEASE
+                            End If
+                            RiffSetLastError RiffErrorMemoryAllocation
+                            Exit Function
                         End If
+
+                        RtlMoveMemory ByVal newPtr, ByVal tempPtr, totalSize
+                        VirtualFree tempPtr, 0, MEM_RELEASE
+                        tempPtr = newPtr
                     End If
                     
                     If tempPtr <> 0 Then
@@ -2033,7 +2332,18 @@ End Function
 ' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
 ' */
 Public Function RiffPlay(ByVal bufferHandle As Long) As Long
-    RiffPlay = -1
+    RiffPlay = RiffPlayBus(bufferHandle, RiffBusMain)
+End Function
+
+'/**
+' * @function RiffPlayBus
+' * @brief Plays a pre-loaded static audio buffer on an available voice and routes it to a bus before activation.
+' * @param bufferHandle The target buffer.
+' * @param busID Mixer bus that will receive the voice.
+' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
+' */
+Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId) As Long
+    RiffPlayBus = -1
     RiffSetLastError RiffErrorNone
 
     If Not RiffRequireBufferHandle(bufferHandle) Then
@@ -2043,6 +2353,8 @@ Public Function RiffPlay(ByVal bufferHandle As Long) As Long
         RiffSetLastError RiffErrorInvalidBuffer
         Exit Function
     End If
+    
+    busID = RiffClampBusId(busID)
     
     Dim voiceSlot As Long
     voiceSlot = InternalGetFreeVoice()
@@ -2058,10 +2370,20 @@ Public Function RiffPlay(ByVal bufferHandle As Long) As Long
     rVoices(voiceSlot).BufferIndex = bufferHandle
     rVoices(voiceSlot).Position = 0#
     rVoices(voiceSlot).loopEnd = CDbl(rCtx.Buffers(bufferHandle).BufferLen)
+    rVoices(voiceSlot).busID = busID
+
+    If Not RiffEnsureRenderTimer() Then
+        rVoices(voiceSlot).Playing = False
+        rVoices(voiceSlot).Active = False
+        RiffPlayBus = -1
+        Exit Function
+    End If
+
     rVoices(voiceSlot).Playing = True
     rVoices(voiceSlot).Active = True
+    rCtx.IdleTimerTicks = 0
     
-    RiffPlay = voiceSlot
+    RiffPlayBus = voiceSlot
 End Function
 
 '/**
@@ -2100,11 +2422,73 @@ Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequen
     rVoices(voiceSlot).OscFreq = frequencyHz
     rVoices(voiceSlot).OscPhase = 0#
     rVoices(voiceSlot).BufferIndex = -1
+
+    If Not RiffEnsureRenderTimer() Then
+        rVoices(voiceSlot).Playing = False
+        rVoices(voiceSlot).Active = False
+        RiffPlayOscillator = -1
+        Exit Function
+    End If
     
     rVoices(voiceSlot).Playing = True
     rVoices(voiceSlot).Active = True
+    rCtx.IdleTimerTicks = 0
     
     RiffPlayOscillator = voiceSlot
+End Function
+
+'/**
+' * @function RiffPlayOscillatorBus
+' * @brief Generates and plays a synthesized waveform routed to a bus before activation.
+' * @param waveType Oscillator waveform enum.
+' * @param frequencyHz Pitch frequency in Hz.
+' * @param busID Mixer bus that will receive the voice.
+' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
+' */
+Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId) As Long
+    RiffPlayOscillatorBus = -1
+    RiffSetLastError RiffErrorNone
+
+    If Not RiffRequireInitialized() Then
+        Exit Function
+    End If
+
+    busID = RiffClampBusId(busID)
+    waveType = RiffClampWaveType(waveType)
+
+    If frequencyHz < 1! Then
+        frequencyHz = RIFF_DEFAULT_OSCILLATOR_HZ
+    End If
+    
+    Dim voiceSlot As Long
+    voiceSlot = InternalGetFreeVoice()
+    
+    If voiceSlot = -1 Then
+        RiffSetLastError RiffErrorNoFreeVoice
+        Exit Function
+    End If
+    
+    InternalResetVoiceDSP voiceSlot
+    
+    rVoices(voiceSlot).IsOscillator = True
+    rVoices(voiceSlot).OscType = waveType
+    rVoices(voiceSlot).OscFreq = frequencyHz
+    rVoices(voiceSlot).OscPhase = 0#
+    rVoices(voiceSlot).BufferIndex = -1
+    rVoices(voiceSlot).busID = busID
+
+    If Not RiffEnsureRenderTimer() Then
+        rVoices(voiceSlot).Playing = False
+        rVoices(voiceSlot).Active = False
+        RiffPlayOscillatorBus = -1
+        Exit Function
+    End If
+
+    rVoices(voiceSlot).Playing = True
+    rVoices(voiceSlot).Active = True
+    rCtx.IdleTimerTicks = 0
+    
+    RiffPlayOscillatorBus = voiceSlot
 End Function
 
 '/**
@@ -2263,6 +2647,7 @@ Public Sub RiffResume(ByVal voiceHandle As Long)
     
     If rVoices(voiceHandle).Active Then
         rVoices(voiceHandle).Paused = False
+        RiffEnsureRenderTimer
     End If
 End Sub
 
@@ -2294,6 +2679,8 @@ Public Sub RiffStopAll()
         rVoices(i).Playing = False
         rVoices(i).Active = False
     Next i
+
+    RiffStopRenderTimer
 End Sub
 
 '/**
@@ -2403,6 +2790,107 @@ Public Property Get RiffVoiceIsPlaying(ByVal voiceHandle As Long) As Boolean
 End Property
 
 '/**
+' * @function RiffVoicePlaying
+' * @brief Returns whether a voice handle is valid, active, and currently playing.
+' * @param voiceHandle The voice handle to inspect.
+' * @return {Boolean} True when the voice exists, is active, and is not stopped.
+' */
+Public Function RiffVoicePlaying(ByVal voiceHandle As Long) As Boolean
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        Exit Function
+    End If
+
+    RiffVoicePlaying = (rVoices(voiceHandle).Active And rVoices(voiceHandle).Playing)
+End Function
+
+'/**
+' * @function RiffVoiceActive
+' * @brief Returns whether a voice handle is valid and still owns an active voice slot.
+' * @param voiceHandle The voice handle to inspect.
+' * @return {Boolean} True when the voice exists and has not been released.
+' */
+Public Function RiffVoiceActive(ByVal voiceHandle As Long) As Boolean
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        Exit Function
+    End If
+
+    RiffVoiceActive = rVoices(voiceHandle).Active
+End Function
+
+'/**
+' * @function RiffFindPlayingVoice
+' * @brief Finds the first active playing voice using a specific static buffer.
+' * @param bufferHandle The static audio buffer to search for.
+' * @param busID Optional bus filter. Pass -1 to search all buses.
+' * @return {Long} Voice handle, or -1 when the buffer is not currently playing.
+' */
+Public Function RiffFindPlayingVoice(ByVal bufferHandle As Long, Optional ByVal busID As Long = -1) As Long
+    Dim i As Long
+
+    RiffFindPlayingVoice = -1
+
+    If Not RiffRequireBufferHandle(bufferHandle) Then
+        Exit Function
+    End If
+
+    If busID > RIFF_MAX_BUS_INDEX Then
+        busID = CLng(RiffClampBusId(busID))
+    End If
+
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active Then
+            If rVoices(i).Playing Then
+                If Not rVoices(i).IsOscillator Then
+                    If rVoices(i).BufferIndex = bufferHandle Then
+                        If busID < 0 Or rVoices(i).busID = busID Then
+                            RiffFindPlayingVoice = i
+                            Exit Function
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+'/**
+' * @function RiffBufferIsPlaying
+' * @brief Checks whether a static audio buffer is already playing on any active voice.
+' * @param bufferHandle The static audio buffer to inspect.
+' * @param busID Optional bus filter. Pass -1 to search all buses.
+' * @return {Boolean} True when at least one active playing voice is using the buffer.
+' */
+Public Function RiffBufferIsPlaying(ByVal bufferHandle As Long, Optional ByVal busID As Long = -1) As Boolean
+    RiffBufferIsPlaying = (RiffFindPlayingVoice(bufferHandle, busID) <> -1)
+End Function
+
+'/**
+' * @function RiffPlayBusOnce
+' * @brief Plays a static buffer on a bus only if the same buffer is not already active on that bus.
+' * @param bufferHandle The target buffer.
+' * @param busID Mixer bus that will receive the voice.
+' * @param looped Whether the voice should loop after creation.
+' * @return {Long} Existing or newly-created voice handle, or -1 on failure.
+' */
+Public Function RiffPlayBusOnce(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal looped As Boolean = False) As Long
+    Dim existingVoice As Long
+
+    busID = RiffClampBusId(busID)
+    existingVoice = RiffFindPlayingVoice(bufferHandle, CLng(busID))
+
+    If existingVoice <> -1 Then
+        RiffPlayBusOnce = existingVoice
+        Exit Function
+    End If
+
+    RiffPlayBusOnce = RiffPlayBus(bufferHandle, busID)
+
+    If RiffPlayBusOnce <> -1 Then
+        rVoices(RiffPlayBusOnce).Looping = looped
+    End If
+End Function
+
+'/**
 ' * @property RiffVoiceIsPaused
 ' * @brief Checks if a voice is currently paused.
 ' */
@@ -2415,7 +2903,7 @@ End Property
 
 '/**
 ' * @property RiffVoiceBus
-' * @brief Determines which Audio Bus this voice routes to (0 to 7).
+' * @brief Determines which Audio Bus this voice routes to.
 ' */
 Public Property Get RiffVoiceBus(ByVal voiceHandle As Long) As RiffBusId
     If Not RiffRequireVoiceHandle(voiceHandle) Then
@@ -3615,6 +4103,81 @@ Private Sub RiffProcessFreeverb(ByVal voiceIndex As Long, ByVal baseIndex As Lon
     feedbackRight = feedbackRight + (wetR * fb)
 End Sub
 
+'/**
+' * @function RiffEnsureRenderTimer
+' * @brief Starts the render timer only when it is not already running.
+' * @return {Boolean} True if the timer is available.
+' */
+Private Function RiffEnsureRenderTimer() As Boolean
+    If Not rCtx.Initialized Then
+        RiffSetLastError RiffErrorNotInitialized
+        Exit Function
+    End If
+
+    If rCtx.TimerID <> 0 Then
+        RiffEnsureRenderTimer = True
+        Exit Function
+    End If
+
+    If rCtx.ThunkTimerCB = 0 Then
+        RiffSetLastError RiffErrorComFailure
+        Exit Function
+    End If
+
+    If Not rCtx.TimerResolutionActive Then
+        timeBeginPeriod RIFF_TIMER_RESOLUTION_MS
+        rCtx.TimerResolutionActive = True
+    End If
+
+    rCtx.TimerID = SetTimer(0, 0, rCtx.RenderPeriodMs, rCtx.ThunkTimerCB)
+
+    If rCtx.TimerID = 0 Then
+        If rCtx.TimerResolutionActive Then
+            timeEndPeriod RIFF_TIMER_RESOLUTION_MS
+            rCtx.TimerResolutionActive = False
+        End If
+        RiffSetLastError RiffErrorComFailure
+        Exit Function
+    End If
+
+    rCtx.IdleTimerTicks = 0
+    RiffEnsureRenderTimer = True
+End Function
+
+'/**
+' * @function RiffStopRenderTimer
+' * @brief Stops the render timer and releases the high-resolution timer request without freeing audio buffers.
+' */
+Private Sub RiffStopRenderTimer()
+    If rCtx.TimerID <> 0 Then
+        KillTimer 0, rCtx.TimerID
+        rCtx.TimerID = 0
+    End If
+
+    If rCtx.TimerResolutionActive Then
+        timeEndPeriod RIFF_TIMER_RESOLUTION_MS
+        rCtx.TimerResolutionActive = False
+    End If
+
+    rCtx.IdleTimerTicks = 0
+End Sub
+
+'/**
+' * @function RiffHasActiveVoices
+' * @brief Returns True when at least one voice is currently active and not fully released.
+' * @return {Boolean} True if playback is still active.
+' */
+Private Function RiffHasActiveVoices() As Boolean
+    Dim i As Long
+
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active And rVoices(i).Playing Then
+            RiffHasActiveVoices = True
+            Exit Function
+        End If
+    Next i
+End Function
+
 #If VBA7 Then
 Private Sub RiffTimerCallback(ByVal hWnd As LongPtr, ByVal uMsg As Long, ByVal idEvent As LongPtr, ByVal dwTime As Long)
 #Else
@@ -3623,6 +4186,16 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
     If rCtx.MagicCookie <> RIFF_MAGIC_COOKIE Then
         Exit Sub
     End If
+    If rCtx.TimerCallbackActive Then
+        Exit Sub
+    End If
+    If rCtx.TimerID <> 0 Then
+        If idEvent <> rCtx.TimerID Then
+            Exit Sub
+        End If
+    End If
+
+    rCtx.TimerCallbackActive = True
     
     Dim padding As Long
     Dim framesAvailable As Long
@@ -3740,16 +4313,29 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
     If Not RiffEngineHasActivePlayback() Then
         rCtx.MasterPeakL = rCtx.MasterPeakL * RIFF_MASTER_IDLE_PEAK_DECAY
         rCtx.MasterPeakR = rCtx.MasterPeakR * RIFF_MASTER_IDLE_PEAK_DECAY
+
+        If rCtx.AutoSuspendTimer Then
+            rCtx.IdleTimerTicks = rCtx.IdleTimerTicks + 1
+            If rCtx.IdleTimerTicks >= RIFF_IDLE_TIMER_STOP_TICKS Then
+                RiffStopRenderTimer
+            End If
+        Else
+            rCtx.IdleTimerTicks = 0
+        End If
+
+        rCtx.TimerCallbackActive = False
         Exit Sub
     End If
     
     hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_GET_CURRENT_PADDING, VarPtr(padding))
     If hr <> 0 Then
+        rCtx.TimerCallbackActive = False
         Exit Sub
     End If
     
     framesAvailable = rCtx.BufferSize - padding
     If framesAvailable <= 0 Then
+        rCtx.TimerCallbackActive = False
         Exit Sub
     End If
 
@@ -3759,8 +4345,11 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
         End If
     End If
     
+    RiffTickBusFades framesAvailable
+    
     hr = vCall(rCtx.RenderClient, VTI_AUDIO_RENDER_CLIENT_GET_BUFFER, framesAvailable, VarPtr(pData))
     If hr <> 0 Or pData = 0 Then
+        rCtx.TimerCallbackActive = False
         Exit Sub
     End If
     
@@ -4210,7 +4799,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             End If
                             
                             Dim busVol As Single
-                            busVol = rCtx.Buses(rVoices(i).busID)
+                            busVol = RiffBusMixVolume(rVoices(i).busID)
                             
                             vL = rVoices(i).Volume * rCtx.MasterVolume * busVol
                             vR = rVoices(i).Volume * rCtx.MasterVolume * busVol
@@ -4240,6 +4829,12 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             End If
                             If Abs(rMixArr32(writeIdx + 1)) > currentMasterPeakR Then
                                 currentMasterPeakR = Abs(rMixArr32(writeIdx + 1))
+                            End If
+                            If Abs(fL) > rCtx.Buses(rVoices(i).busID).PeakL Then
+                                rCtx.Buses(rVoices(i).busID).PeakL = Abs(fL)
+                            End If
+                            If Abs(fR) > rCtx.Buses(rVoices(i).busID).PeakR Then
+                                rCtx.Buses(rVoices(i).busID).PeakR = Abs(fR)
                             End If
                             
                             writeIdx = writeIdx + RIFF_WAV_EXPORT_CHANNELS
@@ -4702,7 +5297,7 @@ NextVoice32:
                             End If
                             
                             Dim bVol16 As Single
-                            bVol16 = rCtx.Buses(rVoices(i).busID)
+                            bVol16 = RiffBusMixVolume(rVoices(i).busID)
                             
                             vL = rVoices(i).Volume * rCtx.MasterVolume * bVol16
                             vR = rVoices(i).Volume * rCtx.MasterVolume * bVol16
@@ -4747,6 +5342,12 @@ NextVoice32:
                             End If
                             If Abs(fR) > currentMasterPeakR Then
                                 currentMasterPeakR = Abs(fR)
+                            End If
+                            If Abs(fL) > rCtx.Buses(rVoices(i).busID).PeakL Then
+                                rCtx.Buses(rVoices(i).busID).PeakL = Abs(fL)
+                            End If
+                            If Abs(fR) > rCtx.Buses(rVoices(i).busID).PeakR Then
+                                rCtx.Buses(rVoices(i).busID).PeakR = Abs(fR)
                             End If
                             
                             writeIdx = writeIdx + RIFF_WAV_EXPORT_CHANNELS
@@ -4793,6 +5394,21 @@ NextVoice16:
     End If
     
     vCall rCtx.RenderClient, VTI_AUDIO_RENDER_CLIENT_RELEASE_BUFFER, framesAvailable, 0&
+
+    If rCtx.AutoSuspendTimer Then
+        If RiffEngineHasActivePlayback() Then
+            rCtx.IdleTimerTicks = 0
+        Else
+            rCtx.IdleTimerTicks = rCtx.IdleTimerTicks + 1
+            If rCtx.IdleTimerTicks >= RIFF_IDLE_TIMER_STOP_TICKS Then
+                RiffStopRenderTimer
+            End If
+        End If
+    Else
+        rCtx.IdleTimerTicks = 0
+    End If
+
+    rCtx.TimerCallbackActive = False
 End Sub
 
 '/**
@@ -5184,16 +5800,10 @@ Private Function InitWASAPI() As Boolean
         RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(originalMixBytes(0)), originalMixSize
     End If
 
-    hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
-    If hr <> 0 Then
-        hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, 0&, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
-    End If
+    hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, 0&, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
     If hr <> 0 Then
         RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(originalMixBytes(0)), originalMixSize
-        hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
-        If hr <> 0 Then
-            hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, 0&, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
-        End If
+        hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, 0&, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
     End If
 
     If hr <> 0 Then
@@ -5212,10 +5822,7 @@ Private Function InitWASAPI() As Boolean
         Exit Function
     End If
 
-    rCtx.MaxWriteFrames = (rCtx.sampleRate * RIFF_MAX_WRITE_MS) \ RIFF_MS_PER_SEC
-    If rCtx.MaxWriteFrames < 1 Then
-        rCtx.MaxWriteFrames = 1
-    End If
+    rCtx.MaxWriteFrames = 0
     
     hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_GET_BUFFER_SIZE, VarPtr(rCtx.BufferSize))
     If hr <> 0 Then
