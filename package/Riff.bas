@@ -3011,7 +3011,9 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
     Dim currentMasterPeakR As Single
     currentMasterPeakL = 0!
     currentMasterPeakR = 0!
-    
+    Dim isMixFloat32 As Boolean
+    isMixFloat32 = RiffMixFormatIsFloat32()
+
     If wBits = 32 Then
         Dim mixArr32() As Single
         ReDim mixArr32(0 To (bytesToWrite \ 4) - 1)
@@ -3041,8 +3043,9 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     loopSnd = rVoices(i).Looping
                     loopStart = rVoices(i).loopStart
                     loopEnd = rVoices(i).loopEnd
-                    
+
                     Dim srcArr32() As Single
+                    Dim srcArrI32() As Long
                     framesNeeded = Int(framesAvailable * ptch) + 2
                     bytesNeeded = framesNeeded * align
                     
@@ -3060,22 +3063,43 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             bytesAvail = 0
                         End If
                         
-                        ReDim srcArr32(0 To (bytesNeeded \ 4) - 1)
-                        
+                        If isMixFloat32 Then
+                            ReDim srcArr32(0 To (bytesNeeded \ 4) - 1)
+                        Else
+                            ReDim srcArrI32(0 To (bytesNeeded \ 4) - 1)
+                        End If
+
                         If bytesNeeded <= bytesAvail Then
-                            RtlMoveMemoryToSingle srcArr32(0), ByVal (ptr + readPos), bytesNeeded
+                            If isMixFloat32 Then
+                                RtlMoveMemoryToSingle srcArr32(0), ByVal (ptr + readPos), bytesNeeded
+                            Else
+                                RtlMoveMemory VarPtr(srcArrI32(0)), ByVal (ptr + readPos), bytesNeeded
+                            End If
                         Else
                             If bytesAvail > 0 Then
-                                RtlMoveMemoryToSingle srcArr32(0), ByVal (ptr + readPos), bytesAvail
+                                If isMixFloat32 Then
+                                    RtlMoveMemoryToSingle srcArr32(0), ByVal (ptr + readPos), bytesAvail
+                                Else
+                                    RtlMoveMemory VarPtr(srcArrI32(0)), ByVal (ptr + readPos), bytesAvail
+                                End If
                             End If
                             If loopSnd Then
                                 remBytes = bytesNeeded - bytesAvail
-                                If remBytes > CLng(loopEnd - loopStart) Then
-                                    remBytes = CLng(loopEnd - loopStart)
-                                End If
-                                If remBytes > 0 Then
-                                    RtlMoveMemoryToSingle srcArr32(bytesAvail \ 4), ByVal (ptr + CLng(loopStart)), remBytes
-                                End If
+                                Dim loopBytes32 As Long
+                                Dim chunkBytes32 As Long
+                                loopBytes32 = CLng(loopEnd - loopStart)
+                                Do While remBytes > 0 And loopBytes32 > 0
+                                    chunkBytes32 = remBytes
+                                    If chunkBytes32 > loopBytes32 Then
+                                        chunkBytes32 = loopBytes32
+                                    End If
+                                    If isMixFloat32 Then
+                                        RtlMoveMemoryToSingle srcArr32((bytesNeeded - remBytes) \ 4), ByVal (ptr + CLng(loopStart)), chunkBytes32
+                                    Else
+                                        RtlMoveMemory VarPtr(srcArrI32((bytesNeeded - remBytes) \ 4)), ByVal (ptr + CLng(loopStart)), chunkBytes32
+                                    End If
+                                    remBytes = remBytes - chunkBytes32
+                                Loop
                             End If
                         End If
                         
@@ -3207,12 +3231,23 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 sBase32 = Int(srcIdx)
                                 sID = sBase32 * 2
                                 sFrac32 = CSng(srcIdx - CDbl(sBase32))
-                                If sID + 3 <= UBound(srcArr32) Then
-                                    fL = srcArr32(sID) + ((srcArr32(sID + 2) - srcArr32(sID)) * sFrac32)
-                                    fR = srcArr32(sID + 1) + ((srcArr32(sID + 3) - srcArr32(sID + 1)) * sFrac32)
-                                ElseIf sID + 1 <= UBound(srcArr32) Then
-                                    fL = srcArr32(sID)
-                                    fR = srcArr32(sID + 1)
+                                If isMixFloat32 Then
+                                    If sID + 3 <= UBound(srcArr32) Then
+                                        fL = srcArr32(sID) + ((srcArr32(sID + 2) - srcArr32(sID)) * sFrac32)
+                                        fR = srcArr32(sID + 1) + ((srcArr32(sID + 3) - srcArr32(sID + 1)) * sFrac32)
+                                    ElseIf sID + 1 <= UBound(srcArr32) Then
+                                        fL = srcArr32(sID)
+                                        fR = srcArr32(sID + 1)
+                                    Else
+                                        fL = 0!
+                                        fR = 0!
+                                    End If
+                                ElseIf sID + 3 <= UBound(srcArrI32) Then
+                                    fL = CSng((CDbl(srcArrI32(sID)) + ((CDbl(srcArrI32(sID + 2)) - CDbl(srcArrI32(sID))) * CDbl(sFrac32))) / 2147483648#)
+                                    fR = CSng((CDbl(srcArrI32(sID + 1)) + ((CDbl(srcArrI32(sID + 3)) - CDbl(srcArrI32(sID + 1))) * CDbl(sFrac32))) / 2147483648#)
+                                ElseIf sID + 1 <= UBound(srcArrI32) Then
+                                    fL = CSng(CDbl(srcArrI32(sID)) / 2147483648#)
+                                    fR = CSng(CDbl(srcArrI32(sID + 1)) / 2147483648#)
                                 Else
                                     fL = 0!
                                     fR = 0!
@@ -3481,7 +3516,7 @@ NextVoice32:
             End If
         Next frame
         
-        If RiffMixFormatIsFloat32() Then
+        If isMixFloat32 Then
             RtlMoveMemory ByVal pData, VarPtr(mixArr32(0)), bytesToWrite
         Else
             Dim mixInt32() As Long
@@ -3556,12 +3591,17 @@ NextVoice32:
                             End If
                             If loopSnd Then
                                 remBytes = bytesNeeded - bytesAvail
-                                If remBytes > CLng(loopEnd - loopStart) Then
-                                    remBytes = CLng(loopEnd - loopStart)
-                                End If
-                                If remBytes > 0 Then
-                                    RtlMoveMemoryToInteger srcArr16(bytesAvail \ 2), ByVal (ptr + CLng(loopStart)), remBytes
-                                End If
+                                Dim loopBytes16 As Long
+                                Dim chunkBytes16 As Long
+                                loopBytes16 = CLng(loopEnd - loopStart)
+                                Do While remBytes > 0 And loopBytes16 > 0
+                                    chunkBytes16 = remBytes
+                                    If chunkBytes16 > loopBytes16 Then
+                                        chunkBytes16 = loopBytes16
+                                    End If
+                                    RtlMoveMemoryToInteger srcArr16((bytesNeeded - remBytes) \ 2), ByVal (ptr + CLng(loopStart)), chunkBytes16
+                                    remBytes = remBytes - chunkBytes16
+                                Loop
                             End If
                         End If
                         
@@ -4134,7 +4174,7 @@ End Function
 
 '/**
 ' * @function RiffTryPromoteMixFormatToFloat32
-' * @brief Rewrites a WAVEFORMATEX/WAVEFORMATEXTENSIBLE structure to 32-bit float while preserving rate and channel count.
+' * @brief Rewrites a WAVEFORMATEX/WAVEFORMATEXTENSIBLE structure to stereo 32-bit float while preserving sample rate.
 ' */
 Private Sub RiffTryPromoteMixFormatToFloat32()
     If rCtx.MixFormatPtr = 0 Then
@@ -4155,9 +4195,7 @@ Private Sub RiffTryPromoteMixFormatToFloat32()
     RtlMoveMemory VarPtr(sampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
     RtlMoveMemory VarPtr(cbSize), ByVal (rCtx.MixFormatPtr + 16), 2
 
-    If nChannels <= 0 Then
-        nChannels = 2
-    End If
+    nChannels = 2
     If sampleRate <= 0 Then
         sampleRate = 44100
     End If
@@ -4170,13 +4208,7 @@ Private Sub RiffTryPromoteMixFormatToFloat32()
         RtlMoveMemory VarPtr(channelMask), ByVal (rCtx.MixFormatPtr + 20), 4
         formatTag = -2
         validBits = 32
-        If channelMask = 0 Then
-            If nChannels = 1 Then
-                channelMask = 4
-            ElseIf nChannels = 2 Then
-                channelMask = 3
-            End If
-        End If
+        channelMask = 3
 
         RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(formatTag), 2
         RtlMoveMemory ByVal (rCtx.MixFormatPtr + 2), VarPtr(nChannels), 2
@@ -4290,6 +4322,8 @@ Private Function InitWASAPI() As Boolean
     Dim iidAudio As GUID
     Dim iidRender As GUID
     Dim hr As Long
+    Dim nChannels As Integer
+    Dim bits As Integer
     
     #If Win64 Then
         Dim pNullPtr As LongLong
@@ -4335,22 +4369,51 @@ Private Function InitWASAPI() As Boolean
     If hr <> 0 Or rCtx.MixFormatPtr = 0 Then
         Exit Function
     End If
-    
-    RtlMoveMemory VarPtr(rCtx.sampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
-    RtlMoveMemory VarPtr(rCtx.AvgBytesPerSec), ByVal (rCtx.MixFormatPtr + 8), 4
 
-    rCtx.MaxWriteFrames = (rCtx.sampleRate * RIFF_MAX_WRITE_MS) \ 1000
-    If rCtx.MaxWriteFrames < 1 Then
-        rCtx.MaxWriteFrames = 1
+    Dim originalMixBytes() As Byte
+    Dim originalMixSize As Long
+    Dim originalCbSize As Integer
+    RtlMoveMemory VarPtr(originalCbSize), ByVal (rCtx.MixFormatPtr + 16), 2
+    originalMixSize = 18 + CLng(originalCbSize)
+    If originalMixSize < 18 Then
+        originalMixSize = 18
     End If
-    
+    ReDim originalMixBytes(0 To originalMixSize - 1)
+    RtlMoveMemory VarPtr(originalMixBytes(0)), ByVal rCtx.MixFormatPtr, originalMixSize
+
+    RiffTryPromoteMixFormatToFloat32
+
     hr = vCall(rCtx.AudioClient, 3, AUDCLNT_SHAREMODE_SHARED, &H80000000, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
     If hr <> 0 Then
         hr = vCall(rCtx.AudioClient, 3, AUDCLNT_SHAREMODE_SHARED, 0&, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
     End If
-    
+    If hr <> 0 Then
+        RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(originalMixBytes(0)), originalMixSize
+        hr = vCall(rCtx.AudioClient, 3, AUDCLNT_SHAREMODE_SHARED, &H80000000, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
+        If hr <> 0 Then
+            hr = vCall(rCtx.AudioClient, 3, AUDCLNT_SHAREMODE_SHARED, 0&, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
+        End If
+    End If
+
     If hr <> 0 Then
         Exit Function
+    End If
+
+    RtlMoveMemory VarPtr(rCtx.sampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
+    RtlMoveMemory VarPtr(rCtx.AvgBytesPerSec), ByVal (rCtx.MixFormatPtr + 8), 4
+    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + 2), 2
+    RtlMoveMemory VarPtr(bits), ByVal (rCtx.MixFormatPtr + 14), 2
+
+    If nChannels <> 2 Then
+        Exit Function
+    End If
+    If bits <> 16 And bits <> 32 Then
+        Exit Function
+    End If
+
+    rCtx.MaxWriteFrames = (rCtx.sampleRate * RIFF_MAX_WRITE_MS) \ 1000
+    If rCtx.MaxWriteFrames < 1 Then
+        rCtx.MaxWriteFrames = 1
     End If
     
     hr = vCall(rCtx.AudioClient, 4, VarPtr(rCtx.BufferSize))
