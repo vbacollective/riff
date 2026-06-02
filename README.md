@@ -1,11 +1,11 @@
 <div align="center">
-  <img src="resources/logo.png" width="150" />
+  <img src="resources/logo.png" width="150" alt="Riff logo" />
 </div>
 
-<h1 align="center">Riff - VBA Audio Engine</h1>
+<h1 align="center">Riff</h1>
 
 <p align="center">
-  <b>A complete WASAPI audio engine for Microsoft Office with studio DSP and WAV export. No DLLs, no dependencies, no installation.</b>
+  <b>A single-file VBA audio engine for Microsoft Office with WASAPI playback, Media Foundation decoding, real-time DSP, oscillators, buses, meters, and WAV export.</b>
 </p>
 
 <p align="center">
@@ -14,371 +14,258 @@
   <img src="https://img.shields.io/badge/arch-32%20%26%2064--bit-green.svg" alt="Architecture" />
   <img src="https://img.shields.io/badge/WASAPI-Shared%20Mode-blue.svg" alt="WASAPI" />
   <img src="https://img.shields.io/badge/Media%20Foundation-Decoding-orange.svg" alt="Media Foundation" />
-  <img src="https://img.shields.io/badge/Polyphony-32%20Voices-blueviolet.svg" alt="Polyphony" />
   <img src="https://img.shields.io/badge/DSP-Studio%20Pipeline-critical.svg" alt="DSP" />
-  <img src="https://img.shields.io/badge/Export-WAV%2016--bit-success.svg" alt="WAV Export" />
-  <img src="https://img.shields.io/badge/Oscillators-BLEP-purple.svg" alt="BLEP Oscillators" />
-  <img src="https://img.shields.io/badge/Assembly-x86%20%26%20x64%20Thunks-red.svg" alt="Assembly" />
   <img src="https://img.shields.io/badge/dependencies-none-success.svg" alt="Dependencies" />
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
-  <img src="https://img.shields.io/github/v/release/vbacollective/riff" alt="Latest Version" />
-  <img src="https://img.shields.io/github/stars/vbacollective/riff?style=flat&color=gold" alt="Stars" />
 </p>
 
-> [!NOTE]
-> **Supported Applications**
->
-> ![](resources/svg/ms-powerpoint.svg)
-> ![](resources/svg/ms-excel.svg)
-> ![](resources/svg/ms-word.svg)
-> ![](resources/svg/ms-outlook.svg)
-> ![](resources/svg/ms-access.svg)
-> **and any** ![](resources/svg/ms-office.svg) **VBA host**
-
-
 > [!IMPORTANT]
-> **Platform**
->
-> ![](resources/svg/windows.svg) Currently Windows only. Riff relies on `kernel32`, `user32`, `ole32`, `mfplat`, `mfreadwrite`, `winmm` and `shlwapi`. Mac support is planned.
+> Riff is Windows-only. It calls native Windows APIs including `kernel32`, `user32`, `ole32`, `oleaut32`, `winmm`, `mfplat`, `mfreadwrite`, and `shlwapi`.
 
-## Table of Contents
+## What Riff Does
 
-- [What is Riff](#what-is-riff)
-- [Quick Start](#quick-start)
-- [Architecture](#architecture)
-  - [Why a Standard Module](#why-a-standard-module)
-  - [The Assembly Thunk](#the-assembly-thunk)
-  - [COM VTable Dispatch](#com-vtable-dispatch)
-  - [The DSP Pipeline](#the-dsp-pipeline)
-- [Features](#features)
-- [Examples](#examples)
-- [Compatibility](#compatibility)
-- [Roadmap](#roadmap)
-- [License](#license)
+Riff brings real audio playback and synthesis to VBA without DLLs, installers, ActiveX controls, typelibs, or external references. Import one `.bas` file into Excel, Word, PowerPoint, Access, Outlook, or another VBA host, then use simple global functions to load sounds, play voices, route buses, shape effects, render oscillators, and export WAV files.
 
-## What is Riff
+The engine uses:
 
-Riff is a single `.bas` module that brings real audio to any Microsoft Office VBA host. Load audio files from disk or directly from memory, synthesize waveforms, export buffers to WAV, and apply a full studio DSP pipeline per voice, all in real time, with zero external dependencies and no configuration required.
+- WASAPI Shared Mode for output.
+- Media Foundation for decoding formats supported by Windows.
+- A runtime x86/x64 timer thunk for the audio callback.
+- Direct COM vtable dispatch for WASAPI and Media Foundation interfaces.
+- Static buffer and voice pools to avoid VBA object lifetime issues in the audio path.
 
-It talks directly to WASAPI through hand-rolled COM vtable calls, decodes any format Windows supports through Media Foundation, and drives the audio callback through a runtime-compiled x86/x64 assembly thunk that fires independently of the VBA execution thread.
+## Repository Layout
 
-A single file drop into any VBA project is all it takes. No references need to be enabled in **Tools > References**.
+| Path | Purpose |
+|---|---|
+| [`package/`](package/) | The importable Riff module. Import `package/Riff.bas` into your VBA project. |
+| [`examples/`](examples/) | Practical example modules and copy-ready snippets. |
+| [`docs/`](docs/) | API reference and internal architecture documentation. |
+| [`resources/`](resources/) | Project visual assets used by documentation. |
 
-## Quick Start
+## Install
 
-### Import
+1. Download or clone this repository.
+2. Open the VBA editor in your Office host with `Alt+F11`.
+3. Choose **File > Import File...**.
+4. Select `package/Riff.bas`.
+5. Save the workbook, document, database, or presentation as a macro-enabled file.
 
-[Download the latest release](../../releases) and import `Riff.bas` into your VBA project via **File → Import File** in the VBA editor.
+No **Tools > References** entries are required.
 
-### Play a sound
+## Minimal Playback
+
+This is the smallest complete pattern: start the engine, load a file, play it, and shut the engine down when the host closes.
 
 ```vb
-RiffOpen
+Option Explicit
 
-Dim buf As Long
-buf = RiffLoad("C:\sounds\explosion.wav")
-RiffPlay buf
+Public Sub PlayOneSound()
+    If Not RiffOpen() Then
+        MsgBox "Riff could not initialize the audio device.", vbCritical
+        Exit Sub
+    End If
+
+    Dim bufferId As Long
+    bufferId = RiffLoad("C:\Audio\click.wav")
+
+    If bufferId < 0 Then
+        MsgBox "The audio file could not be loaded.", vbExclamation
+        Exit Sub
+    End If
+
+    RiffPlay bufferId
+End Sub
+
+Private Sub Workbook_BeforeClose(Cancel As Boolean)
+    RiffClose
+End Sub
 ```
 
-### Play with effects
+## Usage Examples
+
+### Loop background music and play sound effects
+
+Use one loaded buffer for background music and another for short effects. The same buffer can be played many times without decoding it again.
 
 ```vb
-Dim buf As Long
-Dim voice As Long
-
-buf = RiffLoad("C:\sounds\music.ogg")
-voice = RiffPlay(buf)
-
-RiffVoiceLoop(voice) = True
-RiffVoiceVolume(voice) = 0.8
-RiffVoiceReverbMix(voice) = 0.4
-RiffVoiceReverbTime(voice) = 0.75
-```
-
-### Synthesize a waveform
-
-```vb
-Dim voice As Long
-voice = RiffPlayOscillator(0, 440) ' Sine wave at 440 Hz
-
-RiffVoiceFlangerDepth(voice) = 0.6
-RiffVoiceFlangerRate(voice) = 0.3
-```
-
-### Load audio from memory
-
-```vb
-Dim data() As Byte
-data = SomeByteArrayContainingAnAudioFile()
-
-Dim buf As Long
-buf = RiffLoadFromMemory(data)
-RiffPlay buf
-```
-
-### Export a loaded buffer to WAV
-
-```vb
-Dim buf As Long
-buf = RiffLoad("C:\sounds\music.ogg")
-
-RiffExportBufferWav buf, "C:\sounds\music_export.wav"
-```
-
-### Render an oscillator to WAV
-
-```vb
-RiffRenderOscillatorWav 0, 440, 3, "C:\sounds\sine.wav"
-RiffRenderOscillatorWav 1, 110, 2, "C:\sounds\square.wav"
-RiffRenderOscillatorWav 2, 220, 2, "C:\sounds\saw.wav"
-```
-
-## Architecture
-
-### Why a Standard Module
-
-This is a deliberate design choice. Several concrete constraints of the VBA environment make a procedural standard module the right foundation for an audio engine at this level.
-
-**Zero COM overhead.** Every VBA class is a COM object. Method dispatch, reference counting, and heap allocation all accumulate at audio thread frequency. A standard `.bas` module bypasses the COM layer entirely and keeps the hot path clean.
-
-**Data-oriented design.** Riff manages 32 polyphonic voices and 64 static buffers as statically allocated User-Defined Types in contiguous memory. This is more cache-friendly and eliminates heap fragmentation across long Office sessions.
-
-**Native Win32 alignment.** Audio at this level requires direct memory access via `RtlMoveMemory`, raw pointer arithmetic, and COM vtable calls through `DispCallFunc`. A procedural module provides the flat memory model that makes this possible without intermediate copies.
-
-**No lifecycle to manage.** State is accessed globally through simple integer handles. There are no object scopes to worry about and no risk of a variable falling out of scope while audio is playing.
-
-### The Assembly Thunk
-
-The core of the Riff engine is a machine code thunk compiled at runtime and injected into executable memory via `VirtualAlloc`. This thunk is what makes the audio loop possible inside VBA.
-
-**How it works:**
-
-1. On `RiffOpen`, `VirtualAlloc` allocates a block of memory with `PAGE_EXECUTE_READWRITE` permissions.
-2. Raw x86 or x64 opcodes are written into that block via `RtlMoveMemory`, with function pointers patched inline.
-3. `SetTimer` registers this thunk as a Win32 timer callback firing every 15ms.
-4. On each tick, the thunk checks `EbMode` from `vbe7.dll` to detect if the VBA runtime is still alive. If not, it calls `KillTimer` and exits safely without crashing the host application.
-5. If the runtime is alive, it calls `RiffTimerCallback`, which runs the DSP pipeline and pushes audio to WASAPI.
-
-The x64 and x86 thunks use different calling conventions. x64 follows the Microsoft x64 ABI with arguments in `RCX`, `RDX`, `R8`, `R9`. x86 uses `stdcall` with stack cleanup via `ret 10h`. Both are selected transparently through `#If Win64`.
-
-This is the same pattern used in professional VBA subclassing libraries, adapted here to drive a real-time audio engine.
-
-### COM VTable Dispatch
-
-Riff does not use any high-level wrappers for WASAPI or Media Foundation. It calls COM interfaces directly through their virtual function tables using `DispCallFunc` from `oleaut32.dll`.
-
-The `vCall` function at the core of this approach accepts a COM interface pointer, a zero-based vtable index, and a `ParamArray` of arguments, and dispatches directly to the underlying C++ method:
-
-```vb
-' Equivalent to calling IAudioClient::Initialize
-vCall rCtx.AudioClient, 3, AUDCLNT_SHAREMODE_SHARED, 0&, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr
-```
-
-This eliminates all dependency on typelib-bound interface wrappers and makes the entire WASAPI stack self-contained inside the module. The same technique is used for Media Foundation's `IMFSourceReader` during audio decoding.
-
-Direct vtable call optimization for the decoding loop remains a planned performance path. It requires dedicated native thunks per method signature to remain stable across Office x86/x64 hosts, so the current release intentionally keeps the safer `DispCallFunc` route.
-
-### The DSP Pipeline
-
-Each of the 32 polyphonic voices runs a full per-voice DSP chain on every audio frame. Low Pass, High Pass, and EQ use biquad filters for higher quality tone shaping, square and saw oscillators use BLEP correction to reduce aliasing at high frequencies, and the reverb path uses a Freeverb-style comb/damping design for improved spatial depth.
-
-The pipeline processes samples in this order:
-
-**Source** (buffer PCM or BLEP oscillator) > **Bitcrusher** > **Sample Rate Reduction** > **Distortion** > **Biquad Low Pass Filter** > **Biquad High Pass Filter** > **Biquad 3-Band EQ** > **Ring Modulator** > **Tremolo** > **Stereo Width** > **Flanger** > **Chorus** > **Delay** > **Freeverb-style Reverb** > **Compressor** > **AutoPan** > **Volume / Pan / Bus** > **Fade** > **Master Mix**
-
-All modulated effects (Chorus, Flanger, Tremolo, AutoPan, RingMod) use LFO phase accumulators that persist across frames, producing continuous and smooth modulation without clicks or resets.
-
-The ring buffer backing Chorus, Flanger, Delay, and Reverb is a single contiguous 1D array of `32 * 192000` floats. This avoids the Column-Major 2D array wipe issue inherent to VBA's memory layout when using `RtlZeroMemory` on multi-dimensional arrays.
-
-Riff supports common WASAPI shared-mode output formats, with primary support for 32-bit float and 16-bit integer output. Unsupported output layouts are handled conservatively to avoid writing invalid audio data into the device buffer.
-
-## Features
-
-- **32 polyphonic voices** playing simultaneously with independent DSP state
-- **64 static audio buffers** decoded into physical memory via `VirtualAlloc`
-- **In-memory loading** via `RiffLoadFromMemory`, enabling audio embedded directly in the VBA project
-- **Built-in oscillators**: Sine, Square, Sawtooth, Triangle, Noise
-- **BLEP band-limited square and saw oscillators** for reduced high-frequency aliasing
-- **8 audio buses** with independent volume control for grouping voices (music, SFX, voice, etc.)
-- **Per-voice DSP pipeline** with Freeverb-style Reverb, Chorus, Flanger, Delay, Compressor, Biquad 3-Band EQ, Biquad Low Pass, Biquad High Pass, Distortion, Bitcrusher, Sample Rate Reduction, Ring Modulator, Tremolo, AutoPan, Stereo Width
-- **WAV export** for loaded audio buffers via `RiffExportBufferWav`
-- **Oscillator-to-WAV rendering** via `RiffRenderOscillatorWav`
-- **Fade in / Fade out** with frame-accurate interpolation
-- **Loop regions** with sub-second precision via `RiffSetLoopRegionSec`
-- **Pitch shifting** via playback rate control
-- **VU meters** at voice and master level via peak amplitude tracking
-- **32-bit float and 16-bit integer** WASAPI output, auto-detected with conservative handling for unsupported layouts
-- **x86 and x64** support via `#If VBA7` and `#If Win64` conditional compilation
-- **IDE-safe timer thunk** with `EbMode` liveness check to prevent crashes on VBE reset
-
-## Examples
-
-### Radio voice effect
-
-```vb
-Dim voice As Long
-voice = RiffPlay(buf)
-RiffVoiceHighPass(voice) = 0.3
-RiffVoiceLowPass(voice) = 0.4
-RiffVoiceDistortion(voice) = 1.8
-```
-
-### Underwater effect
-
-```vb
-Dim voice As Long
-voice = RiffPlay(buf)
-RiffVoiceLowPass(voice) = 0.08
-RiffVoiceReverbMix(voice) = 0.6
-RiffVoiceReverbTime(voice) = 0.8
-RiffVoiceChorusDepth(voice) = 0.3
-RiffVoiceChorusRate(voice) = 0.4
-```
-
-### Game Boy oscillator
-
-```vb
-Dim voice As Long
-voice = RiffPlayOscillator(1, 440)
-RiffVoiceBitDepth(voice) = 4
-RiffVoiceSampleRateReduction(voice) = 8
-```
-
-### Export a decoded audio file to WAV
-
-```vb
-Dim buf As Long
-buf = RiffLoad("C:\sounds\voice.ogg")
-
-If buf <> -1 Then
-    RiffExportBufferWav buf, "C:\sounds\voice_export.wav"
-End If
-```
-
-### Render a BLEP oscillator to WAV
-
-```vb
-RiffRenderOscillatorWav 1, 110, 2.5, "C:\sounds\blep_square.wav"
-RiffRenderOscillatorWav 2, 220, 2.5, "C:\sounds\blep_saw.wav"
-```
-
-
-### Game audio with buses
-
-```vb
-RiffOpen
-
-Dim bufMusic As Long, bufSFX As Long
-bufMusic = RiffLoad("music.ogg")
-bufSFX = RiffLoad("explosion.wav")
-
-Dim vMusic As Long, vSFX As Long
-vMusic = RiffPlay(bufMusic)
-vSFX = RiffPlay(bufSFX)
-
-RiffVoiceBus(vMusic) = 0
-RiffVoiceBus(vSFX) = 1
-RiffVoiceLoop(vMusic) = True
-
-RiffBusVolume(0) = 0.5
-RiffBusVolume(1) = 1.0
-```
-
-### Loop with intro that does not repeat
-
-```vb
-Dim voice As Long
-voice = RiffPlay(buf)
-RiffVoiceLoop(voice) = True
-RiffSetLoopRegionSec voice, 4.2, 38.7
-```
-
-### VU meter on a UserForm
-
-```vb
-Private Sub Timer_Tick()
-    Dim pL As Single, pR As Single
-    RiffMasterGetPeak pL, pR
-
-    Dim pct As Long
-    pct = CLng(((pL + pR) / 2) * 100)
-
-    VUBar.Width = pct * 2
-
-    If pct > 80 Then
-        VUBar.BackColor = RGB(255, 50, 50)
-    ElseIf pct > 50 Then
-        VUBar.BackColor = RGB(255, 200, 0)
-    Else
-        VUBar.BackColor = RGB(50, 200, 50)
+Option Explicit
+
+Private musicBuffer As Long
+Private explosionBuffer As Long
+Private musicVoice As Long
+Private gameAudioReady As Boolean
+
+Public Sub StartGameAudio()
+    If Not RiffOpen() Then Exit Sub
+
+    gameAudioReady = False
+    musicBuffer = RiffLoad("C:\GameAudio\theme.mp3")
+    explosionBuffer = RiffLoad("C:\GameAudio\explosion.wav")
+
+    If musicBuffer < 0 Or explosionBuffer < 0 Then
+        MsgBox "One or more audio assets failed to load.", vbExclamation
+        Exit Sub
+    End If
+
+    musicVoice = RiffPlay(musicBuffer)
+    If musicVoice >= 0 Then
+        RiffVoiceLoop(musicVoice) = True
+        RiffVoiceVolume(musicVoice) = 0.35
+    End If
+
+    gameAudioReady = True
+End Sub
+
+Public Sub PlayExplosion()
+    If Not gameAudioReady Then Exit Sub
+
+    Dim voiceId As Long
+    voiceId = RiffPlay(explosionBuffer)
+
+    If voiceId >= 0 Then
+        RiffVoiceVolume(voiceId) = 0.9
+        RiffVoicePan(voiceId) = 0.15
+        RiffVoiceLowPass(voiceId) = 0.85
     End If
 End Sub
 ```
 
-## Compatibility
+### Mix with audio buses
 
-Riff uses only native Windows DLLs present on every version of Windows since Vista: `kernel32.dll`, `user32.dll`, `ole32.dll`, `oleaut32.dll`, `winmm.dll`, `mfplat.dll`, `mfreadwrite.dll`, and `shlwapi.dll`. No third-party installers, no COM registration, no ActiveX controls. Dropping the `.bas` file into a VBA project is all it takes.
+Buses are global volume groups. They are useful when your project needs independent music, sound-effect, voice, and UI levels.
 
-### Operating System
+```vb
+Public Sub ConfigureBuses(ByVal musicVoice As Long, ByVal sfxVoice As Long)
+    Const BUS_MUSIC As Long = 0
+    Const BUS_SFX As Long = 1
 
-| Version | Support |
-|---|---|
-| ![](resources/svg/windows.svg) Windows Vista | Supported |
-| ![](resources/svg/windows.svg) Windows 7 | Supported |
-| ![](resources/svg/windows.svg) Windows 8 / 8.1 | Supported |
-| ![](resources/svg/windows.svg) Windows 10 | Supported |
-| ![](resources/svg/windows.svg) Windows 11 | Supported |
+    RiffVoiceBus(musicVoice) = BUS_MUSIC
+    RiffVoiceBus(sfxVoice) = BUS_SFX
 
-### Office and VBA Host
+    RiffBusVolume(BUS_MUSIC) = 0.45
+    RiffBusVolume(BUS_SFX) = 1!
+End Sub
+```
 
-| Environment | Support |
-|---|---|
-| ![](resources/svg/ms-excel.svg) Excel 32-bit | Supported |
-| ![](resources/svg/ms-excel.svg) Excel 64-bit | Supported |
-| ![](resources/svg/ms-word.svg) Word 32-bit | Supported |
-| ![](resources/svg/ms-word.svg) Word 64-bit | Supported |
-| ![](resources/svg/ms-powerpoint.svg) PowerPoint 32-bit | Supported |
-| ![](resources/svg/ms-powerpoint.svg) PowerPoint 64-bit | Supported |
-| ![](resources/svg/ms-access.svg) Access 32-bit | Supported |
-| ![](resources/svg/ms-access.svg) Access 64-bit | Supported |
-| ![](resources/svg/ms-office.svg) Any VBA7 host (Office 2010+) | Supported |
-| ![](resources/svg/ms-office.svg) VBA6 (Office 2007 and earlier) | Supported |
+### Create a synthesized alert tone
 
+Oscillators do not need an audio file. They use the same voice controls and DSP chain as loaded buffers.
 
-32-bit and 64-bit compatibility is handled transparently through `#If VBA7` and `#If Win64` conditional compilation across all API declarations and assembly thunks.
+```vb
+Public Sub PlayAlertTone()
+    If Not RiffOpen() Then Exit Sub
+
+    Dim voiceId As Long
+    voiceId = RiffPlayOscillator(0, 880) ' 0 = sine, frequency is in Hz.
+
+    If voiceId >= 0 Then
+        RiffVoiceVolume(voiceId) = 0.25
+        RiffVoicePan(voiceId) = 0
+        RiffVoiceReverbMix(voiceId) = 0.2
+        RiffFadeOut voiceId, 0.8
+    End If
+End Sub
+```
+
+### Shape a radio-style voice effect
+
+Riff properties are assigned per voice. Load and play a voice clip, then apply high-pass, low-pass, and distortion to narrow and roughen the sound.
+
+```vb
+Public Sub PlayRadioVoice()
+    Dim bufferId As Long
+    bufferId = RiffLoad("C:\Audio\dialog.wav")
+    If bufferId < 0 Then Exit Sub
+
+    Dim voiceId As Long
+    voiceId = RiffPlay(bufferId)
+    If voiceId < 0 Then Exit Sub
+
+    RiffVoiceHighPass(voiceId) = 0.35
+    RiffVoiceLowPass(voiceId) = 0.42
+    RiffVoiceDistortion(voiceId) = 1.6
+    RiffVoiceEqBass(voiceId) = 0.55
+    RiffVoiceEqMid(voiceId) = 1.4
+    RiffVoiceEqTreble(voiceId) = 0.75
+End Sub
+```
+
+### Export audio to WAV
+
+Loaded buffers and generated oscillators can be rendered to standard 16-bit stereo PCM WAV files.
+
+```vb
+Public Sub ExportExamples()
+    Dim bufferId As Long
+    bufferId = RiffLoad("C:\Audio\source.ogg")
+
+    If bufferId >= 0 Then
+        RiffExportBufferWav bufferId, "C:\Audio\source_export.wav"
+    End If
+
+    ' 1 = square oscillator, 110 Hz, 2.5 seconds.
+    RiffRenderOscillatorWav 1, 110, 2.5, "C:\Audio\square_110hz.wav"
+End Sub
+```
+
+## Feature Summary
+
+- 32 simultaneous polyphonic voices.
+- 64 decoded audio buffers allocated with `VirtualAlloc`.
+- File loading through `RiffLoad`.
+- In-memory loading through `RiffLoadFromMemory`.
+- Sine, square, sawtooth, triangle, and noise oscillators.
+- BLEP correction for square and saw oscillators.
+- 8 audio buses with independent volume.
+- Per-voice DSP: reverb, chorus, flanger, delay, compressor, EQ, low-pass, high-pass, distortion, bitcrusher, sample-rate reduction, ring modulation, tremolo, auto-pan, stereo width, fade, pan, pitch, and looping.
+- Master and per-voice peak meters.
+- WAV export for loaded buffers and rendered oscillators.
+- Office x86 and x64 support.
+
+## Supported Hosts
+
+Riff is designed for Windows VBA hosts, including:
+
+- Excel
+- Word
+- PowerPoint
+- Access
+- Outlook
+- Other VBA7-compatible hosts
+
+Office 32-bit and 64-bit are both supported through conditional compilation.
+
+## Documentation
+
+- [API Reference](docs/API_REFERENCE.md): public functions, properties, parameter ranges, and operational guidance.
+- [Architecture](docs/ARCHITECTURE.md): internal memory model, WASAPI path, Media Foundation decoding, timer thunk, DSP pipeline, and shutdown sequence.
+- [Effect Cookbook](docs/EFFECT_COOKBOOK.md): copy-ready effect presets for polished application audio.
+- [Troubleshooting](docs/TROUBLESHOOTING.md): practical diagnostics for initialization, loading, playback, and shutdown issues.
+- [Examples](examples/README.md): detailed usage patterns and the showcase module.
+- [Package Guide](package/README.md): import and integration guidance.
 
 ## Roadmap
 
-### ![](resources/svg/completed.svg) Completed
+Completed:
 
-- [x] WASAPI Shared Mode output with automatic format detection (32-bit float and 16-bit integer)
-- [x] Media Foundation decoding via `IMFSourceReader` with COM vtable dispatch
-- [x] In-memory audio loading via `SHCreateMemStream` and `MFCreateSourceReaderFromByteStream`
-- [x] 32 polyphonic voices with independent DSP state
-- [x] 64 static audio buffers in physical memory via `VirtualAlloc`
-- [x] 8 audio buses with independent volume control
-- [x] Built-in oscillators: Sine, Square, Sawtooth, Triangle, Noise
-- [x] Full per-voice DSP pipeline: Reverb, Chorus, Flanger, Delay, Compressor, EQ, Low Pass, High Pass, Distortion, Bitcrusher, Sample Rate Reduction, Ring Modulator, Tremolo, AutoPan, Stereo Width
-- [x] Frame-accurate fade in / fade out
-- [x] Loop regions with sample-aligned precision
-- [x] Pitch shifting via playback rate
-- [x] VU peak metering at voice and master level
-- [x] IDE-safe timer thunk with `EbMode` liveness guard
-- [x] x86 and x64 assembly thunks with correct calling conventions
-- [x] `#If VBA7` and `#If Win64` full conditional compilation
-- [x] Biquad filters for higher quality EQ and Low/High Pass
-- [x] Band-limited oscillators (BLEP) to reduce aliasing at high frequencies
-- [x] Freeverb-style reverb for improved spatial quality
-- [x] WAV export for loaded audio buffers via `RiffExportBufferWav`
-- [x] Oscillator-to-WAV rendering via `RiffRenderOscillatorWav`
-- [x] Safer buffer, loop-region, seek, and memory-loading validation
+- WASAPI Shared Mode playback.
+- Media Foundation decoding.
+- In-memory audio loading.
+- 32-voice polyphony.
+- 64-buffer pool.
+- 8 audio buses.
+- Full per-voice DSP pipeline.
+- Fade, loop, seek, pitch, and metering support.
+- x86 and x64 timer thunks.
+- WAV export and oscillator rendering.
 
-### ![](resources/svg/planning.svg) Planned
+Planned:
 
-- [ ] `RiffLoadAsync` with Win32 thread and callback on completion
-- [ ] Direct vtable calls inside the decoding loop through dedicated ABI-safe thunks
-- [ ] macOS support via CoreAudio and AudioToolbox
+- Asynchronous loading.
+- Dedicated ABI-safe direct vtable thunks for high-volume decode paths.
+- macOS support through CoreAudio and AudioToolbox.
 
 ## License
 
-MIT, free for personal and commercial use. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
