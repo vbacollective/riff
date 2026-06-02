@@ -302,6 +302,14 @@ Public Enum RiffBusId
     RiffBusAux1 = 5
     RiffBusAux2 = 6
     RiffBusAux3 = 7
+    RiffBusAux4 = 8
+    RiffBusAux5 = 9
+    RiffBusAux6 = 10
+    RiffBusAux7 = 11
+    RiffBusAux8 = 12
+    RiffBusAux9 = 13
+    RiffBusAux10 = 14
+    RiffBusAux11 = 15
 End Enum
 
 '/**

@@ -95,7 +95,7 @@ End If
 
 ### Audio Buses
 
-Riff provides **8 audio buses** (indices `0` to `7`) as an additional global volume layer applied per voice. Every voice routes to Bus 0 by default. You can assign voices to different buses and control each bus volume independently, enabling logical groups such as Music, SFX, Voice, and UI.
+Riff provides **16 audio buses** (indices `0` to `15`) as an additional global volume layer applied per voice. Every voice routes to Bus 0 by default. You can assign voices to different buses and control each bus volume independently, enabling logical groups such as Music, SFX, Voice, and UI.
 
 ```vb
 ' Assign a voice to Bus 1 (SFX group)

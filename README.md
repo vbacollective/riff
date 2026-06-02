@@ -228,7 +228,7 @@ End Sub
 - In-memory loading through `RiffLoadFromMemory`.
 - Sine, square, sawtooth, and noise oscillators.
 - BLEP correction for square and saw oscillators.
-- 8 audio buses with independent volume.
+- 16 audio buses with independent volume.
 - Per-voice DSP: reverb, chorus, flanger, delay, compressor, EQ, low-pass, high-pass, distortion, bitcrusher, sample-rate reduction, ring modulation, tremolo, auto-pan, stereo width, fade, pan, pitch, and looping.
 - Master and per-voice peak meters.
 - WAV export for loaded buffers and rendered oscillators.
@@ -265,7 +265,7 @@ Completed:
 - In-memory audio loading.
 - 32-voice polyphony.
 - 64-buffer pool.
-- 8 audio buses.
+- 16 audio buses.
 - Full per-voice DSP pipeline.
 - Fade, loop, seek, pitch, and metering support.
 - x86 and x64 timer thunks.
