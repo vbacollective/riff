@@ -5,11 +5,29 @@
 ' * Studio DSP Pipeline featuring Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad EQ, Bitcrusher,
 ' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, and Peak Meters.
 ' * @author UesleiDev
-' * @version 1.0.5
+' * @version 1.0.6
 ' */
 
 Option Explicit
 Option Private Module
+
+'/** @description Total static audio buffer slots exposed by the engine. */
+Private Const RIFF_BUFFER_COUNT As Long = 64
+
+'/** @description Highest valid static audio buffer handle. */
+Private Const RIFF_MAX_BUFFER_INDEX As Long = RIFF_BUFFER_COUNT - 1
+
+'/** @description Total polyphonic voice slots exposed by the engine. */
+Private Const RIFF_VOICE_COUNT As Long = 32
+
+'/** @description Highest valid polyphonic voice handle. */
+Private Const RIFF_MAX_VOICE_INDEX As Long = RIFF_VOICE_COUNT - 1
+
+'/** @description Total audio bus slots exposed by the engine. */
+Private Const RIFF_BUS_COUNT As Long = 8
+
+'/** @description Highest valid audio bus index. */
+Private Const RIFF_MAX_BUS_INDEX As Long = RIFF_BUS_COUNT - 1
 
 
 #If VBA7 Then
@@ -132,8 +150,8 @@ Option Private Module
         TimerID As LongPtr
         RenderPeriodMs As Long
         MaxWriteFrames As Long
-        Buffers(0 To 63) As RiffBuffer
-        Buses(0 To 7) As Single
+        Buffers(0 To RIFF_MAX_BUFFER_INDEX) As RiffBuffer
+        Buses(0 To RIFF_MAX_BUS_INDEX) As Single
     End Type
 #Else
     '/** @description Allocates physical memory pages. */
@@ -255,8 +273,8 @@ Option Private Module
         TimerID As Long
         RenderPeriodMs As Long
         MaxWriteFrames As Long
-        Buffers(0 To 63) As RiffBuffer
-        Buses(0 To 7) As Single
+        Buffers(0 To RIFF_MAX_BUFFER_INDEX) As RiffBuffer
+        Buses(0 To RIFF_MAX_BUS_INDEX) As Single
     End Type
 #End If
 
@@ -547,23 +565,23 @@ Private Const PI As Double = 3.14159265358979
 '/** @description Mathematical constant 2 * Pi. */
 Private Const PI2 As Double = 6.28318530717958
 
-'/** @description Total static audio buffer slots exposed by the engine. */
-Private Const RIFF_BUFFER_COUNT As Long = 64
+'/** @description SAFEARRAY.cDims descriptor offset. */
+Private Const RIFF_SAFEARRAY_OFFSET_DIMS As Long = 0
 
-'/** @description Highest valid static audio buffer handle. */
-Private Const RIFF_MAX_BUFFER_INDEX As Long = RIFF_BUFFER_COUNT - 1
+'/** @description SAFEARRAY.cbElements descriptor offset. */
+Private Const RIFF_SAFEARRAY_OFFSET_ELEMENT_SIZE As Long = 4
 
-'/** @description Total polyphonic voice slots exposed by the engine. */
-Private Const RIFF_VOICE_COUNT As Long = 32
+'/** @description 32-bit SAFEARRAY.pvData descriptor offset. */
+Private Const RIFF_SAFEARRAY_OFFSET_DATA_32 As Long = 12
 
-'/** @description Highest valid polyphonic voice handle. */
-Private Const RIFF_MAX_VOICE_INDEX As Long = RIFF_VOICE_COUNT - 1
+'/** @description 64-bit SAFEARRAY.pvData descriptor offset. */
+Private Const RIFF_SAFEARRAY_OFFSET_DATA_64 As Long = 16
 
-'/** @description Total audio bus slots exposed by the engine. */
-Private Const RIFF_BUS_COUNT As Long = 8
+'/** @description 32-bit SAFEARRAY.rgsabound[0].cElements descriptor offset. */
+Private Const RIFF_SAFEARRAY_OFFSET_COUNT_32 As Long = 16
 
-'/** @description Highest valid audio bus index. */
-Private Const RIFF_MAX_BUS_INDEX As Long = RIFF_BUS_COUNT - 1
+'/** @description 64-bit SAFEARRAY.rgsabound[0].cElements descriptor offset. */
+Private Const RIFF_SAFEARRAY_OFFSET_COUNT_64 As Long = 24
 
 '/** @description Low-latency render tick interval in milliseconds. */
 Private Const RIFF_RENDER_PERIOD_MS As Long = 10
@@ -573,6 +591,299 @@ Private Const RIFF_MAX_WRITE_MS As Long = 25
 
 '/** @description Requested WASAPI shared buffer duration in milliseconds. Avoids underruns while still preventing a long silent queue. */
 Private Const RIFF_DEVICE_BUFFER_MS As Long = 100
+
+'/** @description WASAPI REFERENCE_TIME units per millisecond. */
+Private Const RIFF_HNS_PER_MS As Long = 10000
+
+'/** @description Milliseconds per second. */
+Private Const RIFF_MS_PER_SEC As Long = 1000
+
+'/** @description Requested multimedia timer resolution in milliseconds. */
+Private Const RIFF_TIMER_RESOLUTION_MS As Long = 1
+
+'/** @description Timer callback guard value, ASCII "RIFF". */
+Private Const RIFF_MAGIC_COOKIE As Long = &H52494646
+
+'/** @description Per-voice stereo ring buffer capacity in samples. */
+Private Const RIFF_RING_SAMPLES_PER_VOICE As Long = 192000
+
+'/** @description Initial native decode scratch allocation size in bytes. */
+Private Const RIFF_DECODE_INITIAL_CAPACITY As Long = 1048576
+
+'/** @description Native decode scratch growth multiplier when capacity is exhausted. */
+Private Const RIFF_DECODE_GROWTH_FACTOR As Long = 2
+
+'/** @description Byte widths for strongly typed sample buffers. */
+Private Const RIFF_SINGLE_BYTES As Long = 4
+Private Const RIFF_LONG_BYTES As Long = 4
+Private Const RIFF_INTEGER_BYTES As Long = 2
+Private Const RIFF_BYTE_BYTES As Long = 1
+
+'/** @description Number of output channels written by WAV export helpers. */
+Private Const RIFF_WAV_EXPORT_CHANNELS As Integer = 2
+
+'/** @description Common normalized sample/control range. */
+Private Const RIFF_UNITY_GAIN As Single = 1!
+Private Const RIFF_NEGATIVE_UNITY_GAIN As Single = -1!
+Private Const RIFF_HALF_SCALE As Single = 0.5!
+Private Const RIFF_PHASE_FULL As Double = 1#
+Private Const RIFF_PHASE_HALF As Double = 0.5
+Private Const RIFF_BIPOLAR_DOUBLE_SCALE As Double = 2#
+Private Const RIFF_BIPOLAR_SINGLE_SCALE As Single = 2!
+
+'/** @description Bits per sample written by WAV export helpers. */
+Private Const RIFF_WAV_EXPORT_BITS As Integer = 16
+
+'/** @description Supported PCM/native sample bit depths. */
+Private Const RIFF_PCM16_BITS As Integer = 16
+Private Const RIFF_PCM24_BITS As Integer = 24
+Private Const RIFF_FLOAT32_BITS As Integer = 32
+
+'/** @description Bytes per exported stereo PCM16 frame. */
+Private Const RIFF_WAV_EXPORT_FRAME_BYTES As Long = 4
+
+'/** @description Standard PCM fmt chunk payload size. */
+Private Const RIFF_WAV_FMT_CHUNK_SIZE As Long = 16
+
+'/** @description Standard PCM WAV format tag. */
+Private Const RIFF_WAV_FORMAT_PCM As Integer = 1
+
+'/** @description RIFF chunk payload overhead before data bytes. */
+Private Const RIFF_WAV_SIZE_OVERHEAD As Long = 36
+
+'/** @description PCM16 positive full-scale value. */
+Private Const RIFF_PCM16_MAX As Long = 32767
+
+'/** @description PCM16 negative full-scale magnitude. */
+Private Const RIFF_PCM16_MIN_MAGNITUDE As Long = 32768
+
+'/** @description PCM16 signed minimum value. */
+Private Const RIFF_PCM16_MIN As Long = -32768
+
+'/** @description PCM16-to-float normalization multiplier. */
+Private Const RIFF_PCM16_TO_FLOAT_SCALE As Single = 3.051758E-05!
+
+'/** @description PCM24 signed normalization denominator. */
+Private Const RIFF_PCM24_SCALE As Double = 8388608#
+
+'/** @description PCM24 byte shift constants. */
+Private Const RIFF_BYTE_SHIFT_8 As Long = &H100&
+Private Const RIFF_BYTE_SHIFT_16 As Long = &H10000
+Private Const RIFF_PCM24_SIGN_BIT As Byte = &H80
+Private Const RIFF_PCM24_SIGN_EXTEND As Long = -16777216
+
+'/** @description PCM32 signed normalization denominator. */
+Private Const RIFF_PCM32_SCALE As Double = 2147483648#
+
+'/** @description PCM32 positive full-scale value used before integer output conversion. */
+Private Const RIFF_PCM32_MAX As Double = 2147483647#
+
+'/** @description WAVEFORMATEX format tag offset. */
+Private Const RIFF_WFX_FORMAT_TAG_OFFSET As Long = 0
+
+'/** @description WAVEFORMATEX channel count offset. */
+Private Const RIFF_WFX_CHANNELS_OFFSET As Long = 2
+
+'/** @description WAVEFORMATEX sample-rate offset. */
+Private Const RIFF_WFX_SAMPLE_RATE_OFFSET As Long = 4
+
+'/** @description WAVEFORMATEX average-bytes-per-second offset. */
+Private Const RIFF_WFX_AVG_BYTES_OFFSET As Long = 8
+
+'/** @description WAVEFORMATEX block-align offset. */
+Private Const RIFF_WFX_BLOCK_ALIGN_OFFSET As Long = 12
+
+'/** @description WAVEFORMATEX bits-per-sample offset. */
+Private Const RIFF_WFX_BITS_OFFSET As Long = 14
+
+'/** @description WAVEFORMATEX extension-size offset. */
+Private Const RIFF_WFX_CB_SIZE_OFFSET As Long = 16
+
+'/** @description WAVEFORMATEXTENSIBLE valid-bits offset. */
+Private Const RIFF_WFX_VALID_BITS_OFFSET As Long = 18
+
+'/** @description WAVEFORMATEXTENSIBLE channel-mask offset. */
+Private Const RIFF_WFX_CHANNEL_MASK_OFFSET As Long = 20
+
+'/** @description WAVEFORMATEXTENSIBLE subformat GUID Data1 offset. */
+Private Const RIFF_WFX_SUBFORMAT_OFFSET As Long = 24
+
+'/** @description WAVEFORMATEXTENSIBLE subformat GUID Data2 offset. */
+Private Const RIFF_WFX_SUBFORMAT_DATA2_OFFSET As Long = 28
+
+'/** @description WAVEFORMATEXTENSIBLE subformat GUID Data3 offset. */
+Private Const RIFF_WFX_SUBFORMAT_DATA3_OFFSET As Long = 30
+
+'/** @description WAVEFORMATEXTENSIBLE subformat GUID Data4 offset. */
+Private Const RIFF_WFX_SUBFORMAT_DATA4_OFFSET As Long = 32
+
+'/** @description Base WAVEFORMATEX byte size. */
+Private Const RIFF_WFX_BASE_SIZE As Long = 18
+
+'/** @description WAVEFORMATEXTENSIBLE extension byte size. */
+Private Const RIFF_WFX_EXTENSIBLE_CB_SIZE As Integer = 22
+
+'/** @description IEEE float WAVEFORMATEX tag and subformat Data1 value. */
+Private Const RIFF_WAVE_FORMAT_IEEE_FLOAT As Long = 3
+
+'/** @description IEEE float WAVEFORMATEXTENSIBLE subformat GUID values. */
+Private Const RIFF_IEEE_FLOAT_SUBFORMAT_DATA2 As Integer = 0
+Private Const RIFF_IEEE_FLOAT_SUBFORMAT_DATA3 As Integer = 16
+Private Const RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_0 As Byte = 128
+Private Const RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_1 As Byte = 0
+Private Const RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_2 As Byte = 0
+Private Const RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_3 As Byte = 170
+Private Const RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_4 As Byte = 0
+Private Const RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_5 As Byte = 56
+Private Const RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_6 As Byte = 155
+Private Const RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_7 As Byte = 113
+Private Const RIFF_GUID_DATA4_BYTES As Long = 8
+
+'/** @description WAVE_FORMAT_EXTENSIBLE tag as signed Integer. */
+Private Const RIFF_WAVE_FORMAT_EXTENSIBLE As Integer = -2
+
+'/** @description Stereo channel mask for front-left/front-right. */
+Private Const RIFF_STEREO_CHANNEL_MASK As Long = 3
+
+'/** @description Default sample rate used only when a device reports an invalid value during format promotion. */
+Private Const RIFF_DEFAULT_SAMPLE_RATE As Long = 44100
+
+'/** @description Shared-mode initialize flag for event callback mode. */
+Private Const AUDCLNT_STREAMFLAGS_EVENTCALLBACK As Long = &H80000000
+
+'/** @description Media Foundation end-of-stream flag returned by IMFSourceReader::ReadSample. */
+Private Const MF_SOURCE_READERF_ENDOFSTREAM As Long = 2
+
+'/** @description Initial Media Foundation attributes capacity used by source readers. */
+Private Const RIFF_MF_ATTRIBUTES_CAPACITY As Long = 1
+
+'/** @description Media Foundation stream-selection boolean values. */
+Private Const RIFF_MF_STREAM_DESELECT As Long = 0
+Private Const RIFF_MF_STREAM_SELECT As Long = 1
+
+'/** @description Media Foundation source reader resampler attribute GUID. */
+Private Const RIFF_GUID_MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING As String = "{7632CB14-D379-4770-AE7D-EA24154D9298}"
+
+'/** @description Freeverb tap delay multipliers in seconds. */
+Private Const RIFF_REVERB_TAP1_SEC As Single = 0.0297!
+Private Const RIFF_REVERB_TAP2_SEC As Single = 0.0371!
+Private Const RIFF_REVERB_TAP3_SEC As Single = 0.0411!
+Private Const RIFF_REVERB_TAP4_SEC As Single = 0.0437!
+
+'/** @description Freeverb wet mix weights. */
+Private Const RIFF_REVERB_DIRECT_WET As Single = 0.19!
+Private Const RIFF_REVERB_CROSS_WET As Single = 0.055!
+
+'/** @description Peak meter decay multipliers. */
+Private Const RIFF_MASTER_IDLE_PEAK_DECAY As Single = 0.85!
+Private Const RIFF_ACTIVE_PEAK_DECAY As Single = 0.9!
+
+'/** @description Safety clamp for feedback-style effects. */
+Private Const RIFF_MAX_FEEDBACK As Single = 0.95!
+
+'/** @description Safety clamp for stereo width. */
+Private Const RIFF_MAX_STEREO_WIDTH As Single = 0.99!
+
+'/** @description Low-pass bypass threshold. */
+Private Const RIFF_LOWPASS_BYPASS_THRESHOLD As Single = 0.999!
+
+'/** @description Default EQ crossover frequencies used by the simple 3-band tone stage. */
+Private Const RIFF_EQ_LOW_CROSSOVER_HZ As Single = 200!
+Private Const RIFF_EQ_HIGH_CROSSOVER_HZ As Single = 2000!
+
+'/** @description Default parametric EQ center frequencies. */
+Private Const RIFF_EQ_BASS_CENTER_HZ As Single = 120!
+Private Const RIFF_EQ_MID_CENTER_HZ As Single = 1000!
+Private Const RIFF_EQ_TREBLE_CENTER_HZ As Single = 6500!
+
+'/** @description Default parametric EQ Q value. */
+Private Const RIFF_EQ_DEFAULT_Q As Single = 0.7!
+Private Const RIFF_EQ_MID_Q As Single = 1!
+Private Const RIFF_BIQUAD_MIN_Q As Single = 0.1!
+Private Const RIFF_BIQUAD_MAX_Q As Single = 12!
+Private Const RIFF_BIQUAD_MIN_GAIN As Single = 0.05!
+Private Const RIFF_BIQUAD_MAX_GAIN As Single = 8!
+
+'/** @description Default biquad Q used by simple low/high-pass voice filters. */
+Private Const RIFF_FILTER_DEFAULT_Q As Single = 0.707!
+
+'/** @description Voice filter cutoff limits and Nyquist ratios. */
+Private Const RIFF_FILTER_MIN_CUTOFF_HZ As Single = 20!
+Private Const RIFF_LOWPASS_MIN_CUTOFF_HZ As Single = 40!
+Private Const RIFF_LOWPASS_MAX_SAMPLE_RATE_RATIO As Single = 0.45!
+Private Const RIFF_HIGHPASS_MAX_SAMPLE_RATE_RATIO As Single = 0.35!
+
+'/** @description Modulated delay ranges in seconds. */
+Private Const RIFF_FLANGER_BASE_DELAY_SEC As Single = 0.002!
+Private Const RIFF_FLANGER_MOD_DELAY_SEC As Single = 0.005!
+Private Const RIFF_CHORUS_BASE_DELAY_SEC As Single = 0.02!
+Private Const RIFF_CHORUS_MOD_DELAY_SEC As Single = 0.005!
+
+'/** @description Built-in oscillator defaults. */
+Private Const RIFF_DEFAULT_OSCILLATOR_HZ As Single = 440!
+Private Const RIFF_OSCILLATOR_EXPORT_GAIN As Single = 0.75!
+Private Const RIFF_OSCILLATOR_FALLBACK_HZ As Double = 440#
+Private Const RIFF_OSCILLATOR_MAX_DT As Double = 0.5
+Private Const RIFF_OSCILLATOR_BLEP_LEVEL As Single = 0.65!
+
+'/** @description Default voice effect values. */
+Private Const RIFF_DEFAULT_VOICE_VOLUME As Single = 1!
+Private Const RIFF_DEFAULT_VOICE_PITCH As Double = 1#
+Private Const RIFF_DEFAULT_DISTORTION As Single = 1!
+Private Const RIFF_DEFAULT_FILTER_CONTROL As Single = 1!
+Private Const RIFF_DEFAULT_BITCRUSH_DOWNSAMPLE As Long = 1
+Private Const RIFF_DEFAULT_CHORUS_RATE As Single = 1.5!
+Private Const RIFF_DEFAULT_FLANGER_RATE As Single = 0.5!
+Private Const RIFF_DEFAULT_REVERB_TIME As Single = 0.5!
+
+'/** @description Public control clamp limits. */
+Private Const RIFF_MAX_BUS_VOLUME As Single = 2!
+Private Const RIFF_MIN_VOICE_PITCH As Single = 0.1!
+Private Const RIFF_MAX_EQ_GAIN As Single = 5!
+Private Const RIFF_MIN_MOD_RATE_HZ As Single = 0.1!
+Private Const RIFF_MAX_MOD_RATE_HZ As Single = 10!
+Private Const RIFF_MAX_STEREO_WIDTH_CONTROL As Single = 5!
+Private Const RIFF_MAX_BIT_DEPTH As Single = 32!
+Private Const RIFF_MIN_BIT_DEPTH As Single = 2!
+Private Const RIFF_MIN_DOWNSAMPLE_FACTOR As Long = 1
+Private Const RIFF_MAX_LFO_RATE_HZ As Single = 20!
+Private Const RIFF_MAX_COMPRESSOR_RATIO As Single = 20!
+Private Const RIFF_MIN_COMPRESSOR_RATIO As Single = 1!
+Private Const RIFF_MIN_COMPRESSOR_THRESHOLD As Single = 0.01!
+Private Const RIFF_MIN_LOWPASS_CONTROL As Single = 0.01!
+
+'/** @description Compressor envelope smoothing constants. */
+Private Const RIFF_COMP_ENV_FLOOR As Single = 0.0001!
+Private Const RIFF_COMP_ATTACK_COEFF As Single = 0.01!
+Private Const RIFF_COMP_RELEASE_COEFF As Single = 0.001!
+
+'/** @description Freeverb feedback and damping shaping coefficients. */
+Private Const RIFF_REVERB_FEEDBACK_BASE As Single = 0.68!
+Private Const RIFF_REVERB_FEEDBACK_RANGE As Single = 0.28!
+Private Const RIFF_REVERB_DAMP_BASE As Single = 0.18!
+Private Const RIFF_REVERB_DAMP_RANGE As Single = 0.24!
+
+'/** @description Hex byte string width used when decoding generated thunk opcodes. */
+Private Const RIFF_HEX_BYTE_CHARS As Long = 2
+
+'/** @description x64 thunk placeholder offsets. */
+Private Const RIFF_THUNK64_SIZE As Long = 1024
+Private Const RIFF_THUNK64_EBMODE_OFFSET As Long = 26
+Private Const RIFF_THUNK64_KILLTIMER_OFFSET As Long = 63
+Private Const RIFF_THUNK64_CALLBACK_OFFSET As Long = 102
+
+'/** @description x86 thunk placeholder offsets. */
+Private Const RIFF_THUNK32_SIZE As Long = 512
+Private Const RIFF_THUNK32_EBMODE_OFFSET As Long = 4
+Private Const RIFF_THUNK32_KILLTIMER_OFFSET As Long = 33
+Private Const RIFF_THUNK32_CALLBACK_OFFSET As Long = 62
+
+'/** @description VBE EbMode export ordinal used by generated timer thunks. */
+Private Const RIFF_VBE_EBMODE_ORDINAL As Long = 1
+
+'/** @description WASAPI COM class/interface GUIDs. */
+Private Const RIFF_GUID_MM_DEVICE_ENUMERATOR_CLASS As String = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
+Private Const RIFF_GUID_AUDIO_RENDER_CLIENT As String = "{F294ACFC-3146-4483-A7BF-ADDCA7C260E2}"
 
 '/** @description Global state holding hardware info and context. */
 Private rCtx As RiffContext
@@ -734,10 +1045,10 @@ Private Function RiffTryGetByteArrayData(ByRef audioData() As Byte, ByRef dataPt
         Exit Function
     End If
 
-    RtlMoveMemory VarPtr(cDims), ByVal pSafeArray, 2
-    RtlMoveMemory VarPtr(cbElements), ByVal (pSafeArray + 4), 4
-    RtlMoveMemory VarPtr(dataPtr), ByVal (pSafeArray + 16), LenB(dataPtr)
-    RtlMoveMemory VarPtr(cElements), ByVal (pSafeArray + 24), 4
+    RtlMoveMemory VarPtr(cDims), ByVal (pSafeArray + RIFF_SAFEARRAY_OFFSET_DIMS), LenB(cDims)
+    RtlMoveMemory VarPtr(cbElements), ByVal (pSafeArray + RIFF_SAFEARRAY_OFFSET_ELEMENT_SIZE), LenB(cbElements)
+    RtlMoveMemory VarPtr(dataPtr), ByVal (pSafeArray + RIFF_SAFEARRAY_OFFSET_DATA_64), LenB(dataPtr)
+    RtlMoveMemory VarPtr(cElements), ByVal (pSafeArray + RIFF_SAFEARRAY_OFFSET_COUNT_64), LenB(cElements)
 
     If cDims <> 1 Then
         Exit Function
@@ -765,15 +1076,15 @@ Private Function RiffTryGetByteArrayData(ByRef audioData() As Byte, ByRef dataPt
         Exit Function
     End If
 
-    RtlMoveMemory VarPtr(pSafeArray), ByVal pArraySlot, 4
+    RtlMoveMemory VarPtr(pSafeArray), ByVal pArraySlot, LenB(pSafeArray)
     If pSafeArray = 0 Then
         Exit Function
     End If
 
-    RtlMoveMemory VarPtr(cDims), ByVal pSafeArray, 2
-    RtlMoveMemory VarPtr(cbElements), ByVal (pSafeArray + 4), 4
-    RtlMoveMemory VarPtr(dataPtr), ByVal (pSafeArray + 12), 4
-    RtlMoveMemory VarPtr(cElements), ByVal (pSafeArray + 16), 4
+    RtlMoveMemory VarPtr(cDims), ByVal (pSafeArray + RIFF_SAFEARRAY_OFFSET_DIMS), LenB(cDims)
+    RtlMoveMemory VarPtr(cbElements), ByVal (pSafeArray + RIFF_SAFEARRAY_OFFSET_ELEMENT_SIZE), LenB(cbElements)
+    RtlMoveMemory VarPtr(dataPtr), ByVal (pSafeArray + RIFF_SAFEARRAY_OFFSET_DATA_32), LenB(dataPtr)
+    RtlMoveMemory VarPtr(cElements), ByVal (pSafeArray + RIFF_SAFEARRAY_OFFSET_COUNT_32), LenB(cElements)
 
     If cDims <> 1 Then
         Exit Function
@@ -803,8 +1114,8 @@ Public Function RiffOpen() As Boolean
         Exit Function
     End If
 
-    rCtx.MagicCookie = &H52494646
-    rCtx.MasterVolume = 1!
+    rCtx.MagicCookie = RIFF_MAGIC_COOKIE
+    rCtx.MasterVolume = RIFF_UNITY_GAIN
     rCtx.MasterPeakL = 0!
     rCtx.MasterPeakR = 0!
     rCtx.RenderPeriodMs = RIFF_RENDER_PERIOD_MS
@@ -812,7 +1123,7 @@ Public Function RiffOpen() As Boolean
 
     Dim i As Long
     For i = 0 To RIFF_MAX_BUS_INDEX
-        rCtx.Buses(i) = 1!
+        rCtx.Buses(i) = RIFF_UNITY_GAIN
     Next i
 
     If Not InitThunks() Then
@@ -834,14 +1145,14 @@ Public Function RiffOpen() As Boolean
         Exit Function
     End If
 
-    ReDim rRingBuf(0 To (RIFF_VOICE_COUNT * 192000) + 1)
+    ReDim rRingBuf(0 To (RIFF_VOICE_COUNT * RIFF_RING_SAMPLES_PER_VOICE) + 1)
 
-    timeBeginPeriod 1
+    timeBeginPeriod RIFF_TIMER_RESOLUTION_MS
 
     rCtx.TimerID = SetTimer(0, 0, rCtx.RenderPeriodMs, rCtx.ThunkTimerCB)
 
     If rCtx.TimerID = 0 Then
-        timeEndPeriod 1
+        timeEndPeriod RIFF_TIMER_RESOLUTION_MS
         ReleaseWASAPI
         MFShutdown
         FreeThunks
@@ -868,7 +1179,7 @@ Public Sub RiffClose()
     If rCtx.TimerID <> 0 Then
         KillTimer 0, rCtx.TimerID
         rCtx.TimerID = 0
-        timeEndPeriod 1
+        timeEndPeriod RIFF_TIMER_RESOLUTION_MS
     End If
     
     Dim i As Long
@@ -956,8 +1267,8 @@ Public Property Let RiffMasterVolume(ByVal value As Single)
     If value < 0! Then
         value = 0!
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     
     rCtx.MasterVolume = value
@@ -987,8 +1298,8 @@ Public Property Let RiffBusVolume(ByVal busID As RiffBusId, ByVal value As Singl
     If value < 0! Then
         value = 0!
     End If
-    If value > 2! Then
-        value = 2!
+    If value > RIFF_MAX_BUS_VOLUME Then
+        value = RIFF_MAX_BUS_VOLUME
     End If
     
     rCtx.Buses(busID) = value
@@ -1062,12 +1373,12 @@ Public Function RiffLoad(ByVal filePath As String) As Long
     
     Dim hr As Long
     Dim guidResample As GUID
-    IIDFromString StrPtr("{7632CB14-D379-4770-AE7D-EA24154D9298}"), guidResample
+    IIDFromString StrPtr(RIFF_GUID_MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING), guidResample
     
-    hr = MFCreateAttributes(pAttributes, 1)
+    hr = MFCreateAttributes(pAttributes, RIFF_MF_ATTRIBUTES_CAPACITY)
 
     If hr = 0 And pAttributes <> 0 Then
-        vCall pAttributes, VTI_MF_ATTRIBUTES_SET_UINT32, VarPtr(guidResample), 1&
+        vCall pAttributes, VTI_MF_ATTRIBUTES_SET_UINT32, VarPtr(guidResample), RIFF_MF_STREAM_SELECT
         hr = MFCreateSourceReaderFromURL(StrPtr(filePath), pAttributes, pReader)
         vCall0 pAttributes, VTI_IUNKNOWN_RELEASE
     Else
@@ -1151,12 +1462,12 @@ Public Function RiffLoadFromMemory(ByRef audioData() As Byte) As Long
     End If
     
     Dim guidResample As GUID
-    IIDFromString StrPtr("{7632CB14-D379-4770-AE7D-EA24154D9298}"), guidResample
+    IIDFromString StrPtr(RIFF_GUID_MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING), guidResample
     
-    hr = MFCreateAttributes(pAttributes, 1)
+    hr = MFCreateAttributes(pAttributes, RIFF_MF_ATTRIBUTES_CAPACITY)
 
     If hr = 0 And pAttributes <> 0 Then
-        vCall pAttributes, VTI_MF_ATTRIBUTES_SET_UINT32, VarPtr(guidResample), 1&
+        vCall pAttributes, VTI_MF_ATTRIBUTES_SET_UINT32, VarPtr(guidResample), RIFF_MF_STREAM_SELECT
         hr = MFCreateSourceReaderFromByteStream(pByteStream, pAttributes, pReader)
         vCall0 pAttributes, VTI_IUNKNOWN_RELEASE
     Else
@@ -1223,15 +1534,15 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
         pNullPtr = 0
     #End If
     
-    vCall pReader, VTI_MF_SOURCE_READER_SET_STREAM_SELECTION, MF_SOURCE_READER_ALL_STREAMS, 0&
-    vCall pReader, VTI_MF_SOURCE_READER_SET_STREAM_SELECTION, MF_SOURCE_READER_FIRST_AUDIO_STREAM, 1&
+    vCall pReader, VTI_MF_SOURCE_READER_SET_STREAM_SELECTION, MF_SOURCE_READER_ALL_STREAMS, RIFF_MF_STREAM_DESELECT
+    vCall pReader, VTI_MF_SOURCE_READER_SET_STREAM_SELECTION, MF_SOURCE_READER_FIRST_AUDIO_STREAM, RIFF_MF_STREAM_SELECT
     
     hr = MFCreateMediaType(pPartialType)
     If hr = 0 And pPartialType <> 0 Then
         Dim wfx_cbSize As Integer
-        RtlMoveMemory VarPtr(wfx_cbSize), ByVal (rCtx.MixFormatPtr + 16), 2
+        RtlMoveMemory VarPtr(wfx_cbSize), ByVal (rCtx.MixFormatPtr + RIFF_WFX_CB_SIZE_OFFSET), LenB(wfx_cbSize)
         
-        hr = MFInitMediaTypeFromWaveFormatEx(pPartialType, rCtx.MixFormatPtr, 18 + CLng(wfx_cbSize))
+        hr = MFInitMediaTypeFromWaveFormatEx(pPartialType, rCtx.MixFormatPtr, RIFF_WFX_BASE_SIZE + CLng(wfx_cbSize))
         If hr = 0 Then
             vCall pReader, VTI_MF_SOURCE_READER_SET_CURRENT_MEDIA_TYPE, MF_SOURCE_READER_FIRST_AUDIO_STREAM, pNullPtr, pPartialType
         End If
@@ -1239,11 +1550,7 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
     End If
     
     Dim pSz As Long
-    #If Win64 Then
-        pSz = 8
-    #Else
-        pSz = 4
-    #End If
+    pSz = LenB(pReader)
 
     Dim dwFlags As Long
     Dim cbMax As Long
@@ -1297,7 +1604,7 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
     Dim totalSize As Long
     Dim currentCap As Long
     
-    currentCap = 1048576
+    currentCap = RIFF_DECODE_INITIAL_CAPACITY
     tempPtr = VirtualAlloc(0, currentCap, MEM_COMMIT Or MEM_RESERVE, PAGE_READWRITE)
     
     If tempPtr = 0 Then
@@ -1317,7 +1624,7 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
             hr = CLng(vRet)
         End If
         
-        If hr <> 0 Or (dwFlags And 2) <> 0 Then
+        If hr <> 0 Or (dwFlags And MF_SOURCE_READERF_ENDOFSTREAM) <> 0 Then
             Exit Do
         End If
         
@@ -1329,7 +1636,7 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
                 
                 If hr = 0 And pAudioData <> 0 And cbLen > 0 Then
                     If totalSize + cbLen > currentCap Then
-                        currentCap = (totalSize + cbLen) * 2
+                        currentCap = (totalSize + cbLen) * RIFF_DECODE_GROWTH_FACTOR
                         newPtr = VirtualAlloc(0, currentCap, MEM_COMMIT Or MEM_RESERVE, PAGE_READWRITE)
                         
                         If newPtr <> 0 Then
@@ -1462,10 +1769,10 @@ Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath A
     Dim iR As Integer
     Dim isFloat As Boolean
 
-    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + 2), 2
-    RtlMoveMemory VarPtr(sampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
-    RtlMoveMemory VarPtr(nBlockAlign), ByVal (rCtx.MixFormatPtr + 12), 2
-    RtlMoveMemory VarPtr(wBits), ByVal (rCtx.MixFormatPtr + 14), 2
+    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + RIFF_WFX_CHANNELS_OFFSET), LenB(nChannels)
+    RtlMoveMemory VarPtr(sampleRate), ByVal (rCtx.MixFormatPtr + RIFF_WFX_SAMPLE_RATE_OFFSET), LenB(sampleRate)
+    RtlMoveMemory VarPtr(nBlockAlign), ByVal (rCtx.MixFormatPtr + RIFF_WFX_BLOCK_ALIGN_OFFSET), LenB(nBlockAlign)
+    RtlMoveMemory VarPtr(wBits), ByVal (rCtx.MixFormatPtr + RIFF_WFX_BITS_OFFSET), LenB(wBits)
 
     If nChannels <= 0 Or nBlockAlign <= 0 Or sampleRate <= 0 Then
         RiffSetLastError RiffErrorUnsupportedFormat
@@ -1479,7 +1786,7 @@ Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath A
     End If
 
     isFloat = RiffMixFormatIsFloat32()
-    dataBytes = frames * 4
+    dataBytes = frames * RIFF_WAV_EXPORT_FRAME_BYTES
     ReDim outBytes(0 To dataBytes - 1)
 
     For frame = 0 To frames - 1
@@ -1492,9 +1799,9 @@ Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath A
 
         iL = RiffFloatToPcm16(sL)
         iR = RiffFloatToPcm16(sR)
-        outIndex = frame * 4
-        RtlMoveMemory VarPtr(outBytes(outIndex)), VarPtr(iL), 2
-        RtlMoveMemory VarPtr(outBytes(outIndex + 2)), VarPtr(iR), 2
+        outIndex = frame * RIFF_WAV_EXPORT_FRAME_BYTES
+        RtlMoveMemory VarPtr(outBytes(outIndex)), VarPtr(iL), LenB(iL)
+        RtlMoveMemory VarPtr(outBytes(outIndex + LenB(iL))), VarPtr(iR), LenB(iR)
     Next frame
 
     RiffExportBufferWav = RiffWritePcm16StereoWav(filePath, sampleRate, outBytes)
@@ -1520,7 +1827,7 @@ Public Function RiffRenderOscillatorWav(ByVal waveType As RiffWaveType, ByVal fr
         Exit Function
     End If
     If frequencyHz < 1! Then
-        frequencyHz = 440!
+        frequencyHz = RIFF_DEFAULT_OSCILLATOR_HZ
     End If
     waveType = RiffClampWaveType(waveType)
 
@@ -1539,17 +1846,17 @@ Public Function RiffRenderOscillatorWav(ByVal waveType As RiffWaveType, ByVal fr
         Exit Function
     End If
 
-    ReDim outBytes(0 To (frames * 4) - 1)
+    ReDim outBytes(0 To (frames * RIFF_WAV_EXPORT_FRAME_BYTES) - 1)
     dt = CDbl(frequencyHz) / CDbl(rCtx.sampleRate)
 
     For frame = 0 To frames - 1
         sample = RiffOscillatorSampleAtPhase(waveType, phase, dt)
-        pcm = RiffFloatToPcm16(sample * 0.75!)
-        outIndex = frame * 4
-        RtlMoveMemory VarPtr(outBytes(outIndex)), VarPtr(pcm), 2
-        RtlMoveMemory VarPtr(outBytes(outIndex + 2)), VarPtr(pcm), 2
+        pcm = RiffFloatToPcm16(sample * RIFF_OSCILLATOR_EXPORT_GAIN)
+        outIndex = frame * RIFF_WAV_EXPORT_FRAME_BYTES
+        RtlMoveMemory VarPtr(outBytes(outIndex)), VarPtr(pcm), LenB(pcm)
+        RtlMoveMemory VarPtr(outBytes(outIndex + LenB(pcm))), VarPtr(pcm), LenB(pcm)
         phase = phase + dt
-        If phase >= 1# Then
+        If phase >= RIFF_PHASE_FULL Then
             phase = phase - Int(phase)
         End If
     Next frame
@@ -1562,16 +1869,16 @@ End Function
 ' * @brief Converts a normalized float sample to signed 16-bit PCM.
 ' */
 Private Function RiffFloatToPcm16(ByVal value As Single) As Integer
-    If value > 1! Then
-        value = 1!
-    ElseIf value < -1! Then
-        value = -1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
+    ElseIf value < RIFF_NEGATIVE_UNITY_GAIN Then
+        value = RIFF_NEGATIVE_UNITY_GAIN
     End If
 
     If value >= 0! Then
-        RiffFloatToPcm16 = CInt(value * 32767!)
+        RiffFloatToPcm16 = CInt(value * CSng(RIFF_PCM16_MAX))
     Else
-        RiffFloatToPcm16 = CInt(value * 32768!)
+        RiffFloatToPcm16 = CInt(value * CSng(RIFF_PCM16_MIN_MAGNITUDE))
     End If
 End Function
 
@@ -1592,31 +1899,31 @@ Private Function RiffReadInterleavedSample(ByVal basePtr As Long, ByVal frameInd
 
     pSample = basePtr + (CLng(frameIndex) * CLng(nBlockAlign)) + ((CLng(channelIndex) Mod CLng(nChannels)) * (CLng(wBits) \ 8))
 
-    If wBits = 32 And isFloat Then
+    If wBits = RIFF_FLOAT32_BITS And isFloat Then
         Dim f As Single
-        RtlMoveMemory VarPtr(f), ByVal pSample, 4
+        RtlMoveMemory VarPtr(f), ByVal pSample, LenB(f)
         RiffReadInterleavedSample = f
-    ElseIf wBits = 32 Then
+    ElseIf wBits = RIFF_FLOAT32_BITS Then
         Dim l As Long
-        RtlMoveMemory VarPtr(l), ByVal pSample, 4
-        RiffReadInterleavedSample = CSng(CDbl(l) / 2147483648#)
-    ElseIf wBits = 24 Then
+        RtlMoveMemory VarPtr(l), ByVal pSample, LenB(l)
+        RiffReadInterleavedSample = CSng(CDbl(l) / RIFF_PCM32_SCALE)
+    ElseIf wBits = RIFF_PCM24_BITS Then
         Dim b0 As Byte
         Dim b1 As Byte
         Dim b2 As Byte
         Dim v As Long
-        RtlMoveMemory VarPtr(b0), ByVal pSample, 1
-        RtlMoveMemory VarPtr(b1), ByVal (pSample + 1), 1
-        RtlMoveMemory VarPtr(b2), ByVal (pSample + 2), 1
-        v = CLng(b0) Or (CLng(b1) * &H100&) Or (CLng(b2) * &H10000)
-        If (b2 And &H80) <> 0 Then
-            v = v Or -16777216
+        RtlMoveMemory VarPtr(b0), ByVal pSample, LenB(b0)
+        RtlMoveMemory VarPtr(b1), ByVal (pSample + RIFF_BYTE_BYTES), LenB(b1)
+        RtlMoveMemory VarPtr(b2), ByVal (pSample + (RIFF_BYTE_BYTES * 2)), LenB(b2)
+        v = CLng(b0) Or (CLng(b1) * RIFF_BYTE_SHIFT_8) Or (CLng(b2) * RIFF_BYTE_SHIFT_16)
+        If (b2 And RIFF_PCM24_SIGN_BIT) <> 0 Then
+            v = v Or RIFF_PCM24_SIGN_EXTEND
         End If
-        RiffReadInterleavedSample = CSng(CDbl(v) / 8388608#)
-    ElseIf wBits = 16 Then
+        RiffReadInterleavedSample = CSng(CDbl(v) / RIFF_PCM24_SCALE)
+    ElseIf wBits = RIFF_PCM16_BITS Then
         Dim i As Integer
-        RtlMoveMemory VarPtr(i), ByVal pSample, 2
-        RiffReadInterleavedSample = CSng(CDbl(i) / 32768#)
+        RtlMoveMemory VarPtr(i), ByVal pSample, LenB(i)
+        RiffReadInterleavedSample = CSng(CDbl(i) / CDbl(RIFF_PCM16_MIN_MAGNITUDE))
     End If
 End Function
 
@@ -1636,13 +1943,13 @@ Private Function RiffWritePcm16StereoWav(ByVal filePath As String, ByVal sampleR
     Dim audioFormat As Integer
 
     dataSize = UBound(dataBytes) - LBound(dataBytes) + 1
-    riffSize = 36 + dataSize
-    channels = 2
-    bits = 16
-    blockAlign = 4
+    riffSize = RIFF_WAV_SIZE_OVERHEAD + dataSize
+    channels = RIFF_WAV_EXPORT_CHANNELS
+    bits = RIFF_WAV_EXPORT_BITS
+    blockAlign = RIFF_WAV_EXPORT_FRAME_BYTES
     byteRate = sampleRate * CLng(blockAlign)
-    fmtSize = 16
-    audioFormat = 1
+    fmtSize = RIFF_WAV_FMT_CHUNK_SIZE
+    audioFormat = RIFF_WAV_FORMAT_PCM
 
     f = FreeFile
     Open filePath For Binary Access Write As #f
@@ -1688,23 +1995,23 @@ Private Function RiffOscillatorSampleAtPhase(ByVal waveType As RiffWaveType, ByV
         Case RiffWaveSine
             sample = Sin(phase * PI2)
         Case RiffWaveSquare
-            If phase < 0.5 Then
-                sample = 1#
+            If phase < RIFF_PHASE_HALF Then
+                sample = RIFF_PHASE_FULL
             Else
-                sample = -1#
+                sample = -RIFF_PHASE_FULL
             End If
             sample = sample + RiffPolyBLEP(phase, dt)
             Dim t2 As Double
-            t2 = phase + 0.5
-            If t2 >= 1# Then
-                t2 = t2 - 1#
+            t2 = phase + RIFF_PHASE_HALF
+            If t2 >= RIFF_PHASE_FULL Then
+                t2 = t2 - RIFF_PHASE_FULL
             End If
             sample = sample - RiffPolyBLEP(t2, dt)
         Case RiffWaveSawtooth
-            sample = (2# * phase) - 1#
+            sample = (RIFF_BIPOLAR_DOUBLE_SCALE * phase) - RIFF_PHASE_FULL
             sample = sample - RiffPolyBLEP(phase, dt)
         Case Else
-            sample = (Rnd() * 2!) - 1!
+            sample = (Rnd() * RIFF_BIPOLAR_SINGLE_SCALE) - RIFF_UNITY_GAIN
     End Select
 
     RiffOscillatorSampleAtPhase = CSng(sample)
@@ -1777,7 +2084,7 @@ Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequen
     waveType = RiffClampWaveType(waveType)
     
     If frequencyHz < 1! Then
-        frequencyHz = 440!
+        frequencyHz = RIFF_DEFAULT_OSCILLATOR_HZ
     End If
     
     rVoices(voiceSlot).IsOscillator = True
@@ -1815,37 +2122,37 @@ End Function
 ' * @param slot The target voice index.
 ' */
 Private Sub InternalResetVoiceDSP(ByVal slot As Long)
-    rVoices(slot).Volume = 1!
-    rVoices(slot).Pitch = 1#
+    rVoices(slot).Volume = RIFF_DEFAULT_VOICE_VOLUME
+    rVoices(slot).Pitch = RIFF_DEFAULT_VOICE_PITCH
     rVoices(slot).Pan = 0!
     rVoices(slot).Paused = False
     rVoices(slot).busID = RiffBusMain
     rVoices(slot).PeakL = 0!
     rVoices(slot).PeakR = 0!
 
-    rVoices(slot).Distortion = 1!
-    rVoices(slot).lowPass = 1!
+    rVoices(slot).Distortion = RIFF_DEFAULT_DISTORTION
+    rVoices(slot).lowPass = RIFF_DEFAULT_FILTER_CONTROL
     rVoices(slot).highPass = 0!
     rVoices(slot).FilterStateL = 0!
     rVoices(slot).FilterStateR = 0!
     rVoices(slot).FilterStateHP_L = 0!
     rVoices(slot).FilterStateHP_R = 0!
-    rVoices(slot).StereoWidth = 1!
+    rVoices(slot).StereoWidth = RIFF_DEFAULT_FILTER_CONTROL
 
-    rVoices(slot).EqBass = 1!
-    rVoices(slot).EqMid = 1!
-    rVoices(slot).EqTreble = 1!
+    rVoices(slot).EqBass = RIFF_UNITY_GAIN
+    rVoices(slot).EqMid = RIFF_UNITY_GAIN
+    rVoices(slot).EqTreble = RIFF_UNITY_GAIN
     rVoices(slot).EqStateLowL = 0!
     rVoices(slot).EqStateLowR = 0!
     rVoices(slot).EqStateHighL = 0!
     rVoices(slot).EqStateHighR = 0!
 
-    rVoices(slot).CompThreshold = 1!
-    rVoices(slot).CompRatio = 1!
-    rVoices(slot).CompEnv = 0.0001!
+    rVoices(slot).CompThreshold = RIFF_UNITY_GAIN
+    rVoices(slot).CompRatio = RIFF_MIN_COMPRESSOR_RATIO
+    rVoices(slot).CompEnv = RIFF_COMP_ENV_FLOOR
 
     rVoices(slot).BitcrushSteps = 0!
-    rVoices(slot).BitcrushDownsample = 1
+    rVoices(slot).BitcrushDownsample = RIFF_DEFAULT_BITCRUSH_DOWNSAMPLE
     rVoices(slot).BitcrushDsCount = 0
     rVoices(slot).BitcrushLastL = 0!
     rVoices(slot).BitcrushLastR = 0!
@@ -1863,20 +2170,20 @@ Private Sub InternalResetVoiceDSP(ByVal slot As Long)
     rVoices(slot).AutoPanPhase = 0#
 
     rVoices(slot).ChorusDepth = 0!
-    rVoices(slot).ChorusRate = 1.5!
+    rVoices(slot).ChorusRate = RIFF_DEFAULT_CHORUS_RATE
     rVoices(slot).ChorusPhase = 0#
 
-    rVoices(slot).FlangerRate = 0.5!
+    rVoices(slot).FlangerRate = RIFF_DEFAULT_FLANGER_RATE
     rVoices(slot).FlangerDepth = 0!
     rVoices(slot).FlangerFeedback = 0!
     rVoices(slot).FlangerPhase = 0#
 
     rVoices(slot).ReverbMix = 0!
-    rVoices(slot).ReverbTime = 0.5!
-    rVoices(slot).RevTap1 = Int(0.0297 * rCtx.sampleRate) * 2
-    rVoices(slot).RevTap2 = Int(0.0371 * rCtx.sampleRate) * 2
-    rVoices(slot).RevTap3 = Int(0.0411 * rCtx.sampleRate) * 2
-    rVoices(slot).RevTap4 = Int(0.0437 * rCtx.sampleRate) * 2
+    rVoices(slot).ReverbTime = RIFF_DEFAULT_REVERB_TIME
+    rVoices(slot).RevTap1 = Int(RIFF_REVERB_TAP1_SEC * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
+    rVoices(slot).RevTap2 = Int(RIFF_REVERB_TAP2_SEC * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
+    rVoices(slot).RevTap3 = Int(RIFF_REVERB_TAP3_SEC * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
+    rVoices(slot).RevTap4 = Int(RIFF_REVERB_TAP4_SEC * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
     rVoices(slot).RevDamp1L = 0!
     rVoices(slot).RevDamp1R = 0!
     rVoices(slot).RevDamp2L = 0!
@@ -1918,7 +2225,7 @@ Private Sub InternalResetVoiceDSP(ByVal slot As Long)
     rVoices(slot).FadeFramesTotal = 0
     rVoices(slot).FadeFramesCurrent = 0
 
-    RtlZeroMemory VarPtr(rRingBuf(slot * 192000)), 192000 * 4
+    RtlZeroMemory VarPtr(rRingBuf(slot * RIFF_RING_SAMPLES_PER_VOICE)), RIFF_RING_SAMPLES_PER_VOICE * RIFF_SINGLE_BYTES
 End Sub
 
 '/**
@@ -2063,7 +2370,7 @@ Public Sub RiffSetLoopRegionSec(ByVal voiceHandle As Long, ByVal startSec As Sin
     End If
     
     Dim nBlockAlign As Integer
-    RtlMoveMemoryToInteger nBlockAlign, ByVal (rCtx.MixFormatPtr + 12), 2
+    RtlMoveMemoryToInteger nBlockAlign, ByVal (rCtx.MixFormatPtr + RIFF_WFX_BLOCK_ALIGN_OFFSET), LenB(nBlockAlign)
     
     Dim align As Long
     align = CLng(nBlockAlign)
@@ -2215,8 +2522,8 @@ Public Property Let RiffVoiceVolume(ByVal voiceHandle As Long, ByVal value As Si
     If value < 0! Then
         value = 0!
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     
     rVoices(voiceHandle).Volume = value
@@ -2237,8 +2544,8 @@ Public Property Let RiffVoicePitch(ByVal voiceHandle As Long, ByVal value As Sin
         Exit Property
     End If
     
-    If value <= 0.1! Then
-        value = 0.1!
+    If value <= RIFF_MIN_VOICE_PITCH Then
+        value = RIFF_MIN_VOICE_PITCH
     End If
     
     rVoices(voiceHandle).Pitch = CDbl(value)
@@ -2259,11 +2566,11 @@ Public Property Let RiffVoicePan(ByVal voiceHandle As Long, ByVal value As Singl
         Exit Property
     End If
     
-    If value < -1! Then
-        value = -1!
+    If value < RIFF_NEGATIVE_UNITY_GAIN Then
+        value = RIFF_NEGATIVE_UNITY_GAIN
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     
     rVoices(voiceHandle).Pan = value
@@ -2280,7 +2587,7 @@ Public Property Get RiffVoiceBitDepth(ByVal voiceHandle As Long) As Single
     End If
     
     If rVoices(voiceHandle).BitcrushSteps = 0! Then
-        RiffVoiceBitDepth = 32!
+        RiffVoiceBitDepth = RIFF_MAX_BIT_DEPTH
     Else
         RiffVoiceBitDepth = Log(rVoices(voiceHandle).BitcrushSteps) / Log(2)
     End If
@@ -2290,12 +2597,12 @@ Public Property Let RiffVoiceBitDepth(ByVal voiceHandle As Long, ByVal value As 
         Exit Property
     End If
     
-    If value >= 32! Then
+    If value >= RIFF_MAX_BIT_DEPTH Then
         rVoices(voiceHandle).BitcrushSteps = 0!
         Exit Property
     End If
-    If value < 2! Then
-        value = 2!
+    If value < RIFF_MIN_BIT_DEPTH Then
+        value = RIFF_MIN_BIT_DEPTH
     End If
     
     rVoices(voiceHandle).BitcrushSteps = 2 ^ value
@@ -2315,8 +2622,8 @@ Public Property Let RiffVoiceSampleRateReduction(ByVal voiceHandle As Long, ByVa
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    If value < 1 Then
-        value = 1
+    If value < RIFF_MIN_DOWNSAMPLE_FACTOR Then
+        value = RIFF_MIN_DOWNSAMPLE_FACTOR
     End If
     rVoices(voiceHandle).BitcrushDownsample = value
 End Property
@@ -2358,8 +2665,8 @@ Public Property Let RiffVoiceRingModMix(ByVal voiceHandle As Long, ByVal value A
     If value < 0! Then
         value = 0!
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).RingModMix = value
 End Property
@@ -2381,8 +2688,8 @@ Public Property Let RiffVoiceAutoPanRate(ByVal voiceHandle As Long, ByVal value 
     If value < 0! Then
         value = 0!
     End If
-    If value > 20! Then
-        value = 20!
+    If value > RIFF_MAX_LFO_RATE_HZ Then
+        value = RIFF_MAX_LFO_RATE_HZ
     End If
     rVoices(voiceHandle).AutoPanRate = value
 End Property
@@ -2404,8 +2711,8 @@ Public Property Let RiffVoiceAutoPanDepth(ByVal voiceHandle As Long, ByVal value
     If value < 0! Then
         value = 0!
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).AutoPanDepth = value
 End Property
@@ -2427,8 +2734,8 @@ Public Property Let RiffVoiceEqBass(ByVal voiceHandle As Long, ByVal value As Si
     If value < 0! Then
         value = 0!
     End If
-    If value > 5! Then
-        value = 5!
+    If value > RIFF_MAX_EQ_GAIN Then
+        value = RIFF_MAX_EQ_GAIN
     End If
     rVoices(voiceHandle).EqBass = value
 End Property
@@ -2450,8 +2757,8 @@ Public Property Let RiffVoiceEqMid(ByVal voiceHandle As Long, ByVal value As Sin
     If value < 0! Then
         value = 0!
     End If
-    If value > 5! Then
-        value = 5!
+    If value > RIFF_MAX_EQ_GAIN Then
+        value = RIFF_MAX_EQ_GAIN
     End If
     rVoices(voiceHandle).EqMid = value
 End Property
@@ -2473,8 +2780,8 @@ Public Property Let RiffVoiceEqTreble(ByVal voiceHandle As Long, ByVal value As 
     If value < 0! Then
         value = 0!
     End If
-    If value > 5! Then
-        value = 5!
+    If value > RIFF_MAX_EQ_GAIN Then
+        value = RIFF_MAX_EQ_GAIN
     End If
     rVoices(voiceHandle).EqTreble = value
 End Property
@@ -2494,10 +2801,10 @@ Public Property Let RiffVoiceCompressorThreshold(ByVal voiceHandle As Long, ByVa
         Exit Property
     End If
     If value <= 0! Then
-        value = 0.01!
+        value = RIFF_MIN_COMPRESSOR_THRESHOLD
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).CompThreshold = value
 End Property
@@ -2516,11 +2823,11 @@ Public Property Let RiffVoiceCompressorRatio(ByVal voiceHandle As Long, ByVal va
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    If value < 1! Then
-        value = 1!
+    If value < RIFF_MIN_COMPRESSOR_RATIO Then
+        value = RIFF_MIN_COMPRESSOR_RATIO
     End If
-    If value > 20! Then
-        value = 20!
+    If value > RIFF_MAX_COMPRESSOR_RATIO Then
+        value = RIFF_MAX_COMPRESSOR_RATIO
     End If
     rVoices(voiceHandle).CompRatio = value
 End Property
@@ -2542,8 +2849,8 @@ Public Property Let RiffVoiceFlangerDepth(ByVal voiceHandle As Long, ByVal value
     If value < 0! Then
         value = 0!
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).FlangerDepth = value
 End Property
@@ -2562,11 +2869,11 @@ Public Property Let RiffVoiceFlangerRate(ByVal voiceHandle As Long, ByVal value 
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    If value < 0.1! Then
-        value = 0.1!
+    If value < RIFF_MIN_MOD_RATE_HZ Then
+        value = RIFF_MIN_MOD_RATE_HZ
     End If
-    If value > 10! Then
-        value = 10!
+    If value > RIFF_MAX_MOD_RATE_HZ Then
+        value = RIFF_MAX_MOD_RATE_HZ
     End If
     rVoices(voiceHandle).FlangerRate = value
 End Property
@@ -2588,8 +2895,8 @@ Public Property Let RiffVoiceFlangerFeedback(ByVal voiceHandle As Long, ByVal va
     If value < 0! Then
         value = 0!
     End If
-    If value > 0.95! Then
-        value = 0.95!
+    If value > RIFF_MAX_FEEDBACK Then
+        value = RIFF_MAX_FEEDBACK
     End If
     rVoices(voiceHandle).FlangerFeedback = value
 End Property
@@ -2608,8 +2915,8 @@ Public Property Let RiffVoiceDistortion(ByVal voiceHandle As Long, ByVal value A
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    If value < 1! Then
-        value = 1!
+    If value < RIFF_DEFAULT_DISTORTION Then
+        value = RIFF_DEFAULT_DISTORTION
     End If
     rVoices(voiceHandle).Distortion = value
 End Property
@@ -2629,10 +2936,10 @@ Public Property Let RiffVoiceLowPass(ByVal voiceHandle As Long, ByVal value As S
         Exit Property
     End If
     If value <= 0! Then
-        value = 0.01!
+        value = RIFF_MIN_LOWPASS_CONTROL
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).lowPass = value
 End Property
@@ -2654,8 +2961,8 @@ Public Property Let RiffVoiceHighPass(ByVal voiceHandle As Long, ByVal value As 
     If value < 0! Then
         value = 0!
     End If
-    If value > 0.99! Then
-        value = 0.99!
+    If value > RIFF_MAX_STEREO_WIDTH Then
+        value = RIFF_MAX_STEREO_WIDTH
     End If
     rVoices(voiceHandle).highPass = value
 End Property
@@ -2677,8 +2984,8 @@ Public Property Let RiffVoiceStereoWidth(ByVal voiceHandle As Long, ByVal value 
     If value < 0! Then
         value = 0!
     End If
-    If value > 5! Then
-        value = 5!
+    If value > RIFF_MAX_STEREO_WIDTH_CONTROL Then
+        value = RIFF_MAX_STEREO_WIDTH_CONTROL
     End If
     rVoices(voiceHandle).StereoWidth = value
 End Property
@@ -2700,8 +3007,8 @@ Public Property Let RiffVoiceTremoloRate(ByVal voiceHandle As Long, ByVal value 
     If value < 0! Then
         value = 0!
     End If
-    If value > 20! Then
-        value = 20!
+    If value > RIFF_MAX_LFO_RATE_HZ Then
+        value = RIFF_MAX_LFO_RATE_HZ
     End If
     rVoices(voiceHandle).TremoloRate = value
 End Property
@@ -2723,8 +3030,8 @@ Public Property Let RiffVoiceTremoloDepth(ByVal voiceHandle As Long, ByVal value
     If value < 0! Then
         value = 0!
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).TremoloDepth = value
 End Property
@@ -2746,8 +3053,8 @@ Public Property Let RiffVoiceChorusDepth(ByVal voiceHandle As Long, ByVal value 
     If value < 0! Then
         value = 0!
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).ChorusDepth = value
 End Property
@@ -2766,11 +3073,11 @@ Public Property Let RiffVoiceChorusRate(ByVal voiceHandle As Long, ByVal value A
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    If value < 0.1! Then
-        value = 0.1!
+    If value < RIFF_MIN_MOD_RATE_HZ Then
+        value = RIFF_MIN_MOD_RATE_HZ
     End If
-    If value > 10! Then
-        value = 10!
+    If value > RIFF_MAX_MOD_RATE_HZ Then
+        value = RIFF_MAX_MOD_RATE_HZ
     End If
     rVoices(voiceHandle).ChorusRate = value
 End Property
@@ -2792,8 +3099,8 @@ Public Property Let RiffVoiceReverbMix(ByVal voiceHandle As Long, ByVal value As
     If value < 0! Then
         value = 0!
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).ReverbMix = value
 End Property
@@ -2815,8 +3122,8 @@ Public Property Let RiffVoiceReverbTime(ByVal voiceHandle As Long, ByVal value A
     If value < 0! Then
         value = 0!
     End If
-    If value > 0.95! Then
-        value = 0.95!
+    If value > RIFF_MAX_FEEDBACK Then
+        value = RIFF_MAX_FEEDBACK
     End If
     rVoices(voiceHandle).ReverbTime = value
 End Property
@@ -2838,8 +3145,8 @@ Public Property Let RiffVoiceDelayTime(ByVal voiceHandle As Long, ByVal value As
     If value < 0! Then
         value = 0!
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).DelayTime = value
 End Property
@@ -2861,8 +3168,8 @@ Public Property Let RiffVoiceDelayFeedback(ByVal voiceHandle As Long, ByVal valu
     If value < 0! Then
         value = 0!
     End If
-    If value > 0.95! Then
-        value = 0.95!
+    If value > RIFF_MAX_FEEDBACK Then
+        value = RIFF_MAX_FEEDBACK
     End If
     rVoices(voiceHandle).DelayFeedback = value
 End Property
@@ -2884,8 +3191,8 @@ Public Property Let RiffVoiceDelayMix(ByVal voiceHandle As Long, ByVal value As 
     If value < 0! Then
         value = 0!
     End If
-    If value > 1! Then
-        value = 1!
+    If value > RIFF_UNITY_GAIN Then
+        value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).DelayMix = value
 End Property
@@ -2962,7 +3269,7 @@ End Sub
 ' */
 Private Sub RiffClearSingleScratch(ByRef buffer() As Single, ByVal itemCount As Long)
     If itemCount > 0 Then
-        RtlZeroMemory VarPtr(buffer(0)), itemCount * 4
+        RtlZeroMemory VarPtr(buffer(0)), itemCount * RIFF_SINGLE_BYTES
     End If
 End Sub
 
@@ -2972,7 +3279,7 @@ End Sub
 ' */
 Private Sub RiffClearLongScratch(ByRef buffer() As Long, ByVal itemCount As Long)
     If itemCount > 0 Then
-        RtlZeroMemory VarPtr(buffer(0)), itemCount * 4
+        RtlZeroMemory VarPtr(buffer(0)), itemCount * RIFF_LONG_BYTES
     End If
 End Sub
 
@@ -2982,7 +3289,7 @@ End Sub
 ' */
 Private Sub RiffClearIntegerScratch(ByRef buffer() As Integer, ByVal itemCount As Long)
     If itemCount > 0 Then
-        RtlZeroMemory VarPtr(buffer(0)), itemCount * 2
+        RtlZeroMemory VarPtr(buffer(0)), itemCount * RIFF_INTEGER_BYTES
     End If
 End Sub
 
@@ -2997,10 +3304,10 @@ Private Function RiffPolyBLEP(ByVal t As Double, ByVal dt As Double) As Single
 
     If t < dt Then
         t = t / dt
-        RiffPolyBLEP = CSng((t + t) - (t * t) - 1#)
-    ElseIf t > 1# - dt Then
-        t = (t - 1#) / dt
-        RiffPolyBLEP = CSng((t * t) + (t + t) + 1#)
+        RiffPolyBLEP = CSng((t + t) - (t * t) - RIFF_PHASE_FULL)
+    ElseIf t > RIFF_PHASE_FULL - dt Then
+        t = (t - RIFF_PHASE_FULL) / dt
+        RiffPolyBLEP = CSng((t * t) + (t + t) + RIFF_PHASE_FULL)
     Else
         RiffPolyBLEP = 0!
     End If
@@ -3022,39 +3329,39 @@ Private Function RiffNextOscillatorSample(ByVal voiceIndex As Long) As Single
 
     dt = CDbl(rVoices(voiceIndex).OscFreq) / CDbl(rCtx.sampleRate)
     If dt <= 0# Then
-        dt = 440# / CDbl(rCtx.sampleRate)
+        dt = RIFF_OSCILLATOR_FALLBACK_HZ / CDbl(rCtx.sampleRate)
     End If
-    If dt > 0.5 Then
-        dt = 0.5
+    If dt > RIFF_OSCILLATOR_MAX_DT Then
+        dt = RIFF_OSCILLATOR_MAX_DT
     End If
 
     phase01 = rVoices(voiceIndex).OscPhase / PI2
     phase01 = phase01 - Fix(phase01)
     If phase01 < 0# Then
-        phase01 = phase01 + 1#
+        phase01 = phase01 + RIFF_PHASE_FULL
     End If
 
     Select Case rVoices(voiceIndex).OscType
         Case RiffWaveSine
             sample = CSng(Sin(rVoices(voiceIndex).OscPhase))
         Case RiffWaveSquare
-            If phase01 < 0.5 Then
-                sample = 0.65!
+            If phase01 < RIFF_HALF_SCALE Then
+                sample = RIFF_OSCILLATOR_BLEP_LEVEL
             Else
-                sample = -0.65!
+                sample = -RIFF_OSCILLATOR_BLEP_LEVEL
             End If
-            sample = sample + 0.65! * RiffPolyBLEP(phase01, dt)
-            edge = phase01 + 0.5
-            If edge >= 1# Then
-                edge = edge - 1#
+            sample = sample + RIFF_OSCILLATOR_BLEP_LEVEL * RiffPolyBLEP(phase01, dt)
+            edge = phase01 + RIFF_HALF_SCALE
+            If edge >= RIFF_PHASE_FULL Then
+                edge = edge - RIFF_PHASE_FULL
             End If
-            sample = sample - 0.65! * RiffPolyBLEP(edge, dt)
+            sample = sample - RIFF_OSCILLATOR_BLEP_LEVEL * RiffPolyBLEP(edge, dt)
         Case RiffWaveSawtooth
-            sample = CSng((2# * phase01) - 1#)
+            sample = CSng((RIFF_BIPOLAR_DOUBLE_SCALE * phase01) - RIFF_PHASE_FULL)
             sample = sample - RiffPolyBLEP(phase01, dt)
-            sample = sample * 0.65!
+            sample = sample * RIFF_OSCILLATOR_BLEP_LEVEL
         Case Else
-            sample = (Rnd() * 2!) - 1!
+            sample = (Rnd() * RIFF_BIPOLAR_SINGLE_SCALE) - RIFF_UNITY_GAIN
     End Select
 
     rVoices(voiceIndex).OscPhase = rVoices(voiceIndex).OscPhase + (dt * PI2)
@@ -3080,7 +3387,7 @@ Private Function RiffEngineHasActivePlayback() As Boolean
                 Exit Function
             End If
 
-            If rVoices(i).BufferIndex >= 0 And rVoices(i).BufferIndex <= 63 Then
+            If rVoices(i).BufferIndex >= 0 And rVoices(i).BufferIndex <= RIFF_MAX_BUFFER_INDEX Then
                 If rCtx.Buffers(rVoices(i).BufferIndex).Active Then
                     RiffEngineHasActivePlayback = True
                     Exit Function
@@ -3115,20 +3422,20 @@ Private Sub RiffBiquadLowPassCoeffs(ByVal cutoffHz As Single, ByVal q As Single,
     Dim alpha As Double
     Dim a0 As Double
 
-    cutoffHz = RiffClamp(cutoffHz, 20!, CSng(rCtx.sampleRate) * 0.45!)
-    q = RiffClamp(q, 0.1!, 12!)
+    cutoffHz = RiffClamp(cutoffHz, RIFF_FILTER_MIN_CUTOFF_HZ, CSng(rCtx.sampleRate) * RIFF_LOWPASS_MAX_SAMPLE_RATE_RATIO)
+    q = RiffClamp(q, RIFF_BIQUAD_MIN_Q, RIFF_BIQUAD_MAX_Q)
 
     omega = PI2 * CDbl(cutoffHz) / CDbl(rCtx.sampleRate)
     sn = Sin(omega)
     cs = Cos(omega)
-    alpha = sn / (2# * CDbl(q))
-    a0 = 1# + alpha
+    alpha = sn / (RIFF_BIPOLAR_DOUBLE_SCALE * CDbl(q))
+    a0 = RIFF_PHASE_FULL + alpha
 
-    b0 = CSng(((1# - cs) * 0.5) / a0)
-    b1 = CSng((1# - cs) / a0)
+    b0 = CSng(((RIFF_PHASE_FULL - cs) * CDbl(RIFF_HALF_SCALE)) / a0)
+    b1 = CSng((RIFF_PHASE_FULL - cs) / a0)
     b2 = b0
-    a1 = CSng((-2# * cs) / a0)
-    a2 = CSng((1# - alpha) / a0)
+    a1 = CSng((-RIFF_BIPOLAR_DOUBLE_SCALE * cs) / a0)
+    a2 = CSng((RIFF_PHASE_FULL - alpha) / a0)
 End Sub
 
 '/**
@@ -3142,20 +3449,20 @@ Private Sub RiffBiquadHighPassCoeffs(ByVal cutoffHz As Single, ByVal q As Single
     Dim alpha As Double
     Dim a0 As Double
 
-    cutoffHz = RiffClamp(cutoffHz, 20!, CSng(rCtx.sampleRate) * 0.45!)
-    q = RiffClamp(q, 0.1!, 12!)
+    cutoffHz = RiffClamp(cutoffHz, RIFF_FILTER_MIN_CUTOFF_HZ, CSng(rCtx.sampleRate) * RIFF_LOWPASS_MAX_SAMPLE_RATE_RATIO)
+    q = RiffClamp(q, RIFF_BIQUAD_MIN_Q, RIFF_BIQUAD_MAX_Q)
 
     omega = PI2 * CDbl(cutoffHz) / CDbl(rCtx.sampleRate)
     sn = Sin(omega)
     cs = Cos(omega)
-    alpha = sn / (2# * CDbl(q))
-    a0 = 1# + alpha
+    alpha = sn / (RIFF_BIPOLAR_DOUBLE_SCALE * CDbl(q))
+    a0 = RIFF_PHASE_FULL + alpha
 
-    b0 = CSng(((1# + cs) * 0.5) / a0)
-    b1 = CSng((-(1# + cs)) / a0)
+    b0 = CSng(((RIFF_PHASE_FULL + cs) * CDbl(RIFF_HALF_SCALE)) / a0)
+    b1 = CSng((-(RIFF_PHASE_FULL + cs)) / a0)
     b2 = b0
-    a1 = CSng((-2# * cs) / a0)
-    a2 = CSng((1# - alpha) / a0)
+    a1 = CSng((-RIFF_BIPOLAR_DOUBLE_SCALE * cs) / a0)
+    a2 = CSng((RIFF_PHASE_FULL - alpha) / a0)
 End Sub
 
 '/**
@@ -3170,22 +3477,22 @@ Private Sub RiffBiquadPeakCoeffs(ByVal freqHz As Single, ByVal q As Single, ByVa
     Dim amp As Double
     Dim a0 As Double
 
-    freqHz = RiffClamp(freqHz, 20!, CSng(rCtx.sampleRate) * 0.45!)
-    q = RiffClamp(q, 0.1!, 12!)
-    gain = RiffClamp(gain, 0.05!, 8!)
+    freqHz = RiffClamp(freqHz, RIFF_FILTER_MIN_CUTOFF_HZ, CSng(rCtx.sampleRate) * RIFF_LOWPASS_MAX_SAMPLE_RATE_RATIO)
+    q = RiffClamp(q, RIFF_BIQUAD_MIN_Q, RIFF_BIQUAD_MAX_Q)
+    gain = RiffClamp(gain, RIFF_BIQUAD_MIN_GAIN, RIFF_BIQUAD_MAX_GAIN)
 
     omega = PI2 * CDbl(freqHz) / CDbl(rCtx.sampleRate)
     sn = Sin(omega)
     cs = Cos(omega)
-    alpha = sn / (2# * CDbl(q))
+    alpha = sn / (RIFF_BIPOLAR_DOUBLE_SCALE * CDbl(q))
     amp = Sqr(CDbl(gain))
-    a0 = 1# + (alpha / amp)
+    a0 = RIFF_PHASE_FULL + (alpha / amp)
 
-    b0 = CSng((1# + (alpha * amp)) / a0)
-    b1 = CSng((-2# * cs) / a0)
-    b2 = CSng((1# - (alpha * amp)) / a0)
-    a1 = CSng((-2# * cs) / a0)
-    a2 = CSng((1# - (alpha / amp)) / a0)
+    b0 = CSng((RIFF_PHASE_FULL + (alpha * amp)) / a0)
+    b1 = CSng((-RIFF_BIPOLAR_DOUBLE_SCALE * cs) / a0)
+    b2 = CSng((RIFF_PHASE_FULL - (alpha * amp)) / a0)
+    a1 = CSng((-RIFF_BIPOLAR_DOUBLE_SCALE * cs) / a0)
+    a2 = CSng((RIFF_PHASE_FULL - (alpha / amp)) / a0)
 End Sub
 
 '/**
@@ -3204,34 +3511,34 @@ Private Sub RiffProcessVoiceFilters(ByVal voiceIndex As Long, ByRef leftSample A
         Exit Sub
     End If
 
-    If lowPass < 0.999! Then
-        cutoff = 40! + ((RiffClamp(lowPass, 0!, 1!) ^ 2!) * ((CSng(rCtx.sampleRate) * 0.45!) - 40!))
-        RiffBiquadLowPassCoeffs cutoff, 0.707!, b0, b1, b2, a1, a2
+    If lowPass < RIFF_LOWPASS_BYPASS_THRESHOLD Then
+        cutoff = RIFF_LOWPASS_MIN_CUTOFF_HZ + ((RiffClamp(lowPass, 0!, RIFF_UNITY_GAIN) ^ RIFF_BIPOLAR_SINGLE_SCALE) * ((CSng(rCtx.sampleRate) * RIFF_LOWPASS_MAX_SAMPLE_RATE_RATIO) - RIFF_LOWPASS_MIN_CUTOFF_HZ))
+        RiffBiquadLowPassCoeffs cutoff, RIFF_FILTER_DEFAULT_Q, b0, b1, b2, a1, a2
         leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).BqLowPassZ1L, rVoices(voiceIndex).BqLowPassZ2L, b0, b1, b2, a1, a2)
         rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).BqLowPassZ1R, rVoices(voiceIndex).BqLowPassZ2R, b0, b1, b2, a1, a2)
     End If
 
     If highPass > 0! Then
-        cutoff = 20! + ((RiffClamp(highPass, 0!, 1!) ^ 2!) * ((CSng(rCtx.sampleRate) * 0.35!) - 20!))
-        RiffBiquadHighPassCoeffs cutoff, 0.707!, b0, b1, b2, a1, a2
+        cutoff = RIFF_FILTER_MIN_CUTOFF_HZ + ((RiffClamp(highPass, 0!, RIFF_UNITY_GAIN) ^ RIFF_BIPOLAR_SINGLE_SCALE) * ((CSng(rCtx.sampleRate) * RIFF_HIGHPASS_MAX_SAMPLE_RATE_RATIO) - RIFF_FILTER_MIN_CUTOFF_HZ))
+        RiffBiquadHighPassCoeffs cutoff, RIFF_FILTER_DEFAULT_Q, b0, b1, b2, a1, a2
         leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).BqHighPassZ1L, rVoices(voiceIndex).BqHighPassZ2L, b0, b1, b2, a1, a2)
         rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).BqHighPassZ1R, rVoices(voiceIndex).BqHighPassZ2R, b0, b1, b2, a1, a2)
     End If
 
     If bassGain <> 1! Then
-        RiffBiquadPeakCoeffs 120!, 0.7!, bassGain, b0, b1, b2, a1, a2
+        RiffBiquadPeakCoeffs RIFF_EQ_BASS_CENTER_HZ, RIFF_EQ_DEFAULT_Q, bassGain, b0, b1, b2, a1, a2
         leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqBassZ1L, rVoices(voiceIndex).EqBassZ2L, b0, b1, b2, a1, a2)
         rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqBassZ1R, rVoices(voiceIndex).EqBassZ2R, b0, b1, b2, a1, a2)
     End If
 
     If midGain <> 1! Then
-        RiffBiquadPeakCoeffs 1000!, 1!, midGain, b0, b1, b2, a1, a2
+        RiffBiquadPeakCoeffs RIFF_EQ_MID_CENTER_HZ, RIFF_EQ_MID_Q, midGain, b0, b1, b2, a1, a2
         leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqMidZ1L, rVoices(voiceIndex).EqMidZ2L, b0, b1, b2, a1, a2)
         rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqMidZ1R, rVoices(voiceIndex).EqMidZ2R, b0, b1, b2, a1, a2)
     End If
 
     If trebleGain <> 1! Then
-        RiffBiquadPeakCoeffs 6500!, 0.7!, trebleGain, b0, b1, b2, a1, a2
+        RiffBiquadPeakCoeffs RIFF_EQ_TREBLE_CENTER_HZ, RIFF_EQ_DEFAULT_Q, trebleGain, b0, b1, b2, a1, a2
         leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqTrebleZ1L, rVoices(voiceIndex).EqTrebleZ2L, b0, b1, b2, a1, a2)
         rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqTrebleZ1R, rVoices(voiceIndex).EqTrebleZ2R, b0, b1, b2, a1, a2)
     End If
@@ -3243,10 +3550,10 @@ End Sub
 ' */
 Private Function RiffRingRead(ByVal baseIndex As Long, ByVal readIndex As Long, ByVal channelOffset As Long) As Single
     Do While readIndex < 0
-        readIndex = readIndex + 192000
+        readIndex = readIndex + RIFF_RING_SAMPLES_PER_VOICE
     Loop
-    If readIndex >= 192000 Then
-        readIndex = readIndex Mod 192000
+    If readIndex >= RIFF_RING_SAMPLES_PER_VOICE Then
+        readIndex = readIndex Mod RIFF_RING_SAMPLES_PER_VOICE
     End If
     RiffRingRead = rRingBuf(baseIndex + readIndex + channelOffset)
 End Function
@@ -3269,8 +3576,8 @@ Private Sub RiffProcessFreeverb(ByVal voiceIndex As Long, ByVal baseIndex As Lon
     Dim wetL As Single
     Dim wetR As Single
 
-    fb = 0.68! + (RiffClamp(decay, 0!, 1!) * 0.28!)
-    damp = 0.18! + ((1! - RiffClamp(decay, 0!, 1!)) * 0.24!)
+    fb = RIFF_REVERB_FEEDBACK_BASE + (RiffClamp(decay, 0!, RIFF_UNITY_GAIN) * RIFF_REVERB_FEEDBACK_RANGE)
+    damp = RIFF_REVERB_DAMP_BASE + ((RIFF_UNITY_GAIN - RiffClamp(decay, 0!, RIFF_UNITY_GAIN)) * RIFF_REVERB_DAMP_RANGE)
     mix = RiffClamp(mix, 0!, 1!)
 
     l1 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap1, 0)
@@ -3291,8 +3598,8 @@ Private Sub RiffProcessFreeverb(ByVal voiceIndex As Long, ByVal baseIndex As Lon
     rVoices(voiceIndex).RevDamp4L = (l4 * (1! - damp)) + (rVoices(voiceIndex).RevDamp4L * damp)
     rVoices(voiceIndex).RevDamp4R = (r4 * (1! - damp)) + (rVoices(voiceIndex).RevDamp4R * damp)
 
-    wetL = ((rVoices(voiceIndex).RevDamp1L + rVoices(voiceIndex).RevDamp2L + rVoices(voiceIndex).RevDamp3L + rVoices(voiceIndex).RevDamp4L) * 0.19!) + ((rVoices(voiceIndex).RevDamp2R + rVoices(voiceIndex).RevDamp4R) * 0.055!)
-    wetR = ((rVoices(voiceIndex).RevDamp1R + rVoices(voiceIndex).RevDamp2R + rVoices(voiceIndex).RevDamp3R + rVoices(voiceIndex).RevDamp4R) * 0.19!) + ((rVoices(voiceIndex).RevDamp1L + rVoices(voiceIndex).RevDamp3L) * 0.055!)
+    wetL = ((rVoices(voiceIndex).RevDamp1L + rVoices(voiceIndex).RevDamp2L + rVoices(voiceIndex).RevDamp3L + rVoices(voiceIndex).RevDamp4L) * RIFF_REVERB_DIRECT_WET) + ((rVoices(voiceIndex).RevDamp2R + rVoices(voiceIndex).RevDamp4R) * RIFF_REVERB_CROSS_WET)
+    wetR = ((rVoices(voiceIndex).RevDamp1R + rVoices(voiceIndex).RevDamp2R + rVoices(voiceIndex).RevDamp3R + rVoices(voiceIndex).RevDamp4R) * RIFF_REVERB_DIRECT_WET) + ((rVoices(voiceIndex).RevDamp1L + rVoices(voiceIndex).RevDamp3L) * RIFF_REVERB_CROSS_WET)
 
     leftSample = leftSample + (wetL * mix)
     rightSample = rightSample + (wetR * mix)
@@ -3305,7 +3612,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As LongPtr, ByVal uMsg As Long, ByVal i
 #Else
 Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEvent As Long, ByVal dwTime As Long)
 #End If
-    If rCtx.MagicCookie <> &H52494646 Then
+    If rCtx.MagicCookie <> RIFF_MAGIC_COOKIE Then
         Exit Sub
     End If
     
@@ -3423,8 +3730,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
     #End If
 
     If Not RiffEngineHasActivePlayback() Then
-        rCtx.MasterPeakL = rCtx.MasterPeakL * 0.85!
-        rCtx.MasterPeakR = rCtx.MasterPeakR * 0.85!
+        rCtx.MasterPeakL = rCtx.MasterPeakL * RIFF_MASTER_IDLE_PEAK_DECAY
+        rCtx.MasterPeakR = rCtx.MasterPeakR * RIFF_MASTER_IDLE_PEAK_DECAY
         Exit Sub
     End If
     
@@ -3449,18 +3756,18 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
         Exit Sub
     End If
     
-    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + 2), 2
-    RtlMoveMemory VarPtr(nBlockAlign), ByVal (rCtx.MixFormatPtr + 12), 2
-    RtlMoveMemory VarPtr(wBits), ByVal (rCtx.MixFormatPtr + 14), 2
+    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + RIFF_WFX_CHANNELS_OFFSET), LenB(nChannels)
+    RtlMoveMemory VarPtr(nBlockAlign), ByVal (rCtx.MixFormatPtr + RIFF_WFX_BLOCK_ALIGN_OFFSET), LenB(nBlockAlign)
+    RtlMoveMemory VarPtr(wBits), ByVal (rCtx.MixFormatPtr + RIFF_WFX_BITS_OFFSET), LenB(wBits)
     
     bytesToWrite = framesAvailable * CLng(nBlockAlign)
     align = CLng(nBlockAlign)
     
-    eqAlphaLow = 1! - Exp(-PI2 * 200! / CSng(rCtx.sampleRate))
-    eqAlphaHigh = 1! - Exp(-PI2 * 2000! / CSng(rCtx.sampleRate))
+    eqAlphaLow = 1! - Exp(-PI2 * RIFF_EQ_LOW_CROSSOVER_HZ / CSng(rCtx.sampleRate))
+    eqAlphaHigh = 1! - Exp(-PI2 * RIFF_EQ_HIGH_CROSSOVER_HZ / CSng(rCtx.sampleRate))
     
-    rCtx.MasterPeakL = rCtx.MasterPeakL * 0.9!
-    rCtx.MasterPeakR = rCtx.MasterPeakR * 0.9!
+    rCtx.MasterPeakL = rCtx.MasterPeakL * RIFF_ACTIVE_PEAK_DECAY
+    rCtx.MasterPeakR = rCtx.MasterPeakR * RIFF_ACTIVE_PEAK_DECAY
     
     Dim currentMasterPeakL As Single
     Dim currentMasterPeakR As Single
@@ -3469,8 +3776,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
     Dim isMixFloat32 As Boolean
     isMixFloat32 = RiffMixFormatIsFloat32()
 
-    If wBits = 32 Then
-        sampleCount32 = bytesToWrite \ 4
+    If wBits = RIFF_FLOAT32_BITS Then
+        sampleCount32 = bytesToWrite \ RIFF_SINGLE_BYTES
         RiffEnsureSingleScratch rMixArr32, rMixArr32Cap, sampleCount32
         RiffClearSingleScratch rMixArr32, sampleCount32
         
@@ -3500,7 +3807,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     loopStart = rVoices(i).loopStart
                     loopEnd = rVoices(i).loopEnd
 
-                    framesNeeded = Int(framesAvailable * ptch) + 2
+                    framesNeeded = Int(framesAvailable * ptch) + RIFF_WAV_EXPORT_CHANNELS
                     bytesNeeded = framesNeeded * align
                     sourceSampleCount = bytesNeeded \ 4
                     
@@ -3617,9 +3924,9 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     dTime = rVoices(i).DelayTime
                     dFB = rVoices(i).DelayFeedback
                     dMix = rVoices(i).DelayMix
-                    dSamples = Int(dTime * rCtx.sampleRate) * 2
+                    dSamples = Int(dTime * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                     dWrite = rVoices(i).RingWritePos
-                    dBase = i * 192000
+                    dBase = i * RIFF_RING_SAMPLES_PER_VOICE
                     
                     fadeState = rVoices(i).fadeState
                     fadeCur = rVoices(i).FadeFramesCurrent
@@ -3640,10 +3947,10 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     Dim currentVoicePeakR As Single
                     currentVoicePeakL = 0!
                     currentVoicePeakR = 0!
-                    rVoices(i).PeakL = rVoices(i).PeakL * 0.9!
-                    rVoices(i).PeakR = rVoices(i).PeakR * 0.9!
+                    rVoices(i).PeakL = rVoices(i).PeakL * RIFF_ACTIVE_PEAK_DECAY
+                    rVoices(i).PeakR = rVoices(i).PeakR * RIFF_ACTIVE_PEAK_DECAY
                     
-                    If nChannels = 2 Then
+                    If nChannels = RIFF_WAV_EXPORT_CHANNELS Then
                         For frame = 0 To framesAvailable - 1
                             If Not rVoices(i).IsOscillator Then
                                 If pos >= loopEnd Then
@@ -3686,7 +3993,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 Dim sID As Long
                                 Dim sFrac32 As Single
                                 sBase32 = Int(srcIdx)
-                                sID = sBase32 * 2
+                                sID = sBase32 * RIFF_WAV_EXPORT_CHANNELS
                                 sFrac32 = CSng(srcIdx - CDbl(sBase32))
                                 If isMixFloat32 Then
                                     If sID + 3 < sourceSampleCount Then
@@ -3700,11 +4007,11 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                         fR = 0!
                                     End If
                                 ElseIf sID + 3 < sourceSampleCount Then
-                                    fL = CSng((CDbl(rSrcArrI32(sID)) + ((CDbl(rSrcArrI32(sID + 2)) - CDbl(rSrcArrI32(sID))) * CDbl(sFrac32))) / 2147483648#)
-                                    fR = CSng((CDbl(rSrcArrI32(sID + 1)) + ((CDbl(rSrcArrI32(sID + 3)) - CDbl(rSrcArrI32(sID + 1))) * CDbl(sFrac32))) / 2147483648#)
+                                    fL = CSng((CDbl(rSrcArrI32(sID)) + ((CDbl(rSrcArrI32(sID + 2)) - CDbl(rSrcArrI32(sID))) * CDbl(sFrac32))) / RIFF_PCM32_SCALE)
+                                    fR = CSng((CDbl(rSrcArrI32(sID + 1)) + ((CDbl(rSrcArrI32(sID + 3)) - CDbl(rSrcArrI32(sID + 1))) * CDbl(sFrac32))) / RIFF_PCM32_SCALE)
                                 ElseIf sID + 1 < sourceSampleCount Then
-                                    fL = CSng(CDbl(rSrcArrI32(sID)) / 2147483648#)
-                                    fR = CSng(CDbl(rSrcArrI32(sID + 1)) / 2147483648#)
+                                    fL = CSng(CDbl(rSrcArrI32(sID)) / RIFF_PCM32_SCALE)
+                                    fR = CSng(CDbl(rSrcArrI32(sID + 1)) / RIFF_PCM32_SCALE)
                                 Else
                                     fL = 0!
                                     fR = 0!
@@ -3757,7 +4064,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             
                             If trmDepth > 0! Then
                                 Dim trmMult As Single
-                                trmMult = 1! - trmDepth * (0.5! + 0.5! * CSng(Sin(trmPhase)))
+                                trmMult = RIFF_UNITY_GAIN - trmDepth * (RIFF_HALF_SCALE + RIFF_HALF_SCALE * CSng(Sin(trmPhase)))
                                 fL = fL * trmMult
                                 fR = fR * trmMult
                                 trmPhase = trmPhase + trmStep
@@ -3769,8 +4076,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             If sWidth <> 1! Then
                                 Dim midS As Single
                                 Dim sideS As Single
-                                midS = (fL + fR) * 0.5!
-                                sideS = (fL - fR) * 0.5!
+                                midS = (fL + fR) * RIFF_HALF_SCALE
+                                sideS = (fL - fR) * RIFF_HALF_SCALE
                                 fL = midS + sideS * sWidth
                                 fR = midS - sideS * sWidth
                             End If
@@ -3786,10 +4093,10 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 Dim flgL As Single
                                 Dim flgR As Single
                                 
-                                fDel = Int((0.002! + 0.005! * CSng(Sin(flgPhase))) * rCtx.sampleRate) * 2
+                                fDel = Int((RIFF_FLANGER_BASE_DELAY_SEC + RIFF_FLANGER_MOD_DELAY_SEC * CSng(Sin(flgPhase))) * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                                 fRd = dWrite - fDel
                                 If fRd < 0 Then
-                                    fRd = fRd + 192000
+                                    fRd = fRd + RIFF_RING_SAMPLES_PER_VOICE
                                 End If
                                 
                                 flgL = rRingBuf(dBase + fRd)
@@ -3810,14 +4117,14 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 Dim cDelay As Long
                                 Dim cRead As Long
                                 
-                                cDelay = Int((0.02! + 0.005! * CSng(Sin(cPhase))) * rCtx.sampleRate) * 2
+                                cDelay = Int((RIFF_CHORUS_BASE_DELAY_SEC + RIFF_CHORUS_MOD_DELAY_SEC * CSng(Sin(cPhase))) * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                                 cRead = dWrite - cDelay
                                 If cRead < 0 Then
-                                    cRead = cRead + 192000
+                                    cRead = cRead + RIFF_RING_SAMPLES_PER_VOICE
                                 End If
                                 
-                                fL = fL * (1! - cDepth * 0.5!) + rRingBuf(dBase + cRead) * cDepth
-                                fR = fR * (1! - cDepth * 0.5!) + rRingBuf(dBase + cRead + 1) * cDepth
+                                fL = fL * (RIFF_UNITY_GAIN - cDepth * RIFF_HALF_SCALE) + rRingBuf(dBase + cRead) * cDepth
+                                fR = fR * (RIFF_UNITY_GAIN - cDepth * RIFF_HALF_SCALE) + rRingBuf(dBase + cRead + 1) * cDepth
                                 cPhase = cPhase + cStep
                                 If cPhase > PI2 Then
                                     cPhase = cPhase - PI2
@@ -3831,7 +4138,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 
                                 dRead = dWrite - dSamples
                                 If dRead < 0 Then
-                                    dRead = dRead + 192000
+                                    dRead = dRead + RIFF_RING_SAMPLES_PER_VOICE
                                 End If
                                 
                                 dL = rRingBuf(dBase + dRead)
@@ -3848,8 +4155,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             
                             rRingBuf(dBase + dWrite) = bufInL
                             rRingBuf(dBase + dWrite + 1) = bufInR
-                            dWrite = dWrite + 2
-                            If dWrite >= 192000 Then
+                            dWrite = dWrite + RIFF_WAV_EXPORT_CHANNELS
+                            If dWrite >= RIFF_RING_SAMPLES_PER_VOICE Then
                                 dWrite = 0
                             End If
                             
@@ -3866,12 +4173,12 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 End If
                                 
                                 If maxPk > cmpEnv Then
-                                    cmpEnv = cmpEnv + 0.01! * (maxPk - cmpEnv)
+                                    cmpEnv = cmpEnv + RIFF_COMP_ATTACK_COEFF * (maxPk - cmpEnv)
                                 Else
-                                    cmpEnv = cmpEnv + 0.001! * (maxPk - cmpEnv)
+                                    cmpEnv = cmpEnv + RIFF_COMP_RELEASE_COEFF * (maxPk - cmpEnv)
                                 End If
                                 
-                                If cmpEnv > cmpThresh And cmpEnv > 0.0001! Then
+                                If cmpEnv > cmpThresh And cmpEnv > RIFF_COMP_ENV_FLOOR Then
                                     cmpGain = cmpThresh + ((cmpEnv - cmpThresh) / cmpRatio)
                                     cmpGain = cmpGain / cmpEnv
                                     fL = fL * cmpGain
@@ -3927,7 +4234,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 currentMasterPeakR = Abs(rMixArr32(writeIdx + 1))
                             End If
                             
-                            writeIdx = writeIdx + 2
+                            writeIdx = writeIdx + RIFF_WAV_EXPORT_CHANNELS
                             srcIdx = srcIdx + ptch
                             pos = pos + ptchAlign
                         Next frame
@@ -3979,18 +4286,18 @@ NextVoice32:
             RiffEnsureLongScratch rMixInt32, rMixInt32Cap, sampleCount32
             For frame = 0 To sampleCount32 - 1
                 If rMixArr32(frame) >= 1! Then
-                    rMixInt32(frame) = 2147483647
+                    rMixInt32(frame) = CLng(RIFF_PCM32_MAX)
                 ElseIf rMixArr32(frame) <= -1! Then
-                    rMixInt32(frame) = -2147483647
+                    rMixInt32(frame) = -CLng(RIFF_PCM32_MAX)
                 Else
-                    rMixInt32(frame) = CLng(rMixArr32(frame) * 2147483647#)
+                    rMixInt32(frame) = CLng(rMixArr32(frame) * RIFF_PCM32_MAX)
                 End If
             Next frame
             RtlMoveMemory ByVal pData, VarPtr(rMixInt32(0)), bytesToWrite
         End If
 
-    ElseIf wBits = 16 Then
-        sampleCount16 = bytesToWrite \ 2
+    ElseIf wBits = RIFF_PCM16_BITS Then
+        sampleCount16 = bytesToWrite \ RIFF_INTEGER_BYTES
         RiffEnsureIntegerScratch rMixArr16, rMixArr16Cap, sampleCount16
         RiffClearIntegerScratch rMixArr16, sampleCount16
         
@@ -4020,7 +4327,7 @@ NextVoice32:
                     loopStart = rVoices(i).loopStart
                     loopEnd = rVoices(i).loopEnd
                     
-                    framesNeeded = Int(framesAvailable * ptch) + 2
+                    framesNeeded = Int(framesAvailable * ptch) + RIFF_WAV_EXPORT_CHANNELS
                     bytesNeeded = framesNeeded * align
                     sourceSampleCount = bytesNeeded \ 2
                     
@@ -4120,9 +4427,9 @@ NextVoice32:
                     dTime = rVoices(i).DelayTime
                     dFB = rVoices(i).DelayFeedback
                     dMix = rVoices(i).DelayMix
-                    dSamples = Int(dTime * rCtx.sampleRate) * 2
+                    dSamples = Int(dTime * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                     dWrite = rVoices(i).RingWritePos
-                    dBase = i * 192000
+                    dBase = i * RIFF_RING_SAMPLES_PER_VOICE
                     
                     fadeState = rVoices(i).fadeState
                     fadeCur = rVoices(i).FadeFramesCurrent
@@ -4143,10 +4450,10 @@ NextVoice32:
                     Dim cVoicePeakR16 As Single
                     cVoicePeakL16 = 0!
                     cVoicePeakR16 = 0!
-                    rVoices(i).PeakL = rVoices(i).PeakL * 0.9!
-                    rVoices(i).PeakR = rVoices(i).PeakR * 0.9!
+                    rVoices(i).PeakL = rVoices(i).PeakL * RIFF_ACTIVE_PEAK_DECAY
+                    rVoices(i).PeakR = rVoices(i).PeakR * RIFF_ACTIVE_PEAK_DECAY
                     
-                    If nChannels = 2 Then
+                    If nChannels = RIFF_WAV_EXPORT_CHANNELS Then
                         For frame = 0 To framesAvailable - 1
                             If Not rVoices(i).IsOscillator Then
                                 If pos >= loopEnd Then
@@ -4189,14 +4496,14 @@ NextVoice32:
                                 Dim sID16 As Long
                                 Dim sFrac16 As Single
                                 sBase16 = Int(srcIdx)
-                                sID16 = sBase16 * 2
+                                sID16 = sBase16 * RIFF_WAV_EXPORT_CHANNELS
                                 sFrac16 = CSng(srcIdx - CDbl(sBase16))
                                 If sID16 + 3 < sourceSampleCount Then
-                                    fL = (CSng(rSrcArr16(sID16)) + ((CSng(rSrcArr16(sID16 + 2)) - CSng(rSrcArr16(sID16))) * sFrac16)) * 3.051758E-05!
-                                    fR = (CSng(rSrcArr16(sID16 + 1)) + ((CSng(rSrcArr16(sID16 + 3)) - CSng(rSrcArr16(sID16 + 1))) * sFrac16)) * 3.051758E-05!
+                                    fL = (CSng(rSrcArr16(sID16)) + ((CSng(rSrcArr16(sID16 + 2)) - CSng(rSrcArr16(sID16))) * sFrac16)) * RIFF_PCM16_TO_FLOAT_SCALE
+                                    fR = (CSng(rSrcArr16(sID16 + 1)) + ((CSng(rSrcArr16(sID16 + 3)) - CSng(rSrcArr16(sID16 + 1))) * sFrac16)) * RIFF_PCM16_TO_FLOAT_SCALE
                                 ElseIf sID16 + 1 < sourceSampleCount Then
-                                    fL = CSng(rSrcArr16(sID16)) * 3.051758E-05!
-                                    fR = CSng(rSrcArr16(sID16 + 1)) * 3.051758E-05!
+                                    fL = CSng(rSrcArr16(sID16)) * RIFF_PCM16_TO_FLOAT_SCALE
+                                    fR = CSng(rSrcArr16(sID16 + 1)) * RIFF_PCM16_TO_FLOAT_SCALE
                                 Else
                                     fL = 0!
                                     fR = 0!
@@ -4249,7 +4556,7 @@ NextVoice32:
                             
                             If trmDepth > 0! Then
                                 Dim trmM16 As Single
-                                trmM16 = 1! - trmDepth * (0.5! + 0.5! * CSng(Sin(trmPhase)))
+                                trmM16 = RIFF_UNITY_GAIN - trmDepth * (RIFF_HALF_SCALE + RIFF_HALF_SCALE * CSng(Sin(trmPhase)))
                                 fL = fL * trmM16
                                 fR = fR * trmM16
                                 trmPhase = trmPhase + trmStep
@@ -4261,8 +4568,8 @@ NextVoice32:
                             If sWidth <> 1! Then
                                 Dim m16 As Single
                                 Dim sd16 As Single
-                                m16 = (fL + fR) * 0.5!
-                                sd16 = (fL - fR) * 0.5!
+                                m16 = (fL + fR) * RIFF_HALF_SCALE
+                                sd16 = (fL - fR) * RIFF_HALF_SCALE
                                 fL = m16 + sd16 * sWidth
                                 fR = m16 - sd16 * sWidth
                             End If
@@ -4278,10 +4585,10 @@ NextVoice32:
                                 Dim flgL16 As Single
                                 Dim flgR16 As Single
                                 
-                                fDel16 = Int((0.002! + 0.005! * CSng(Sin(flgPhase))) * rCtx.sampleRate) * 2
+                                fDel16 = Int((RIFF_FLANGER_BASE_DELAY_SEC + RIFF_FLANGER_MOD_DELAY_SEC * CSng(Sin(flgPhase))) * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                                 fRd16 = dWrite - fDel16
                                 If fRd16 < 0 Then
-                                    fRd16 = fRd16 + 192000
+                                    fRd16 = fRd16 + RIFF_RING_SAMPLES_PER_VOICE
                                 End If
                                 
                                 flgL16 = rRingBuf(dBase + fRd16)
@@ -4302,14 +4609,14 @@ NextVoice32:
                                 Dim cDel16 As Long
                                 Dim cRd16 As Long
                                 
-                                cDel16 = Int((0.02! + 0.005! * CSng(Sin(cPhase))) * rCtx.sampleRate) * 2
+                                cDel16 = Int((RIFF_CHORUS_BASE_DELAY_SEC + RIFF_CHORUS_MOD_DELAY_SEC * CSng(Sin(cPhase))) * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                                 cRd16 = dWrite - cDel16
                                 If cRd16 < 0 Then
-                                    cRd16 = cRd16 + 192000
+                                    cRd16 = cRd16 + RIFF_RING_SAMPLES_PER_VOICE
                                 End If
                                 
-                                fL = fL * (1! - cDepth * 0.5!) + rRingBuf(dBase + cRd16) * cDepth
-                                fR = fR * (1! - cDepth * 0.5!) + rRingBuf(dBase + cRd16 + 1) * cDepth
+                                fL = fL * (RIFF_UNITY_GAIN - cDepth * RIFF_HALF_SCALE) + rRingBuf(dBase + cRd16) * cDepth
+                                fR = fR * (RIFF_UNITY_GAIN - cDepth * RIFF_HALF_SCALE) + rRingBuf(dBase + cRd16 + 1) * cDepth
                                 cPhase = cPhase + cStep
                                 If cPhase > PI2 Then
                                     cPhase = cPhase - PI2
@@ -4323,7 +4630,7 @@ NextVoice32:
                                 
                                 dR16 = dWrite - dSamples
                                 If dR16 < 0 Then
-                                    dR16 = dR16 + 192000
+                                    dR16 = dR16 + RIFF_RING_SAMPLES_PER_VOICE
                                 End If
                                 
                                 dL16 = rRingBuf(dBase + dR16)
@@ -4340,8 +4647,8 @@ NextVoice32:
                             
                             rRingBuf(dBase + dWrite) = bufInL16
                             rRingBuf(dBase + dWrite + 1) = bufInR16
-                            dWrite = dWrite + 2
-                            If dWrite >= 192000 Then
+                            dWrite = dWrite + RIFF_WAV_EXPORT_CHANNELS
+                            If dWrite >= RIFF_RING_SAMPLES_PER_VOICE Then
                                 dWrite = 0
                             End If
                             
@@ -4358,12 +4665,12 @@ NextVoice32:
                                 End If
                                 
                                 If maxPk16 > cmpEnv Then
-                                    cmpEnv = cmpEnv + 0.01! * (maxPk16 - cmpEnv)
+                                    cmpEnv = cmpEnv + RIFF_COMP_ATTACK_COEFF * (maxPk16 - cmpEnv)
                                 Else
-                                    cmpEnv = cmpEnv + 0.001! * (maxPk16 - cmpEnv)
+                                    cmpEnv = cmpEnv + RIFF_COMP_RELEASE_COEFF * (maxPk16 - cmpEnv)
                                 End If
                                 
-                                If cmpEnv > cmpThresh And cmpEnv > 0.0001! Then
+                                If cmpEnv > cmpThresh And cmpEnv > RIFF_COMP_ENV_FLOOR Then
                                     cmpGain = cmpThresh + ((cmpEnv - cmpThresh) / cmpRatio)
                                     cmpGain = cmpGain / cmpEnv
                                     fL = fL * cmpGain
@@ -4409,19 +4716,19 @@ NextVoice32:
                                 cVoicePeakR16 = Abs(fR)
                             End If
                             
-                            l1 = CLng(rMixArr16(writeIdx)) + CLng(fL * 32767!)
-                            l2 = CLng(rMixArr16(writeIdx + 1)) + CLng(fR * 32767!)
+                            l1 = CLng(rMixArr16(writeIdx)) + CLng(fL * CSng(RIFF_PCM16_MAX))
+                            l2 = CLng(rMixArr16(writeIdx + 1)) + CLng(fR * CSng(RIFF_PCM16_MAX))
                             
-                            If l1 > 32767 Then
-                                l1 = 32767
-                            ElseIf l1 < -32768 Then
-                                l1 = -32768
+                            If l1 > RIFF_PCM16_MAX Then
+                                l1 = RIFF_PCM16_MAX
+                            ElseIf l1 < RIFF_PCM16_MIN Then
+                                l1 = RIFF_PCM16_MIN
                             End If
                             
-                            If l2 > 32767 Then
-                                l2 = 32767
-                            ElseIf l2 < -32768 Then
-                                l2 = -32768
+                            If l2 > RIFF_PCM16_MAX Then
+                                l2 = RIFF_PCM16_MAX
+                            ElseIf l2 < RIFF_PCM16_MIN Then
+                                l2 = RIFF_PCM16_MIN
                             End If
                             
                             rMixArr16(writeIdx) = CInt(l1)
@@ -4434,7 +4741,7 @@ NextVoice32:
                                 currentMasterPeakR = Abs(fR)
                             End If
                             
-                            writeIdx = writeIdx + 2
+                            writeIdx = writeIdx + RIFF_WAV_EXPORT_CHANNELS
                             srcIdx = srcIdx + ptch
                             pos = pos + ptchAlign
                         Next frame
@@ -4512,9 +4819,9 @@ End Function
 ' */
 Private Function InitThunks() As Boolean
     #If VBA7 Then
-        Const THUNK_SIZE As Long = 1024
+        Const THUNK_SIZE As Long = RIFF_THUNK64_SIZE
     #Else
-        Const THUNK_SIZE As Long = 512
+        Const THUNK_SIZE As Long = RIFF_THUNK32_SIZE
     #End If
     
     rCtx.ThunkTimerCB = VirtualAlloc(0, THUNK_SIZE, MEM_COMMIT Or MEM_RESERVE, PAGE_EXECUTE_READWRITE)
@@ -4546,7 +4853,7 @@ Private Function InitThunks() As Boolean
     If hVbe <> 0 Then
         pEbMode = GetProcAddress(hVbe, "EbMode")
         If pEbMode = 0 Then
-            pEbMode = GetProcAddressOrdinal(hVbe, 1&)
+            pEbMode = GetProcAddressOrdinal(hVbe, RIFF_VBE_EBMODE_ORDINAL)
         End If
     End If
     
@@ -4562,24 +4869,24 @@ Private Function InitThunks() As Boolean
                  "4885C07429FFD083F801742283F802741D488B4C2430488B54244048B800000000" & _
                  "000000004885C07429FFD0EB25488B4C2430488B5424384C8B4424404C8B4C2448" & _
                  "48B800000000000000004885C07402FFD04883C428C3"
-        ReDim opcodes(0 To (Len(hexStr) \ 2) - 1)
+        ReDim opcodes(0 To (Len(hexStr) \ RIFF_HEX_BYTE_CHARS) - 1)
         For i = 0 To UBound(opcodes)
-            opcodes(i) = CByte("&H" & Mid$(hexStr, (i * 2) + 1, 2))
+            opcodes(i) = CByte("&H" & Mid$(hexStr, (i * RIFF_HEX_BYTE_CHARS) + 1, RIFF_HEX_BYTE_CHARS))
         Next i
-        RtlMoveMemory VarPtr(opcodes(26)), VarPtr(pEbMode), 8
-        RtlMoveMemory VarPtr(opcodes(63)), VarPtr(pKill), 8
-        RtlMoveMemory VarPtr(opcodes(102)), VarPtr(pCallback), 8
+        RtlMoveMemory VarPtr(opcodes(RIFF_THUNK64_EBMODE_OFFSET)), VarPtr(pEbMode), LenB(pEbMode)
+        RtlMoveMemory VarPtr(opcodes(RIFF_THUNK64_KILLTIMER_OFFSET)), VarPtr(pKill), LenB(pKill)
+        RtlMoveMemory VarPtr(opcodes(RIFF_THUNK64_CALLBACK_OFFSET)), VarPtr(pCallback), LenB(pCallback)
     #Else
         hexStr = "5589E5B80000000085C07421FFD083F801741A83F80274158B4510508B450850B8" & _
                  "0000000085C0741FFFD0EB1B8B4514508B4510508B450C508B450850B800000000" & _
                  "85C07402FFD05DC21000"
-        ReDim opcodes(0 To (Len(hexStr) \ 2) - 1)
+        ReDim opcodes(0 To (Len(hexStr) \ RIFF_HEX_BYTE_CHARS) - 1)
         For i = 0 To UBound(opcodes)
-            opcodes(i) = CByte("&H" & Mid$(hexStr, (i * 2) + 1, 2))
+            opcodes(i) = CByte("&H" & Mid$(hexStr, (i * RIFF_HEX_BYTE_CHARS) + 1, RIFF_HEX_BYTE_CHARS))
         Next i
-        RtlMoveMemory VarPtr(opcodes(4)), VarPtr(pEbMode), 4
-        RtlMoveMemory VarPtr(opcodes(33)), VarPtr(pKill), 4
-        RtlMoveMemory VarPtr(opcodes(62)), VarPtr(pCallback), 4
+        RtlMoveMemory VarPtr(opcodes(RIFF_THUNK32_EBMODE_OFFSET)), VarPtr(pEbMode), LenB(pEbMode)
+        RtlMoveMemory VarPtr(opcodes(RIFF_THUNK32_KILLTIMER_OFFSET)), VarPtr(pKill), LenB(pKill)
+        RtlMoveMemory VarPtr(opcodes(RIFF_THUNK32_CALLBACK_OFFSET)), VarPtr(pCallback), LenB(pCallback)
     #End If
     
     RtlMoveMemory ByVal rCtx.ThunkTimerCB, VarPtr(opcodes(0)), UBound(opcodes) + 1
@@ -4612,21 +4919,21 @@ Private Function RiffMixFormatIsFloat32() As Boolean
     Dim bitsPerSample As Integer
     Dim subFormatData1 As Long
 
-    RtlMoveMemory VarPtr(formatTag), ByVal rCtx.MixFormatPtr, 2
-    RtlMoveMemory VarPtr(bitsPerSample), ByVal (rCtx.MixFormatPtr + 14), 2
+    RtlMoveMemory VarPtr(formatTag), ByVal rCtx.MixFormatPtr, LenB(formatTag)
+    RtlMoveMemory VarPtr(bitsPerSample), ByVal (rCtx.MixFormatPtr + RIFF_WFX_BITS_OFFSET), LenB(bitsPerSample)
 
-    If bitsPerSample <> 32 Then
+    If bitsPerSample <> RIFF_FLOAT32_BITS Then
         Exit Function
     End If
 
-    If formatTag = 3 Then
+    If formatTag = RIFF_WAVE_FORMAT_IEEE_FLOAT Then
         RiffMixFormatIsFloat32 = True
         Exit Function
     End If
 
-    If formatTag = -2 Then
-        RtlMoveMemory VarPtr(subFormatData1), ByVal (rCtx.MixFormatPtr + 24), 4
-        RiffMixFormatIsFloat32 = (subFormatData1 = 3)
+    If formatTag = RIFF_WAVE_FORMAT_EXTENSIBLE Then
+        RtlMoveMemory VarPtr(subFormatData1), ByVal (rCtx.MixFormatPtr + RIFF_WFX_SUBFORMAT_OFFSET), LenB(subFormatData1)
+        RiffMixFormatIsFloat32 = (subFormatData1 = RIFF_WAVE_FORMAT_IEEE_FLOAT)
     End If
 End Function
 
@@ -4674,66 +4981,66 @@ Private Sub RiffTryPromoteMixFormatToFloat32()
     Dim channelMask As Long
     Dim formatTag As Integer
 
-    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + 2), 2
-    RtlMoveMemory VarPtr(sampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
-    RtlMoveMemory VarPtr(cbSize), ByVal (rCtx.MixFormatPtr + 16), 2
+    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + RIFF_WFX_CHANNELS_OFFSET), LenB(nChannels)
+    RtlMoveMemory VarPtr(sampleRate), ByVal (rCtx.MixFormatPtr + RIFF_WFX_SAMPLE_RATE_OFFSET), LenB(sampleRate)
+    RtlMoveMemory VarPtr(cbSize), ByVal (rCtx.MixFormatPtr + RIFF_WFX_CB_SIZE_OFFSET), LenB(cbSize)
 
-    nChannels = 2
+    nChannels = RIFF_WAV_EXPORT_CHANNELS
     If sampleRate <= 0 Then
-        sampleRate = 44100
+        sampleRate = RIFF_DEFAULT_SAMPLE_RATE
     End If
 
-    bits = 32
-    blockAlign = CInt(nChannels * 4)
+    bits = RIFF_FLOAT32_BITS
+    blockAlign = CInt(nChannels * (bits \ 8))
     avgBytes = sampleRate * CLng(blockAlign)
 
-    If cbSize >= 22 Then
-        RtlMoveMemory VarPtr(channelMask), ByVal (rCtx.MixFormatPtr + 20), 4
-        formatTag = -2
-        validBits = 32
-        channelMask = 3
+    If cbSize >= RIFF_WFX_EXTENSIBLE_CB_SIZE Then
+        RtlMoveMemory VarPtr(channelMask), ByVal (rCtx.MixFormatPtr + RIFF_WFX_CHANNEL_MASK_OFFSET), LenB(channelMask)
+        formatTag = RIFF_WAVE_FORMAT_EXTENSIBLE
+        validBits = bits
+        channelMask = RIFF_STEREO_CHANNEL_MASK
 
-        RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(formatTag), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 2), VarPtr(nChannels), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 4), VarPtr(sampleRate), 4
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 8), VarPtr(avgBytes), 4
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 12), VarPtr(blockAlign), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 14), VarPtr(bits), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 16), VarPtr(cbSize), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 18), VarPtr(validBits), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 20), VarPtr(channelMask), 4
+        RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(formatTag), LenB(formatTag)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_CHANNELS_OFFSET), VarPtr(nChannels), LenB(nChannels)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_SAMPLE_RATE_OFFSET), VarPtr(sampleRate), LenB(sampleRate)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_AVG_BYTES_OFFSET), VarPtr(avgBytes), LenB(avgBytes)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_BLOCK_ALIGN_OFFSET), VarPtr(blockAlign), LenB(blockAlign)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_BITS_OFFSET), VarPtr(bits), LenB(bits)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_CB_SIZE_OFFSET), VarPtr(cbSize), LenB(cbSize)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_VALID_BITS_OFFSET), VarPtr(validBits), LenB(validBits)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_CHANNEL_MASK_OFFSET), VarPtr(channelMask), LenB(channelMask)
 
         Dim sf1 As Long
         Dim sf2 As Integer
         Dim sf3 As Integer
-        Dim sf4(0 To 7) As Byte
+        Dim sf4(0 To RIFF_GUID_DATA4_BYTES - 1) As Byte
 
-        sf1 = 3
-        sf2 = 0
-        sf3 = 16
-        sf4(0) = 128
-        sf4(1) = 0
-        sf4(2) = 0
-        sf4(3) = 170
-        sf4(4) = 0
-        sf4(5) = 56
-        sf4(6) = 155
-        sf4(7) = 113
+        sf1 = RIFF_WAVE_FORMAT_IEEE_FLOAT
+        sf2 = RIFF_IEEE_FLOAT_SUBFORMAT_DATA2
+        sf3 = RIFF_IEEE_FLOAT_SUBFORMAT_DATA3
+        sf4(0) = RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_0
+        sf4(1) = RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_1
+        sf4(2) = RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_2
+        sf4(3) = RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_3
+        sf4(4) = RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_4
+        sf4(5) = RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_5
+        sf4(6) = RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_6
+        sf4(7) = RIFF_IEEE_FLOAT_SUBFORMAT_DATA4_7
 
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 24), VarPtr(sf1), 4
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 28), VarPtr(sf2), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 30), VarPtr(sf3), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 32), VarPtr(sf4(0)), 8
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_SUBFORMAT_OFFSET), VarPtr(sf1), LenB(sf1)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_SUBFORMAT_DATA2_OFFSET), VarPtr(sf2), LenB(sf2)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_SUBFORMAT_DATA3_OFFSET), VarPtr(sf3), LenB(sf3)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_SUBFORMAT_DATA4_OFFSET), VarPtr(sf4(0)), RIFF_GUID_DATA4_BYTES
     Else
-        formatTag = 3
+        formatTag = RIFF_WAVE_FORMAT_IEEE_FLOAT
         cbSize = 0
-        RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(formatTag), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 2), VarPtr(nChannels), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 4), VarPtr(sampleRate), 4
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 8), VarPtr(avgBytes), 4
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 12), VarPtr(blockAlign), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 14), VarPtr(bits), 2
-        RtlMoveMemory ByVal (rCtx.MixFormatPtr + 16), VarPtr(cbSize), 2
+        RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(formatTag), LenB(formatTag)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_CHANNELS_OFFSET), VarPtr(nChannels), LenB(nChannels)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_SAMPLE_RATE_OFFSET), VarPtr(sampleRate), LenB(sampleRate)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_AVG_BYTES_OFFSET), VarPtr(avgBytes), LenB(avgBytes)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_BLOCK_ALIGN_OFFSET), VarPtr(blockAlign), LenB(blockAlign)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_BITS_OFFSET), VarPtr(bits), LenB(bits)
+        RtlMoveMemory ByVal (rCtx.MixFormatPtr + RIFF_WFX_CB_SIZE_OFFSET), VarPtr(cbSize), LenB(cbSize)
     End If
 End Sub
 
@@ -4753,8 +5060,8 @@ End Function
 #Else
 Private Function VTableProc(ByVal pUnk As Long, ByVal vTableIndex As Long) As Long
     Dim pVtbl As Long
-    RtlMoveMemory VarPtr(pVtbl), ByVal pUnk, 4
-    RtlMoveMemory VarPtr(VTableProc), ByVal (pVtbl + (vTableIndex * 4)), 4
+    RtlMoveMemory VarPtr(pVtbl), ByVal pUnk, LenB(pVtbl)
+    RtlMoveMemory VarPtr(VTableProc), ByVal (pVtbl + (vTableIndex * LenB(pVtbl))), LenB(pVtbl)
 End Function
 #End If
 
@@ -4813,7 +5120,7 @@ Private Function InitWASAPI() As Boolean
         Dim hnsDur As LongLong
         Dim hnsPer As LongLong
         pNullPtr = CLngLng(0)
-        hnsDur = CLngLng(RIFF_DEVICE_BUFFER_MS) * CLngLng(10000)
+        hnsDur = CLngLng(RIFF_DEVICE_BUFFER_MS) * CLngLng(RIFF_HNS_PER_MS)
         hnsPer = CLngLng(0)
     #Else
         #If VBA7 Then
@@ -4829,9 +5136,9 @@ Private Function InitWASAPI() As Boolean
     #End If
     
     IIDFromString StrPtr("{BCDE0395-E52F-467C-8E3D-C4579291692E}"), clsidEnum
-    IIDFromString StrPtr("{A95664D2-9614-4F35-A746-DE8DB63617E6}"), iidEnum
+    IIDFromString StrPtr(RIFF_GUID_MM_DEVICE_ENUMERATOR_CLASS), iidEnum
     IIDFromString StrPtr("{1CB9AD4C-DBFA-4c32-B178-C2F568A703B2}"), iidAudio
-    IIDFromString StrPtr("{F294ACFC-3146-4483-A7BF-ADDCA7C260E2}"), iidRender
+    IIDFromString StrPtr(RIFF_GUID_AUDIO_RENDER_CLIENT), iidRender
     
     hr = CoCreateInstance(clsidEnum, 0, CLSCTX_ALL, iidEnum, rCtx.DeviceEnumerator)
     If hr <> 0 Or rCtx.DeviceEnumerator = 0 Then
@@ -4856,10 +5163,10 @@ Private Function InitWASAPI() As Boolean
     Dim originalMixBytes() As Byte
     Dim originalMixSize As Long
     Dim originalCbSize As Integer
-    RtlMoveMemory VarPtr(originalCbSize), ByVal (rCtx.MixFormatPtr + 16), 2
-    originalMixSize = 18 + CLng(originalCbSize)
-    If originalMixSize < 18 Then
-        originalMixSize = 18
+    RtlMoveMemory VarPtr(originalCbSize), ByVal (rCtx.MixFormatPtr + RIFF_WFX_CB_SIZE_OFFSET), LenB(originalCbSize)
+    originalMixSize = RIFF_WFX_BASE_SIZE + CLng(originalCbSize)
+    If originalMixSize < RIFF_WFX_BASE_SIZE Then
+        originalMixSize = RIFF_WFX_BASE_SIZE
     End If
     ReDim originalMixBytes(0 To originalMixSize - 1)
     RtlMoveMemory VarPtr(originalMixBytes(0)), ByVal rCtx.MixFormatPtr, originalMixSize
@@ -4869,13 +5176,13 @@ Private Function InitWASAPI() As Boolean
         RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(originalMixBytes(0)), originalMixSize
     End If
 
-    hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, &H80000000, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
+    hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
     If hr <> 0 Then
         hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, 0&, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
     End If
     If hr <> 0 Then
         RtlMoveMemory ByVal rCtx.MixFormatPtr, VarPtr(originalMixBytes(0)), originalMixSize
-        hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, &H80000000, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
+        hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
         If hr <> 0 Then
             hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_INITIALIZE, AUDCLNT_SHAREMODE_SHARED, 0&, hnsDur, hnsPer, rCtx.MixFormatPtr, pNullPtr)
         End If
@@ -4885,19 +5192,19 @@ Private Function InitWASAPI() As Boolean
         Exit Function
     End If
 
-    RtlMoveMemory VarPtr(rCtx.sampleRate), ByVal (rCtx.MixFormatPtr + 4), 4
-    RtlMoveMemory VarPtr(rCtx.AvgBytesPerSec), ByVal (rCtx.MixFormatPtr + 8), 4
-    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + 2), 2
-    RtlMoveMemory VarPtr(bits), ByVal (rCtx.MixFormatPtr + 14), 2
+    RtlMoveMemory VarPtr(rCtx.sampleRate), ByVal (rCtx.MixFormatPtr + RIFF_WFX_SAMPLE_RATE_OFFSET), LenB(rCtx.sampleRate)
+    RtlMoveMemory VarPtr(rCtx.AvgBytesPerSec), ByVal (rCtx.MixFormatPtr + RIFF_WFX_AVG_BYTES_OFFSET), LenB(rCtx.AvgBytesPerSec)
+    RtlMoveMemory VarPtr(nChannels), ByVal (rCtx.MixFormatPtr + RIFF_WFX_CHANNELS_OFFSET), LenB(nChannels)
+    RtlMoveMemory VarPtr(bits), ByVal (rCtx.MixFormatPtr + RIFF_WFX_BITS_OFFSET), LenB(bits)
 
-    If nChannels <> 2 Then
+    If nChannels <> RIFF_WAV_EXPORT_CHANNELS Then
         Exit Function
     End If
-    If bits <> 16 And bits <> 32 Then
+    If bits <> RIFF_PCM16_BITS And bits <> RIFF_FLOAT32_BITS Then
         Exit Function
     End If
 
-    rCtx.MaxWriteFrames = (rCtx.sampleRate * RIFF_MAX_WRITE_MS) \ 1000
+    rCtx.MaxWriteFrames = (rCtx.sampleRate * RIFF_MAX_WRITE_MS) \ RIFF_MS_PER_SEC
     If rCtx.MaxWriteFrames < 1 Then
         rCtx.MaxWriteFrames = 1
     End If
@@ -4965,11 +5272,7 @@ Private Function vCall0(ByVal pUnk As Long, ByVal vTableIndex As Long) As Long
     Dim offset As Long
     Dim vRet As Variant
 
-    #If Win64 Then
-        offset = vTableIndex * 8
-    #Else
-        offset = vTableIndex * 4
-    #End If
+    offset = vTableIndex * LenB(pUnk)
 
     hrInvoke = DispCallFunc(pUnk, offset, CC_STDCALL, vbLong, 0, ByVal 0&, ByVal 0&, vRet)
 
@@ -4999,11 +5302,7 @@ Private Function vCall(ByVal pUnk As Long, ByVal vTableIndex As Long, ParamArray
     Dim offset As Long
     Dim vRet As Variant
     
-    #If Win64 Then
-        offset = vTableIndex * 8
-    #Else
-        offset = vTableIndex * 4
-    #End If
+    offset = vTableIndex * LenB(pUnk)
     
     argCount = UBound(args) - LBound(args) + 1
     If argCount < 0 Then
