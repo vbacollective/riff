@@ -2,6 +2,7 @@ Option Explicit
 
 ' Examples for the Riff.bas audio engine.
 ' Import this BAS beside Riff.bas, then run Showcase.
+' Original code by @C-Johnson-83 but re-adapted to new Riff structure.
 
 Private Sub LWait(ByVal seconds As Single)
     Dim t As Double
