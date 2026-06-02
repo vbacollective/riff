@@ -3144,7 +3144,14 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     fadeCur = rVoices(i).FadeFramesCurrent
                     fadeTot = rVoices(i).FadeFramesTotal
                     
-                    srcIdx = 0
+                    If rVoices(i).IsOscillator Then
+                        srcIdx = 0
+                    Else
+                        srcIdx = (pos - CDbl(readPos)) / CDbl(align)
+                        If srcIdx < 0# Then
+                            srcIdx = 0#
+                        End If
+                    End If
                     writeIdx = 0
                     ptchAlign = ptch * CDbl(align)
                     
@@ -3194,9 +3201,16 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 fL = RiffNextOscillatorSample(i)
                                 fR = fL
                             Else
+                                Dim sBase32 As Long
                                 Dim sID As Long
-                                sID = Int(srcIdx) * 2
-                                If sID + 1 <= UBound(srcArr32) Then
+                                Dim sFrac32 As Single
+                                sBase32 = Int(srcIdx)
+                                sID = sBase32 * 2
+                                sFrac32 = CSng(srcIdx - CDbl(sBase32))
+                                If sID + 3 <= UBound(srcArr32) Then
+                                    fL = srcArr32(sID) + ((srcArr32(sID + 2) - srcArr32(sID)) * sFrac32)
+                                    fR = srcArr32(sID + 1) + ((srcArr32(sID + 3) - srcArr32(sID + 1)) * sFrac32)
+                                ElseIf sID + 1 <= UBound(srcArr32) Then
                                     fL = srcArr32(sID)
                                     fR = srcArr32(sID + 1)
                                 Else
@@ -3616,7 +3630,14 @@ NextVoice32:
                     fadeCur = rVoices(i).FadeFramesCurrent
                     fadeTot = rVoices(i).FadeFramesTotal
                     
-                    srcIdx = 0
+                    If rVoices(i).IsOscillator Then
+                        srcIdx = 0
+                    Else
+                        srcIdx = (pos - CDbl(readPos)) / CDbl(align)
+                        If srcIdx < 0# Then
+                            srcIdx = 0#
+                        End If
+                    End If
                     writeIdx = 0
                     ptchAlign = ptch * CDbl(align)
                     
@@ -3666,9 +3687,16 @@ NextVoice32:
                                 fL = RiffNextOscillatorSample(i)
                                 fR = fL
                             Else
+                                Dim sBase16 As Long
                                 Dim sID16 As Long
-                                sID16 = Int(srcIdx) * 2
-                                If sID16 + 1 <= UBound(srcArr16) Then
+                                Dim sFrac16 As Single
+                                sBase16 = Int(srcIdx)
+                                sID16 = sBase16 * 2
+                                sFrac16 = CSng(srcIdx - CDbl(sBase16))
+                                If sID16 + 3 <= UBound(srcArr16) Then
+                                    fL = (CSng(srcArr16(sID16)) + ((CSng(srcArr16(sID16 + 2)) - CSng(srcArr16(sID16))) * sFrac16)) * 3.051758E-05!
+                                    fR = (CSng(srcArr16(sID16 + 1)) + ((CSng(srcArr16(sID16 + 3)) - CSng(srcArr16(sID16 + 1))) * sFrac16)) * 3.051758E-05!
+                                ElseIf sID16 + 1 <= UBound(srcArr16) Then
                                     fL = CSng(srcArr16(sID16)) * 3.051758E-05!
                                     fR = CSng(srcArr16(sID16 + 1)) * 3.051758E-05!
                                 Else
