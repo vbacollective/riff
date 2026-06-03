@@ -620,7 +620,7 @@ Private Const RIFF_SAFEARRAY_OFFSET_COUNT_32 As Long = 16
 Private Const RIFF_SAFEARRAY_OFFSET_COUNT_64 As Long = 24
 
 '/** @description Low-latency render tick interval in milliseconds. */
-Private Const RIFF_RENDER_PERIOD_MS As Long = 5
+Private Const RIFF_RENDER_PERIOD_MS As Long = 20
 
 '/** @description Number of idle timer ticks before the render timer suspends itself to release the VBE. */
 Private Const RIFF_IDLE_TIMER_STOP_TICKS As Long = 50
@@ -629,7 +629,7 @@ Private Const RIFF_IDLE_TIMER_STOP_TICKS As Long = 50
 Private Const RIFF_MAX_WRITE_MS As Long = 100
 
 '/** @description Requested WASAPI shared buffer duration in milliseconds. Avoids underruns while still preventing a long silent queue. */
-Private Const RIFF_DEVICE_BUFFER_MS As Long = 100
+Private Const RIFF_DEVICE_BUFFER_MS As Long = 150
 
 '/** @description WASAPI REFERENCE_TIME units per millisecond. */
 Private Const RIFF_HNS_PER_MS As Long = 10000
@@ -3996,109 +3996,156 @@ End Sub
 ' * @brief Applies biquad low-pass, high-pass, and three-band parametric EQ to one stereo sample.
 ' */
 Private Sub RiffProcessVoiceFilters(ByVal voiceIndex As Long, ByRef leftSample As Single, ByRef rightSample As Single, ByVal lowPass As Single, ByVal highPass As Single, ByVal bassGain As Single, ByVal midGain As Single, ByVal trebleGain As Single)
-    Dim b0 As Single
-    Dim b1 As Single
-    Dim b2 As Single
-    Dim a1 As Single
-    Dim a2 As Single
+    Static lastVoice As Long
+    Static lastLp As Single, lastHp As Single
+    Static lastEqB As Single, lastEqM As Single, lastEqT As Single
+    
+    Static b0_lp As Single, b1_lp As Single, b2_lp As Single, a1_lp As Single, a2_lp As Single
+    Static b0_hp As Single, b1_hp As Single, b2_hp As Single, a1_hp As Single, a2_hp As Single
+    Static b0_b As Single, b1_b As Single, b2_b As Single, a1_b As Single, a2_b As Single
+    Static b0_m As Single, b1_m As Single, b2_m As Single, a1_m As Single, a2_m As Single
+    Static b0_t As Single, b1_t As Single, b2_t As Single, a1_t As Single, a2_t As Single
+    
+    Dim recalc As Boolean
     Dim cutoff As Single
-
-    If rCtx.sampleRate <= 0 Then
-        Exit Sub
+    
+    If voiceIndex <> lastVoice Then
+        recalc = True
+        lastVoice = voiceIndex
     End If
-
+    
+    If rCtx.sampleRate <= 0 Then Exit Sub
+    
     If lowPass < RIFF_LOWPASS_BYPASS_THRESHOLD Then
-        cutoff = RIFF_LOWPASS_MIN_CUTOFF_HZ + ((RiffClamp(lowPass, 0!, RIFF_UNITY_GAIN) ^ RIFF_BIPOLAR_SINGLE_SCALE) * ((CSng(rCtx.sampleRate) * RIFF_LOWPASS_MAX_SAMPLE_RATE_RATIO) - RIFF_LOWPASS_MIN_CUTOFF_HZ))
-        RiffBiquadLowPassCoeffs cutoff, RIFF_FILTER_DEFAULT_Q, b0, b1, b2, a1, a2
-        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).BqLowPassZ1L, rVoices(voiceIndex).BqLowPassZ2L, b0, b1, b2, a1, a2)
-        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).BqLowPassZ1R, rVoices(voiceIndex).BqLowPassZ2R, b0, b1, b2, a1, a2)
+        If recalc Or lowPass <> lastLp Then
+            cutoff = RIFF_LOWPASS_MIN_CUTOFF_HZ + ((RiffClamp(lowPass, 0!, RIFF_UNITY_GAIN) ^ RIFF_BIPOLAR_SINGLE_SCALE) * ((CSng(rCtx.sampleRate) * RIFF_LOWPASS_MAX_SAMPLE_RATE_RATIO) - RIFF_LOWPASS_MIN_CUTOFF_HZ))
+            RiffBiquadLowPassCoeffs cutoff, RIFF_FILTER_DEFAULT_Q, b0_lp, b1_lp, b2_lp, a1_lp, a2_lp
+            lastLp = lowPass
+        End If
+        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).BqLowPassZ1L, rVoices(voiceIndex).BqLowPassZ2L, b0_lp, b1_lp, b2_lp, a1_lp, a2_lp)
+        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).BqLowPassZ1R, rVoices(voiceIndex).BqLowPassZ2R, b0_lp, b1_lp, b2_lp, a1_lp, a2_lp)
     End If
-
+    
     If highPass > 0! Then
-        cutoff = RIFF_FILTER_MIN_CUTOFF_HZ + ((RiffClamp(highPass, 0!, RIFF_UNITY_GAIN) ^ RIFF_BIPOLAR_SINGLE_SCALE) * ((CSng(rCtx.sampleRate) * RIFF_HIGHPASS_MAX_SAMPLE_RATE_RATIO) - RIFF_FILTER_MIN_CUTOFF_HZ))
-        RiffBiquadHighPassCoeffs cutoff, RIFF_FILTER_DEFAULT_Q, b0, b1, b2, a1, a2
-        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).BqHighPassZ1L, rVoices(voiceIndex).BqHighPassZ2L, b0, b1, b2, a1, a2)
-        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).BqHighPassZ1R, rVoices(voiceIndex).BqHighPassZ2R, b0, b1, b2, a1, a2)
+        If recalc Or highPass <> lastHp Then
+            cutoff = RIFF_FILTER_MIN_CUTOFF_HZ + ((RiffClamp(highPass, 0!, RIFF_UNITY_GAIN) ^ RIFF_BIPOLAR_SINGLE_SCALE) * ((CSng(rCtx.sampleRate) * RIFF_HIGHPASS_MAX_SAMPLE_RATE_RATIO) - RIFF_FILTER_MIN_CUTOFF_HZ))
+            RiffBiquadHighPassCoeffs cutoff, RIFF_FILTER_DEFAULT_Q, b0_hp, b1_hp, b2_hp, a1_hp, a2_hp
+            lastHp = highPass
+        End If
+        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).BqHighPassZ1L, rVoices(voiceIndex).BqHighPassZ2L, b0_hp, b1_hp, b2_hp, a1_hp, a2_hp)
+        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).BqHighPassZ1R, rVoices(voiceIndex).BqHighPassZ2R, b0_hp, b1_hp, b2_hp, a1_hp, a2_hp)
     End If
-
+    
     If bassGain <> 1! Then
-        RiffBiquadPeakCoeffs RIFF_EQ_BASS_CENTER_HZ, RIFF_EQ_DEFAULT_Q, bassGain, b0, b1, b2, a1, a2
-        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqBassZ1L, rVoices(voiceIndex).EqBassZ2L, b0, b1, b2, a1, a2)
-        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqBassZ1R, rVoices(voiceIndex).EqBassZ2R, b0, b1, b2, a1, a2)
+        If recalc Or bassGain <> lastEqB Then
+            RiffBiquadPeakCoeffs RIFF_EQ_BASS_CENTER_HZ, RIFF_EQ_DEFAULT_Q, bassGain, b0_b, b1_b, b2_b, a1_b, a2_b
+            lastEqB = bassGain
+        End If
+        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqBassZ1L, rVoices(voiceIndex).EqBassZ2L, b0_b, b1_b, b2_b, a1_b, a2_b)
+        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqBassZ1R, rVoices(voiceIndex).EqBassZ2R, b0_b, b1_b, b2_b, a1_b, a2_b)
     End If
-
+    
     If midGain <> 1! Then
-        RiffBiquadPeakCoeffs RIFF_EQ_MID_CENTER_HZ, RIFF_EQ_MID_Q, midGain, b0, b1, b2, a1, a2
-        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqMidZ1L, rVoices(voiceIndex).EqMidZ2L, b0, b1, b2, a1, a2)
-        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqMidZ1R, rVoices(voiceIndex).EqMidZ2R, b0, b1, b2, a1, a2)
+        If recalc Or midGain <> lastEqM Then
+            RiffBiquadPeakCoeffs RIFF_EQ_MID_CENTER_HZ, RIFF_EQ_MID_Q, midGain, b0_m, b1_m, b2_m, a1_m, a2_m
+            lastEqM = midGain
+        End If
+        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqMidZ1L, rVoices(voiceIndex).EqMidZ2L, b0_m, b1_m, b2_m, a1_m, a2_m)
+        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqMidZ1R, rVoices(voiceIndex).EqMidZ2R, b0_m, b1_m, b2_m, a1_m, a2_m)
     End If
-
+    
     If trebleGain <> 1! Then
-        RiffBiquadPeakCoeffs RIFF_EQ_TREBLE_CENTER_HZ, RIFF_EQ_DEFAULT_Q, trebleGain, b0, b1, b2, a1, a2
-        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqTrebleZ1L, rVoices(voiceIndex).EqTrebleZ2L, b0, b1, b2, a1, a2)
-        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqTrebleZ1R, rVoices(voiceIndex).EqTrebleZ2R, b0, b1, b2, a1, a2)
+        If recalc Or trebleGain <> lastEqT Then
+            RiffBiquadPeakCoeffs RIFF_EQ_TREBLE_CENTER_HZ, RIFF_EQ_DEFAULT_Q, trebleGain, b0_t, b1_t, b2_t, a1_t, a2_t
+            lastEqT = trebleGain
+        End If
+        leftSample = RiffBiquadProcess(leftSample, rVoices(voiceIndex).EqTrebleZ1L, rVoices(voiceIndex).EqTrebleZ2L, b0_t, b1_t, b2_t, a1_t, a2_t)
+        rightSample = RiffBiquadProcess(rightSample, rVoices(voiceIndex).EqTrebleZ1R, rVoices(voiceIndex).EqTrebleZ2R, b0_t, b1_t, b2_t, a1_t, a2_t)
     End If
 End Sub
-
-'/**
-' * @function RiffRingRead
-' * @brief Reads one channel from the per-voice stereo delay line with wraparound.
-' */
-Private Function RiffRingRead(ByVal baseIndex As Long, ByVal readIndex As Long, ByVal channelOffset As Long) As Single
-    Do While readIndex < 0
-        readIndex = readIndex + RIFF_RING_SAMPLES_PER_VOICE
-    Loop
-    If readIndex >= RIFF_RING_SAMPLES_PER_VOICE Then
-        readIndex = readIndex Mod RIFF_RING_SAMPLES_PER_VOICE
-    End If
-    RiffRingRead = rRingBuf(baseIndex + readIndex + channelOffset)
-End Function
 
 '/**
 ' * @function RiffProcessFreeverb
 ' * @brief Applies a Freeverb-style damped comb network with stereo cross-feed.
 ' */
 Private Sub RiffProcessFreeverb(ByVal voiceIndex As Long, ByVal baseIndex As Long, ByVal writeIndex As Long, ByVal mix As Single, ByVal decay As Single, ByRef leftSample As Single, ByRef rightSample As Single, ByRef feedbackLeft As Single, ByRef feedbackRight As Single)
-    Dim fb As Single
-    Dim damp As Single
-    Dim l1 As Single
-    Dim r1 As Single
-    Dim l2 As Single
-    Dim r2 As Single
-    Dim l3 As Single
-    Dim r3 As Single
-    Dim l4 As Single
-    Dim r4 As Single
-    Dim wetL As Single
-    Dim wetR As Single
+    Static lastVoice As Long
+    Static lastDecay As Single
+    Static lastMix As Single
+    Static fb As Single
+    Static damp As Single
+    Static invDamp As Single
+    Static clampedMix As Single
+    
+    Dim recalc As Boolean
+    If voiceIndex <> lastVoice Then
+        recalc = True
+        lastVoice = voiceIndex
+    End If
+    
+    If recalc Or decay <> lastDecay Then
+        Dim clampDecay As Single
+        clampDecay = decay
+        If clampDecay < 0! Then clampDecay = 0!
+        If clampDecay > RIFF_UNITY_GAIN Then clampDecay = RIFF_UNITY_GAIN
+        
+        fb = RIFF_REVERB_FEEDBACK_BASE + (clampDecay * RIFF_REVERB_FEEDBACK_RANGE)
+        damp = RIFF_REVERB_DAMP_BASE + ((RIFF_UNITY_GAIN - clampDecay) * RIFF_REVERB_DAMP_RANGE)
+        invDamp = 1! - damp
+        lastDecay = decay
+    End If
+    
+    If recalc Or mix <> lastMix Then
+        clampedMix = mix
+        If clampedMix < 0! Then clampedMix = 0!
+        If clampedMix > 1! Then clampedMix = 1!
+        lastMix = mix
+    End If
 
-    fb = RIFF_REVERB_FEEDBACK_BASE + (RiffClamp(decay, 0!, RIFF_UNITY_GAIN) * RIFF_REVERB_FEEDBACK_RANGE)
-    damp = RIFF_REVERB_DAMP_BASE + ((RIFF_UNITY_GAIN - RiffClamp(decay, 0!, RIFF_UNITY_GAIN)) * RIFF_REVERB_DAMP_RANGE)
-    mix = RiffClamp(mix, 0!, 1!)
+    Dim idx1 As Long, idx2 As Long, idx3 As Long, idx4 As Long
+    
+    idx1 = writeIndex - rVoices(voiceIndex).RevTap1
+    If idx1 < 0 Then idx1 = idx1 + RIFF_RING_SAMPLES_PER_VOICE
+    
+    idx2 = writeIndex - rVoices(voiceIndex).RevTap2
+    If idx2 < 0 Then idx2 = idx2 + RIFF_RING_SAMPLES_PER_VOICE
+    
+    idx3 = writeIndex - rVoices(voiceIndex).RevTap3
+    If idx3 < 0 Then idx3 = idx3 + RIFF_RING_SAMPLES_PER_VOICE
+    
+    idx4 = writeIndex - rVoices(voiceIndex).RevTap4
+    If idx4 < 0 Then idx4 = idx4 + RIFF_RING_SAMPLES_PER_VOICE
 
-    l1 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap1, 0)
-    r1 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap1, 1)
-    l2 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap2, 0)
-    r2 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap2, 1)
-    l3 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap3, 0)
-    r3 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap3, 1)
-    l4 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap4, 0)
-    r4 = RiffRingRead(baseIndex, writeIndex - rVoices(voiceIndex).RevTap4, 1)
+    Dim l1 As Single, r1 As Single, l2 As Single, r2 As Single
+    Dim l3 As Single, r3 As Single, l4 As Single, r4 As Single
 
-    rVoices(voiceIndex).RevDamp1L = (l1 * (1! - damp)) + (rVoices(voiceIndex).RevDamp1L * damp)
-    rVoices(voiceIndex).RevDamp1R = (r1 * (1! - damp)) + (rVoices(voiceIndex).RevDamp1R * damp)
-    rVoices(voiceIndex).RevDamp2L = (l2 * (1! - damp)) + (rVoices(voiceIndex).RevDamp2L * damp)
-    rVoices(voiceIndex).RevDamp2R = (r2 * (1! - damp)) + (rVoices(voiceIndex).RevDamp2R * damp)
-    rVoices(voiceIndex).RevDamp3L = (l3 * (1! - damp)) + (rVoices(voiceIndex).RevDamp3L * damp)
-    rVoices(voiceIndex).RevDamp3R = (r3 * (1! - damp)) + (rVoices(voiceIndex).RevDamp3R * damp)
-    rVoices(voiceIndex).RevDamp4L = (l4 * (1! - damp)) + (rVoices(voiceIndex).RevDamp4L * damp)
-    rVoices(voiceIndex).RevDamp4R = (r4 * (1! - damp)) + (rVoices(voiceIndex).RevDamp4R * damp)
+    l1 = rRingBuf(baseIndex + idx1)
+    r1 = rRingBuf(baseIndex + idx1 + 1)
+    
+    l2 = rRingBuf(baseIndex + idx2)
+    r2 = rRingBuf(baseIndex + idx2 + 1)
+    
+    l3 = rRingBuf(baseIndex + idx3)
+    r3 = rRingBuf(baseIndex + idx3 + 1)
+    
+    l4 = rRingBuf(baseIndex + idx4)
+    r4 = rRingBuf(baseIndex + idx4 + 1)
 
+    rVoices(voiceIndex).RevDamp1L = (l1 * invDamp) + (rVoices(voiceIndex).RevDamp1L * damp)
+    rVoices(voiceIndex).RevDamp1R = (r1 * invDamp) + (rVoices(voiceIndex).RevDamp1R * damp)
+    rVoices(voiceIndex).RevDamp2L = (l2 * invDamp) + (rVoices(voiceIndex).RevDamp2L * damp)
+    rVoices(voiceIndex).RevDamp2R = (r2 * invDamp) + (rVoices(voiceIndex).RevDamp2R * damp)
+    rVoices(voiceIndex).RevDamp3L = (l3 * invDamp) + (rVoices(voiceIndex).RevDamp3L * damp)
+    rVoices(voiceIndex).RevDamp3R = (r3 * invDamp) + (rVoices(voiceIndex).RevDamp3R * damp)
+    rVoices(voiceIndex).RevDamp4L = (l4 * invDamp) + (rVoices(voiceIndex).RevDamp4L * damp)
+    rVoices(voiceIndex).RevDamp4R = (r4 * invDamp) + (rVoices(voiceIndex).RevDamp4R * damp)
+
+    Dim wetL As Single, wetR As Single
     wetL = ((rVoices(voiceIndex).RevDamp1L + rVoices(voiceIndex).RevDamp2L + rVoices(voiceIndex).RevDamp3L + rVoices(voiceIndex).RevDamp4L) * RIFF_REVERB_DIRECT_WET) + ((rVoices(voiceIndex).RevDamp2R + rVoices(voiceIndex).RevDamp4R) * RIFF_REVERB_CROSS_WET)
     wetR = ((rVoices(voiceIndex).RevDamp1R + rVoices(voiceIndex).RevDamp2R + rVoices(voiceIndex).RevDamp3R + rVoices(voiceIndex).RevDamp4R) * RIFF_REVERB_DIRECT_WET) + ((rVoices(voiceIndex).RevDamp1L + rVoices(voiceIndex).RevDamp3L) * RIFF_REVERB_CROSS_WET)
 
-    leftSample = leftSample + (wetL * mix)
-    rightSample = rightSample + (wetR * mix)
+    leftSample = leftSample + (wetL * clampedMix)
+    rightSample = rightSample + (wetR * clampedMix)
     feedbackLeft = feedbackLeft + (wetL * fb)
     feedbackRight = feedbackRight + (wetR * fb)
 End Sub
@@ -4183,16 +4230,10 @@ Private Sub RiffTimerCallback(ByVal hWnd As LongPtr, ByVal uMsg As Long, ByVal i
 #Else
 Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEvent As Long, ByVal dwTime As Long)
 #End If
-    If rCtx.MagicCookie <> RIFF_MAGIC_COOKIE Then
-        Exit Sub
-    End If
-    If rCtx.TimerCallbackActive Then
-        Exit Sub
-    End If
+    If rCtx.MagicCookie <> RIFF_MAGIC_COOKIE Then Exit Sub
+    If rCtx.TimerCallbackActive Then Exit Sub
     If rCtx.TimerID <> 0 Then
-        If idEvent <> rCtx.TimerID Then
-            Exit Sub
-        End If
+        If idEvent <> rCtx.TimerID Then Exit Sub
     End If
 
     rCtx.TimerCallbackActive = True
@@ -4397,7 +4438,6 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                 End If
                 
                 If isSourceValid Then
-                    
                     pos = rVoices(i).Position
                     ptch = rVoices(i).Pitch
                     loopSnd = rVoices(i).Looping
@@ -4409,18 +4449,13 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     sourceSampleCount = bytesNeeded \ 4
                     
                     If Not rVoices(i).IsOscillator Then
-                        
                         ptr = rCtx.Buffers(rVoices(i).BufferIndex).BufferPtr
                         readPos = (CLng(pos) \ align) * align
                         
-                        If readPos < 0 Then
-                            readPos = 0
-                        End If
+                        If readPos < 0 Then readPos = 0
                         
                         bytesAvail = CLng(loopEnd) - readPos
-                        If bytesAvail < 0 Then
-                            bytesAvail = 0
-                        End If
+                        If bytesAvail < 0 Then bytesAvail = 0
                         
                         If isMixFloat32 Then
                             RiffEnsureSingleScratch rSrcArr32, rSrcArr32Cap, sourceSampleCount
@@ -4451,9 +4486,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 loopBytes32 = CLng(loopEnd - loopStart)
                                 Do While remBytes > 0 And loopBytes32 > 0
                                     chunkBytes32 = remBytes
-                                    If chunkBytes32 > loopBytes32 Then
-                                        chunkBytes32 = loopBytes32
-                                    End If
+                                    If chunkBytes32 > loopBytes32 Then chunkBytes32 = loopBytes32
                                     If isMixFloat32 Then
                                         RtlMoveMemoryToSingle rSrcArr32((bytesNeeded - remBytes) \ 4), ByVal (ptr + CLng(loopStart)), chunkBytes32
                                     Else
@@ -4463,68 +4496,56 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 Loop
                             End If
                         End If
-                        
                     End If
                     
                     dist = rVoices(i).Distortion
                     lp = rVoices(i).lowPass
                     hp = rVoices(i).highPass
                     sWidth = rVoices(i).StereoWidth
-                    
                     eqB = rVoices(i).EqBass
                     eqM = rVoices(i).EqMid
                     eqT = rVoices(i).EqTreble
-                    
                     cmpThresh = rVoices(i).CompThreshold
                     cmpRatio = rVoices(i).CompRatio
                     cmpEnv = rVoices(i).CompEnv
-                    
                     bdSteps = rVoices(i).BitcrushSteps
                     dsFactor = rVoices(i).BitcrushDownsample
                     dsCount = rVoices(i).BitcrushDsCount
                     lastL = rVoices(i).BitcrushLastL
                     lastR = rVoices(i).BitcrushLastR
-                    
                     rmFreq = rVoices(i).RingModFreq
                     rmMix = rVoices(i).RingModMix
                     rmPhase = rVoices(i).RingModPhase
                     rmStep = (PI2 * rmFreq) / CDbl(rCtx.sampleRate)
-                    
                     trmRate = rVoices(i).TremoloRate
                     trmDepth = rVoices(i).TremoloDepth
                     trmPhase = rVoices(i).TremoloPhase
                     trmStep = (PI2 * trmRate) / CDbl(rCtx.sampleRate)
-                    
                     apRate = rVoices(i).AutoPanRate
                     apDepth = rVoices(i).AutoPanDepth
                     apPhase = rVoices(i).AutoPanPhase
                     apStep = (PI2 * apRate) / CDbl(rCtx.sampleRate)
-                    
                     cRate = rVoices(i).ChorusRate
                     cDepth = rVoices(i).ChorusDepth
                     cPhase = rVoices(i).ChorusPhase
                     cStep = (PI2 * cRate) / CDbl(rCtx.sampleRate)
-                    
                     flgRate = rVoices(i).FlangerRate
                     flgDepth = rVoices(i).FlangerDepth
                     flgFB = rVoices(i).FlangerFeedback
                     flgPhase = rVoices(i).FlangerPhase
                     flgStep = (PI2 * flgRate) / CDbl(rCtx.sampleRate)
-                    
                     rMix = rVoices(i).ReverbMix
                     rTime = rVoices(i).ReverbTime
                     rt1 = rVoices(i).RevTap1
                     rt2 = rVoices(i).RevTap2
                     rt3 = rVoices(i).RevTap3
                     rt4 = rVoices(i).RevTap4
-                    
                     dTime = rVoices(i).DelayTime
                     dFB = rVoices(i).DelayFeedback
                     dMix = rVoices(i).DelayMix
                     dSamples = Int(dTime * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                     dWrite = rVoices(i).RingWritePos
                     dBase = i * RIFF_RING_SAMPLES_PER_VOICE
-                    
                     fadeState = rVoices(i).fadeState
                     fadeCur = rVoices(i).FadeFramesCurrent
                     fadeTot = rVoices(i).FadeFramesTotal
@@ -4533,9 +4554,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                         srcIdx = 0
                     Else
                         srcIdx = (pos - CDbl(readPos)) / CDbl(align)
-                        If srcIdx < 0# Then
-                            srcIdx = 0#
-                        End If
+                        If srcIdx < 0# Then srcIdx = 0#
                     End If
                     writeIdx = 0
                     ptchAlign = ptch * CDbl(align)
@@ -4546,6 +4565,11 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     currentVoicePeakR = 0!
                     rVoices(i).PeakL = rVoices(i).PeakL * RIFF_ACTIVE_PEAK_DECAY
                     rVoices(i).PeakR = rVoices(i).PeakR * RIFF_ACTIVE_PEAK_DECAY
+
+                    Dim currentVoiceBus As Long
+                    Dim baseVol As Single
+                    currentVoiceBus = rVoices(i).busID
+                    baseVol = rVoices(i).Volume * rCtx.MasterVolume * RiffBusMixVolume(currentVoiceBus)
                     
                     If nChannels = RIFF_WAV_EXPORT_CHANNELS Then
                         For frame = 0 To framesAvailable - 1
@@ -4654,9 +4678,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 fL = fL * (1! - rmMix) + (fL * rmOsc) * rmMix
                                 fR = fR * (1! - rmMix) + (fR * rmOsc) * rmMix
                                 rmPhase = rmPhase + rmStep
-                                If rmPhase > PI2 Then
-                                    rmPhase = rmPhase - PI2
-                                End If
+                                If rmPhase > PI2 Then rmPhase = rmPhase - PI2
                             End If
                             
                             If trmDepth > 0! Then
@@ -4665,9 +4687,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 fL = fL * trmMult
                                 fR = fR * trmMult
                                 trmPhase = trmPhase + trmStep
-                                If trmPhase > PI2 Then
-                                    trmPhase = trmPhase - PI2
-                                End If
+                                If trmPhase > PI2 Then trmPhase = trmPhase - PI2
                             End If
                             
                             If sWidth <> 1! Then
@@ -4692,9 +4712,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 
                                 fDel = Int((RIFF_FLANGER_BASE_DELAY_SEC + RIFF_FLANGER_MOD_DELAY_SEC * CSng(Sin(flgPhase))) * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                                 fRd = dWrite - fDel
-                                If fRd < 0 Then
-                                    fRd = fRd + RIFF_RING_SAMPLES_PER_VOICE
-                                End If
+                                If fRd < 0 Then fRd = fRd + RIFF_RING_SAMPLES_PER_VOICE
                                 
                                 flgL = rRingBuf(dBase + fRd)
                                 flgR = rRingBuf(dBase + fRd + 1)
@@ -4705,9 +4723,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 bufInR = bufInR + flgR * flgFB
                                 
                                 flgPhase = flgPhase + flgStep
-                                If flgPhase > PI2 Then
-                                    flgPhase = flgPhase - PI2
-                                End If
+                                If flgPhase > PI2 Then flgPhase = flgPhase - PI2
                             End If
                             
                             If cDepth > 0! Then
@@ -4716,16 +4732,12 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 
                                 cDelay = Int((RIFF_CHORUS_BASE_DELAY_SEC + RIFF_CHORUS_MOD_DELAY_SEC * CSng(Sin(cPhase))) * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                                 cRead = dWrite - cDelay
-                                If cRead < 0 Then
-                                    cRead = cRead + RIFF_RING_SAMPLES_PER_VOICE
-                                End If
+                                If cRead < 0 Then cRead = cRead + RIFF_RING_SAMPLES_PER_VOICE
                                 
                                 fL = fL * (RIFF_UNITY_GAIN - cDepth * RIFF_HALF_SCALE) + rRingBuf(dBase + cRead) * cDepth
                                 fR = fR * (RIFF_UNITY_GAIN - cDepth * RIFF_HALF_SCALE) + rRingBuf(dBase + cRead + 1) * cDepth
                                 cPhase = cPhase + cStep
-                                If cPhase > PI2 Then
-                                    cPhase = cPhase - PI2
-                                End If
+                                If cPhase > PI2 Then cPhase = cPhase - PI2
                             End If
                             
                             If dMix > 0! And dSamples > 0 Then
@@ -4734,9 +4746,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 Dim dR As Single
                                 
                                 dRead = dWrite - dSamples
-                                If dRead < 0 Then
-                                    dRead = dRead + RIFF_RING_SAMPLES_PER_VOICE
-                                End If
+                                If dRead < 0 Then dRead = dRead + RIFF_RING_SAMPLES_PER_VOICE
                                 
                                 dL = rRingBuf(dBase + dRead)
                                 dR = rRingBuf(dBase + dRead + 1)
@@ -4753,9 +4763,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             rRingBuf(dBase + dWrite) = bufInL
                             rRingBuf(dBase + dWrite + 1) = bufInR
                             dWrite = dWrite + RIFF_WAV_EXPORT_CHANNELS
-                            If dWrite >= RIFF_RING_SAMPLES_PER_VOICE Then
-                                dWrite = 0
-                            End If
+                            If dWrite >= RIFF_RING_SAMPLES_PER_VOICE Then dWrite = 0
                             
                             If cmpRatio > 1! Then
                                 Dim pkL As Single
@@ -4765,9 +4773,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 pkL = Abs(fL)
                                 pkR = Abs(fR)
                                 maxPk = pkL
-                                If pkR > maxPk Then
-                                    maxPk = pkR
-                                End If
+                                If pkR > maxPk Then maxPk = pkR
                                 
                                 If maxPk > cmpEnv Then
                                     cmpEnv = cmpEnv + RIFF_COMP_ATTACK_COEFF * (maxPk - cmpEnv)
@@ -4793,49 +4799,26 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                     curPan = -1!
                                 End If
                                 apPhase = apPhase + apStep
-                                If apPhase > PI2 Then
-                                    apPhase = apPhase - PI2
-                                End If
+                                If apPhase > PI2 Then apPhase = apPhase - PI2
                             End If
                             
-                            Dim busVol As Single
-                            busVol = RiffBusMixVolume(rVoices(i).busID)
+                            vL = baseVol
+                            vR = baseVol
                             
-                            vL = rVoices(i).Volume * rCtx.MasterVolume * busVol
-                            vR = rVoices(i).Volume * rCtx.MasterVolume * busVol
-                            
-                            If curPan > 0! Then
-                                vL = vL * (1! - curPan)
-                            End If
-                            If curPan < 0! Then
-                                vR = vR * (1! + curPan)
-                            End If
+                            If curPan > 0! Then vL = vL * (1! - curPan)
+                            If curPan < 0! Then vR = vR * (1! + curPan)
                             
                             fL = fL * vL * fadeMult
                             fR = fR * vR * fadeMult
                             
-                            If Abs(fL) > currentVoicePeakL Then
-                                currentVoicePeakL = Abs(fL)
-                            End If
-                            If Abs(fR) > currentVoicePeakR Then
-                                currentVoicePeakR = Abs(fR)
-                            End If
+                            If Abs(fL) > currentVoicePeakL Then currentVoicePeakL = Abs(fL)
+                            If Abs(fR) > currentVoicePeakR Then currentVoicePeakR = Abs(fR)
                             
                             rMixArr32(writeIdx) = rMixArr32(writeIdx) + fL
                             rMixArr32(writeIdx + 1) = rMixArr32(writeIdx + 1) + fR
 
-                            If Abs(rMixArr32(writeIdx)) > currentMasterPeakL Then
-                                currentMasterPeakL = Abs(rMixArr32(writeIdx))
-                            End If
-                            If Abs(rMixArr32(writeIdx + 1)) > currentMasterPeakR Then
-                                currentMasterPeakR = Abs(rMixArr32(writeIdx + 1))
-                            End If
-                            If Abs(fL) > rCtx.Buses(rVoices(i).busID).PeakL Then
-                                rCtx.Buses(rVoices(i).busID).PeakL = Abs(fL)
-                            End If
-                            If Abs(fR) > rCtx.Buses(rVoices(i).busID).PeakR Then
-                                rCtx.Buses(rVoices(i).busID).PeakR = Abs(fR)
-                            End If
+                            If Abs(rMixArr32(writeIdx)) > currentMasterPeakL Then currentMasterPeakL = Abs(rMixArr32(writeIdx))
+                            If Abs(rMixArr32(writeIdx + 1)) > currentMasterPeakR Then currentMasterPeakR = Abs(rMixArr32(writeIdx + 1))
                             
                             writeIdx = writeIdx + RIFF_WAV_EXPORT_CHANNELS
                             srcIdx = srcIdx + ptch
@@ -4843,12 +4826,11 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                         Next frame
                     End If
                     
-                    If currentVoicePeakL > rVoices(i).PeakL Then
-                        rVoices(i).PeakL = currentVoicePeakL
-                    End If
-                    If currentVoicePeakR > rVoices(i).PeakR Then
-                        rVoices(i).PeakR = currentVoicePeakR
-                    End If
+                    If currentVoicePeakL > rVoices(i).PeakL Then rVoices(i).PeakL = currentVoicePeakL
+                    If currentVoicePeakR > rVoices(i).PeakR Then rVoices(i).PeakR = currentVoicePeakR
+                    
+                    If currentVoicePeakL > rCtx.Buses(currentVoiceBus).PeakL Then rCtx.Buses(currentVoiceBus).PeakL = currentVoicePeakL
+                    If currentVoicePeakR > rCtx.Buses(currentVoiceBus).PeakR Then rCtx.Buses(currentVoiceBus).PeakR = currentVoicePeakR
                     
                     rVoices(i).Position = pos
                     rVoices(i).TremoloPhase = trmPhase
@@ -4868,12 +4850,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
 NextVoice32:
         Next i
         
-        If currentMasterPeakL > rCtx.MasterPeakL Then
-            rCtx.MasterPeakL = currentMasterPeakL
-        End If
-        If currentMasterPeakR > rCtx.MasterPeakR Then
-            rCtx.MasterPeakR = currentMasterPeakR
-        End If
+        If currentMasterPeakL > rCtx.MasterPeakL Then rCtx.MasterPeakL = currentMasterPeakL
+        If currentMasterPeakR > rCtx.MasterPeakR Then rCtx.MasterPeakR = currentMasterPeakR
         
         For frame = 0 To sampleCount32 - 1
             If rMixArr32(frame) > 1! Then
@@ -4923,7 +4901,6 @@ NextVoice32:
                 End If
                 
                 If isSourceValid16 Then
-                    
                     pos = rVoices(i).Position
                     ptch = rVoices(i).Pitch
                     loopSnd = rVoices(i).Looping
@@ -4935,18 +4912,13 @@ NextVoice32:
                     sourceSampleCount = bytesNeeded \ 2
                     
                     If Not rVoices(i).IsOscillator Then
-                        
                         ptr = rCtx.Buffers(rVoices(i).BufferIndex).BufferPtr
                         readPos = (CLng(pos) \ align) * align
                         
-                        If readPos < 0 Then
-                            readPos = 0
-                        End If
+                        If readPos < 0 Then readPos = 0
                         
                         bytesAvail = CLng(loopEnd) - readPos
-                        If bytesAvail < 0 Then
-                            bytesAvail = 0
-                        End If
+                        If bytesAvail < 0 Then bytesAvail = 0
                         
                         RiffEnsureIntegerScratch rSrcArr16, rSrcArr16Cap, sourceSampleCount
                         RiffClearIntegerScratch rSrcArr16, sourceSampleCount
@@ -4964,76 +4936,62 @@ NextVoice32:
                                 loopBytes16 = CLng(loopEnd - loopStart)
                                 Do While remBytes > 0 And loopBytes16 > 0
                                     chunkBytes16 = remBytes
-                                    If chunkBytes16 > loopBytes16 Then
-                                        chunkBytes16 = loopBytes16
-                                    End If
+                                    If chunkBytes16 > loopBytes16 Then chunkBytes16 = loopBytes16
                                     RtlMoveMemoryToInteger rSrcArr16((bytesNeeded - remBytes) \ 2), ByVal (ptr + CLng(loopStart)), chunkBytes16
                                     remBytes = remBytes - chunkBytes16
                                 Loop
                             End If
                         End If
-                        
                     End If
                     
                     dist = rVoices(i).Distortion
                     lp = rVoices(i).lowPass
                     hp = rVoices(i).highPass
                     sWidth = rVoices(i).StereoWidth
-                    
                     eqB = rVoices(i).EqBass
                     eqM = rVoices(i).EqMid
                     eqT = rVoices(i).EqTreble
-                    
                     cmpThresh = rVoices(i).CompThreshold
                     cmpRatio = rVoices(i).CompRatio
                     cmpEnv = rVoices(i).CompEnv
-                    
                     bdSteps = rVoices(i).BitcrushSteps
                     dsFactor = rVoices(i).BitcrushDownsample
                     dsCount = rVoices(i).BitcrushDsCount
                     lastL = rVoices(i).BitcrushLastL
                     lastR = rVoices(i).BitcrushLastR
-                    
                     rmFreq = rVoices(i).RingModFreq
                     rmMix = rVoices(i).RingModMix
                     rmPhase = rVoices(i).RingModPhase
                     rmStep = (PI2 * rmFreq) / CDbl(rCtx.sampleRate)
-                    
                     trmRate = rVoices(i).TremoloRate
                     trmDepth = rVoices(i).TremoloDepth
                     trmPhase = rVoices(i).TremoloPhase
                     trmStep = (PI2 * trmRate) / CDbl(rCtx.sampleRate)
-                    
                     apRate = rVoices(i).AutoPanRate
                     apDepth = rVoices(i).AutoPanDepth
                     apPhase = rVoices(i).AutoPanPhase
                     apStep = (PI2 * apRate) / CDbl(rCtx.sampleRate)
-                    
                     cRate = rVoices(i).ChorusRate
                     cDepth = rVoices(i).ChorusDepth
                     cPhase = rVoices(i).ChorusPhase
                     cStep = (PI2 * cRate) / CDbl(rCtx.sampleRate)
-                    
                     flgRate = rVoices(i).FlangerRate
                     flgDepth = rVoices(i).FlangerDepth
                     flgFB = rVoices(i).FlangerFeedback
                     flgPhase = rVoices(i).FlangerPhase
                     flgStep = (PI2 * flgRate) / CDbl(rCtx.sampleRate)
-                    
                     rMix = rVoices(i).ReverbMix
                     rTime = rVoices(i).ReverbTime
                     rt1 = rVoices(i).RevTap1
                     rt2 = rVoices(i).RevTap2
                     rt3 = rVoices(i).RevTap3
                     rt4 = rVoices(i).RevTap4
-                    
                     dTime = rVoices(i).DelayTime
                     dFB = rVoices(i).DelayFeedback
                     dMix = rVoices(i).DelayMix
                     dSamples = Int(dTime * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                     dWrite = rVoices(i).RingWritePos
                     dBase = i * RIFF_RING_SAMPLES_PER_VOICE
-                    
                     fadeState = rVoices(i).fadeState
                     fadeCur = rVoices(i).FadeFramesCurrent
                     fadeTot = rVoices(i).FadeFramesTotal
@@ -5042,9 +5000,7 @@ NextVoice32:
                         srcIdx = 0
                     Else
                         srcIdx = (pos - CDbl(readPos)) / CDbl(align)
-                        If srcIdx < 0# Then
-                            srcIdx = 0#
-                        End If
+                        If srcIdx < 0# Then srcIdx = 0#
                     End If
                     writeIdx = 0
                     ptchAlign = ptch * CDbl(align)
@@ -5056,6 +5012,11 @@ NextVoice32:
                     rVoices(i).PeakL = rVoices(i).PeakL * RIFF_ACTIVE_PEAK_DECAY
                     rVoices(i).PeakR = rVoices(i).PeakR * RIFF_ACTIVE_PEAK_DECAY
                     
+                    Dim cVoiceBus16 As Long
+                    Dim bVol16 As Single
+                    cVoiceBus16 = rVoices(i).busID
+                    bVol16 = rVoices(i).Volume * rCtx.MasterVolume * RiffBusMixVolume(cVoiceBus16)
+
                     If nChannels = RIFF_WAV_EXPORT_CHANNELS Then
                         For frame = 0 To framesAvailable - 1
                             If Not rVoices(i).IsOscillator Then
@@ -5152,9 +5113,7 @@ NextVoice32:
                                 fL = fL * (1! - rmMix) + (fL * rmOsc16) * rmMix
                                 fR = fR * (1! - rmMix) + (fR * rmOsc16) * rmMix
                                 rmPhase = rmPhase + rmStep
-                                If rmPhase > PI2 Then
-                                    rmPhase = rmPhase - PI2
-                                End If
+                                If rmPhase > PI2 Then rmPhase = rmPhase - PI2
                             End If
                             
                             If trmDepth > 0! Then
@@ -5163,9 +5122,7 @@ NextVoice32:
                                 fL = fL * trmM16
                                 fR = fR * trmM16
                                 trmPhase = trmPhase + trmStep
-                                If trmPhase > PI2 Then
-                                    trmPhase = trmPhase - PI2
-                                End If
+                                If trmPhase > PI2 Then trmPhase = trmPhase - PI2
                             End If
                             
                             If sWidth <> 1! Then
@@ -5190,9 +5147,7 @@ NextVoice32:
                                 
                                 fDel16 = Int((RIFF_FLANGER_BASE_DELAY_SEC + RIFF_FLANGER_MOD_DELAY_SEC * CSng(Sin(flgPhase))) * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                                 fRd16 = dWrite - fDel16
-                                If fRd16 < 0 Then
-                                    fRd16 = fRd16 + RIFF_RING_SAMPLES_PER_VOICE
-                                End If
+                                If fRd16 < 0 Then fRd16 = fRd16 + RIFF_RING_SAMPLES_PER_VOICE
                                 
                                 flgL16 = rRingBuf(dBase + fRd16)
                                 flgR16 = rRingBuf(dBase + fRd16 + 1)
@@ -5203,9 +5158,7 @@ NextVoice32:
                                 bufInR16 = bufInR16 + flgR16 * flgFB
                                 
                                 flgPhase = flgPhase + flgStep
-                                If flgPhase > PI2 Then
-                                    flgPhase = flgPhase - PI2
-                                End If
+                                If flgPhase > PI2 Then flgPhase = flgPhase - PI2
                             End If
                             
                             If cDepth > 0! Then
@@ -5214,16 +5167,12 @@ NextVoice32:
                                 
                                 cDel16 = Int((RIFF_CHORUS_BASE_DELAY_SEC + RIFF_CHORUS_MOD_DELAY_SEC * CSng(Sin(cPhase))) * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                                 cRd16 = dWrite - cDel16
-                                If cRd16 < 0 Then
-                                    cRd16 = cRd16 + RIFF_RING_SAMPLES_PER_VOICE
-                                End If
+                                If cRd16 < 0 Then cRd16 = cRd16 + RIFF_RING_SAMPLES_PER_VOICE
                                 
                                 fL = fL * (RIFF_UNITY_GAIN - cDepth * RIFF_HALF_SCALE) + rRingBuf(dBase + cRd16) * cDepth
                                 fR = fR * (RIFF_UNITY_GAIN - cDepth * RIFF_HALF_SCALE) + rRingBuf(dBase + cRd16 + 1) * cDepth
                                 cPhase = cPhase + cStep
-                                If cPhase > PI2 Then
-                                    cPhase = cPhase - PI2
-                                End If
+                                If cPhase > PI2 Then cPhase = cPhase - PI2
                             End If
                             
                             If dMix > 0! And dSamples > 0 Then
@@ -5232,9 +5181,7 @@ NextVoice32:
                                 Dim dR16_2 As Single
                                 
                                 dR16 = dWrite - dSamples
-                                If dR16 < 0 Then
-                                    dR16 = dR16 + RIFF_RING_SAMPLES_PER_VOICE
-                                End If
+                                If dR16 < 0 Then dR16 = dR16 + RIFF_RING_SAMPLES_PER_VOICE
                                 
                                 dL16 = rRingBuf(dBase + dR16)
                                 dR16_2 = rRingBuf(dBase + dR16 + 1)
@@ -5251,9 +5198,7 @@ NextVoice32:
                             rRingBuf(dBase + dWrite) = bufInL16
                             rRingBuf(dBase + dWrite + 1) = bufInR16
                             dWrite = dWrite + RIFF_WAV_EXPORT_CHANNELS
-                            If dWrite >= RIFF_RING_SAMPLES_PER_VOICE Then
-                                dWrite = 0
-                            End If
+                            If dWrite >= RIFF_RING_SAMPLES_PER_VOICE Then dWrite = 0
                             
                             If cmpRatio > 1! Then
                                 Dim pkL16 As Single
@@ -5263,9 +5208,7 @@ NextVoice32:
                                 pkL16 = Abs(fL)
                                 pkR16 = Abs(fR)
                                 maxPk16 = pkL16
-                                If pkR16 > maxPk16 Then
-                                    maxPk16 = pkR16
-                                End If
+                                If pkR16 > maxPk16 Then maxPk16 = pkR16
                                 
                                 If maxPk16 > cmpEnv Then
                                     cmpEnv = cmpEnv + RIFF_COMP_ATTACK_COEFF * (maxPk16 - cmpEnv)
@@ -5291,33 +5234,20 @@ NextVoice32:
                                     cPan16 = -1!
                                 End If
                                 apPhase = apPhase + apStep
-                                If apPhase > PI2 Then
-                                    apPhase = apPhase - PI2
-                                End If
+                                If apPhase > PI2 Then apPhase = apPhase - PI2
                             End If
                             
-                            Dim bVol16 As Single
-                            bVol16 = RiffBusMixVolume(rVoices(i).busID)
+                            vL = bVol16
+                            vR = bVol16
                             
-                            vL = rVoices(i).Volume * rCtx.MasterVolume * bVol16
-                            vR = rVoices(i).Volume * rCtx.MasterVolume * bVol16
-                            
-                            If cPan16 > 0! Then
-                                vL = vL * (1! - cPan16)
-                            End If
-                            If cPan16 < 0! Then
-                                vR = vR * (1! + cPan16)
-                            End If
+                            If cPan16 > 0! Then vL = vL * (1! - cPan16)
+                            If cPan16 < 0! Then vR = vR * (1! + cPan16)
                             
                             fL = fL * vL * fadeMult
                             fR = fR * vR * fadeMult
                             
-                            If Abs(fL) > cVoicePeakL16 Then
-                                cVoicePeakL16 = Abs(fL)
-                            End If
-                            If Abs(fR) > cVoicePeakR16 Then
-                                cVoicePeakR16 = Abs(fR)
-                            End If
+                            If Abs(fL) > cVoicePeakL16 Then cVoicePeakL16 = Abs(fL)
+                            If Abs(fR) > cVoicePeakR16 Then cVoicePeakR16 = Abs(fR)
                             
                             l1 = CLng(rMixArr16(writeIdx)) + CLng(fL * CSng(RIFF_PCM16_MAX))
                             l2 = CLng(rMixArr16(writeIdx + 1)) + CLng(fR * CSng(RIFF_PCM16_MAX))
@@ -5337,18 +5267,8 @@ NextVoice32:
                             rMixArr16(writeIdx) = CInt(l1)
                             rMixArr16(writeIdx + 1) = CInt(l2)
                             
-                            If Abs(fL) > currentMasterPeakL Then
-                                currentMasterPeakL = Abs(fL)
-                            End If
-                            If Abs(fR) > currentMasterPeakR Then
-                                currentMasterPeakR = Abs(fR)
-                            End If
-                            If Abs(fL) > rCtx.Buses(rVoices(i).busID).PeakL Then
-                                rCtx.Buses(rVoices(i).busID).PeakL = Abs(fL)
-                            End If
-                            If Abs(fR) > rCtx.Buses(rVoices(i).busID).PeakR Then
-                                rCtx.Buses(rVoices(i).busID).PeakR = Abs(fR)
-                            End If
+                            If Abs(fL) > currentMasterPeakL Then currentMasterPeakL = Abs(fL)
+                            If Abs(fR) > currentMasterPeakR Then currentMasterPeakR = Abs(fR)
                             
                             writeIdx = writeIdx + RIFF_WAV_EXPORT_CHANNELS
                             srcIdx = srcIdx + ptch
@@ -5356,12 +5276,11 @@ NextVoice32:
                         Next frame
                     End If
                     
-                    If cVoicePeakL16 > rVoices(i).PeakL Then
-                        rVoices(i).PeakL = cVoicePeakL16
-                    End If
-                    If cVoicePeakR16 > rVoices(i).PeakR Then
-                        rVoices(i).PeakR = cVoicePeakR16
-                    End If
+                    If cVoicePeakL16 > rVoices(i).PeakL Then rVoices(i).PeakL = cVoicePeakL16
+                    If cVoicePeakR16 > rVoices(i).PeakR Then rVoices(i).PeakR = cVoicePeakR16
+                    
+                    If cVoicePeakL16 > rCtx.Buses(cVoiceBus16).PeakL Then rCtx.Buses(cVoiceBus16).PeakL = cVoicePeakL16
+                    If cVoicePeakR16 > rCtx.Buses(cVoiceBus16).PeakR Then rCtx.Buses(cVoiceBus16).PeakR = cVoicePeakR16
                     
                     rVoices(i).Position = pos
                     rVoices(i).TremoloPhase = trmPhase
@@ -5381,12 +5300,8 @@ NextVoice32:
 NextVoice16:
         Next i
         
-        If currentMasterPeakL > rCtx.MasterPeakL Then
-            rCtx.MasterPeakL = currentMasterPeakL
-        End If
-        If currentMasterPeakR > rCtx.MasterPeakR Then
-            rCtx.MasterPeakR = currentMasterPeakR
-        End If
+        If currentMasterPeakL > rCtx.MasterPeakL Then rCtx.MasterPeakL = currentMasterPeakL
+        If currentMasterPeakR > rCtx.MasterPeakR Then rCtx.MasterPeakR = currentMasterPeakR
         
         RtlMoveMemory ByVal pData, VarPtr(rMixArr16(0)), bytesToWrite
     Else
@@ -5822,7 +5737,7 @@ Private Function InitWASAPI() As Boolean
         Exit Function
     End If
 
-    rCtx.MaxWriteFrames = 0
+    rCtx.MaxWriteFrames = (rCtx.sampleRate * 60) \ 1000
     
     hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_GET_BUFFER_SIZE, VarPtr(rCtx.BufferSize))
     If hr <> 0 Then
