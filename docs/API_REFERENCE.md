@@ -1,8 +1,10 @@
 # Riff API Reference
 
-**Riff.bas** is a high-performance VBA audio engine for Windows Office hosts. It uses Media Foundation for decoding, WASAPI shared-mode output for playback, and a real-time DSP pipeline written directly in VBA with a small native timer thunk. It supports x86 and x64 VBA, static audio buffers, polyphonic voices, audio buses, synthetic oscillators, white/pink/brown noise, WAV export, peak meters, adaptive buffering, and a full per-voice effects chain.
+> Current target: **Riff v1.0.9**.
 
-This reference documents the current public API from the adaptive-buffer architecture build. Older helper names are still documented when they remain available for compatibility, but the recommended API style is now the unified form:
+**Riff.bas** is a high-performance VBA audio engine for Windows Office hosts. It uses Media Foundation for decoding, WASAPI shared-mode output for playback, and a real-time DSP pipeline written directly in VBA with a small native timer thunk. It supports x86 and x64 VBA, static audio buffers, polyphonic voices, audio buses, synthetic oscillators, white/pink/brown noise, WAV export, peak meters, adaptive buffering, musical preset packs, master bus processors, and a full per-voice effects chain.
+
+This reference documents the current public API from the **v1.0.9 musical-preset and master-processor build**. Older helper names are still documented when they remain available for compatibility, but the recommended API style is now the unified form:
 
 ```vb
 voice = RiffPlay(bufferHandle, RiffBusSfx, False, 0.9, 0!)
@@ -29,10 +31,12 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!)
   - [RiffWaveType](#riffwavetype)
   - [RiffBusId](#riffbusid)
   - [RiffEffectPreset](#riffeffectpreset)
+  - [RiffMasterPreset](#riffmasterpreset)
   - [RiffErrorCode](#rifferrorcode)
 - [Initialization and Teardown](#initialization-and-teardown)
 - [Diagnostics](#diagnostics)
 - [Global Settings](#global-settings)
+- [Master Bus Processors](#master-bus-processors)
 - [Audio Buses](#audio-buses-api)
 - [Asset Loading and Memory](#asset-loading-and-memory)
 - [Export and Offline Rendering](#export-and-offline-rendering)
@@ -40,6 +44,7 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!)
 - [Voice State and Transport](#voice-state-and-transport)
 - [Voice Properties](#voice-properties)
 - [Effect Helpers and Presets](#effect-helpers-and-presets)
+- [Musical Preset Packs](#musical-preset-packs)
 - [DSP Parameters](#dsp-parameters)
   - [Bitcrusher](#bitcrusher)
   - [Ring Modulator](#ring-modulator)
@@ -175,7 +180,36 @@ The effective output gain is conceptually:
 voice output × voice volume × bus volume × master volume
 ```
 
-Buses also support mute, solo, fade, and peak metering.
+Buses also support mute, solo, fade, peak metering, and optional persistent voice presets that can be applied to all current and future voices on a bus.
+
+### Master Bus Processors
+
+Riff v1.0.9 adds a lightweight master processing stage after all voices and buses are mixed. This stage is useful for final polish and global mix shaping.
+
+The master stage can apply:
+
+- soft clipping
+- low-pass and high-pass filtering
+- 3-band EQ
+- compression/glue
+- drive/saturation
+- stereo width
+- output gain
+- named master presets
+
+Use master processors carefully. They affect the entire mix, not just one voice or bus.
+
+```vb
+RiffMasterProcessorEnabled = True
+RiffMasterApplyPreset RiffMasterFxGlue, 0.7
+RiffMasterOutputGain = 0.95!
+```
+
+For clean output:
+
+```vb
+RiffMasterClearProcessors
+```
 
 ### Adaptive Buffering
 
@@ -241,6 +275,7 @@ Each active voice goes through a fixed per-sample DSP chain. The conceptual orde
 17. Voice gain, bus gain, master gain.
 18. Fade gain.
 19. Peak metering and mix accumulation.
+20. Master bus processing: optional soft clip, filters, EQ, compression, drive, stereo width, and output gain.
 
 Most DSP stages are skipped when their parameters are at neutral defaults. For example, delay is skipped when `RiffVoiceDelayMix = 0`, and EQ is skipped when all EQ bands are `1.0`.
 
@@ -384,6 +419,18 @@ Public Enum RiffEffectPreset
     RiffFxWide = 11
     RiffFxRobot = 12
     RiffFxAmbient = 13
+    RiffFxWarmTape = 14
+    RiffFxVHS = 15
+    RiffFxDreamPad = 16
+    RiffFxDarkCave = 17
+    RiffFxTinySpeaker = 18
+    RiffFxMegaphone = 19
+    RiffFxGameBoy = 20
+    RiffFxHorrorDrone = 21
+    RiffFxWind = 22
+    RiffFxRain = 23
+    RiffFxCinematicBoom = 24
+    RiffFxSoftFocus = 25
 End Enum
 ```
 
@@ -405,6 +452,48 @@ Presets are convenience recipes applied to a voice. Use `RiffVoiceApplyPreset vo
 | `RiffFxWide` | Stereo width enhancement. |
 | `RiffFxRobot` | Ring-modulated robotic timbre. |
 | `RiffFxAmbient` | Spacious reverb/chorus ambience. |
+| `RiffFxWarmTape` | Warm tape-like coloration with gentle filtering and compression. |
+| `RiffFxVHS` | Warbly degraded VHS-style tone. |
+| `RiffFxDreamPad` | Soft wide chorus/reverb preset for pads and ambience. |
+| `RiffFxDarkCave` | Dark, large, cave-like space. |
+| `RiffFxTinySpeaker` | Small speaker coloration with narrow bandwidth. |
+| `RiffFxMegaphone` | Mid-forward projected voice effect. |
+| `RiffFxGameBoy` | Retro crunchy bit-reduced game tone. |
+| `RiffFxHorrorDrone` | Dark modulated unsettling texture. |
+| `RiffFxWind` | Airy filtered noise/wind coloration. |
+| `RiffFxRain` | Soft filtered rain/noise ambience. |
+| `RiffFxCinematicBoom` | Big low-heavy impact treatment. |
+| `RiffFxSoftFocus` | Smooth, softened, gentle wide tone. |
+
+### RiffMasterPreset
+
+```vb
+Public Enum RiffMasterPreset
+    RiffMasterFxClean = 0
+    RiffMasterFxGlue = 1
+    RiffMasterFxWarm = 2
+    RiffMasterFxBright = 3
+    RiffMasterFxDark = 4
+    RiffMasterFxRadio = 5
+    RiffMasterFxCinematic = 6
+    RiffMasterFxNight = 7
+    RiffMasterFxSoftLimiter = 8
+End Enum
+```
+
+Master presets apply to the final mixed output. They are used with `RiffMasterApplyPreset`.
+
+| Preset | Description |
+|:---|:---|
+| `RiffMasterFxClean` | Neutral master stage. |
+| `RiffMasterFxGlue` | Gentle compression and soft limiting for a cohesive mix. |
+| `RiffMasterFxWarm` | Warm tonal shaping with slight saturation. |
+| `RiffMasterFxBright` | Brighter master tone with controlled low end. |
+| `RiffMasterFxDark` | Darker master tone for night/cave/low-energy scenes. |
+| `RiffMasterFxRadio` | Global radio/band-limited output. |
+| `RiffMasterFxCinematic` | Wider, fuller, slightly compressed cinematic shaping. |
+| `RiffMasterFxNight` | Lower, softer, less bright nighttime mix. |
+| `RiffMasterFxSoftLimiter` | Safety preset focused on limiting and clipping control. |
 
 ### RiffErrorCode
 
@@ -723,6 +812,194 @@ Debug.Print "Master peak:", Format(l, "0.00"), Format(r, "0.00")
 
 ---
 
+## Master Bus Processors
+
+Master processors run after all voices and buses have been mixed. They are designed for final polish, safety limiting, and global scene-level coloration. Unlike voice effects, master processors affect the entire output.
+
+Use them sparingly. A master preset can make a whole project sound more cohesive, but aggressive settings can also exaggerate clipping or reduce clarity.
+
+### RiffSoftClipEnabled
+
+```vb
+Public Property Get RiffSoftClipEnabled() As Boolean
+Public Property Let RiffSoftClipEnabled(ByVal value As Boolean)
+```
+
+Enables or disables the master soft clipper. This is a safety stage intended to reduce harsh digital clipping when many voices overlap.
+
+```vb
+RiffSoftClipEnabled = True
+```
+
+### RiffMasterProcessorEnabled
+
+```vb
+Public Property Get RiffMasterProcessorEnabled() As Boolean
+Public Property Let RiffMasterProcessorEnabled(ByVal value As Boolean)
+```
+
+Enables or disables the optional master processor chain.
+
+```vb
+RiffMasterProcessorEnabled = True
+```
+
+When disabled, the mix still uses normal master volume and core output handling, but optional master EQ/compression/drive/width processing is bypassed.
+
+### RiffMasterLowPass
+
+```vb
+Public Property Get RiffMasterLowPass() As Single
+Public Property Let RiffMasterLowPass(ByVal value As Single)
+```
+
+Controls global low-pass filtering. `1.0` is open/neutral. Lower values darken the entire mix.
+
+```vb
+RiffMasterLowPass = 0.85!
+```
+
+### RiffMasterHighPass
+
+```vb
+Public Property Get RiffMasterHighPass() As Single
+Public Property Let RiffMasterHighPass(ByVal value As Single)
+```
+
+Controls global high-pass filtering. `0.0` is neutral. Higher values remove more low end.
+
+```vb
+RiffMasterHighPass = 0.05!
+```
+
+### RiffMasterEqBass / RiffMasterEqMid / RiffMasterEqTreble
+
+```vb
+Public Property Get RiffMasterEqBass() As Single
+Public Property Let RiffMasterEqBass(ByVal value As Single)
+
+Public Property Get RiffMasterEqMid() As Single
+Public Property Let RiffMasterEqMid(ByVal value As Single)
+
+Public Property Get RiffMasterEqTreble() As Single
+Public Property Let RiffMasterEqTreble(ByVal value As Single)
+```
+
+Global 3-band tonal shaping. `1.0` is neutral.
+
+```vb
+RiffMasterEqBass = 1.1!
+RiffMasterEqMid = 1!
+RiffMasterEqTreble = 0.95!
+```
+
+### RiffMasterCompressorThreshold / RiffMasterCompressorRatio
+
+```vb
+Public Property Get RiffMasterCompressorThreshold() As Single
+Public Property Let RiffMasterCompressorThreshold(ByVal value As Single)
+
+Public Property Get RiffMasterCompressorRatio() As Single
+Public Property Let RiffMasterCompressorRatio(ByVal value As Single)
+```
+
+Global compression controls. Use this for mix glue, dialogue/music balancing, and soft limiting behavior.
+
+```vb
+RiffMasterCompressorThreshold = 0.72!
+RiffMasterCompressorRatio = 2.5!
+```
+
+### RiffMasterDrive
+
+```vb
+Public Property Get RiffMasterDrive() As Single
+Public Property Let RiffMasterDrive(ByVal value As Single)
+```
+
+Applies global drive/saturation before final output gain.
+
+```vb
+RiffMasterDrive = 1.08!
+```
+
+Use subtle values for warmth. Heavy values can distort the full mix.
+
+### RiffMasterStereoWidth
+
+```vb
+Public Property Get RiffMasterStereoWidth() As Single
+Public Property Let RiffMasterStereoWidth(ByVal value As Single)
+```
+
+Controls global stereo width. `1.0` is neutral, `0.0` is mono, values above `1.0` widen the mix.
+
+```vb
+RiffMasterStereoWidth = 1.15!
+```
+
+### RiffMasterOutputGain
+
+```vb
+Public Property Get RiffMasterOutputGain() As Single
+Public Property Let RiffMasterOutputGain(ByVal value As Single)
+```
+
+Final output gain after master processing.
+
+```vb
+RiffMasterOutputGain = 0.95!
+```
+
+### RiffMasterClearProcessors
+
+```vb
+Public Sub RiffMasterClearProcessors()
+```
+
+Resets master processing to a clean neutral state.
+
+```vb
+RiffMasterClearProcessors
+```
+
+### RiffMasterApplyPreset
+
+```vb
+Public Sub RiffMasterApplyPreset(ByVal preset As RiffMasterPreset, Optional ByVal amount As Single = 1!)
+```
+
+Applies a master processor preset.
+
+```vb
+RiffMasterApplyPreset RiffMasterFxGlue, 0.7!
+RiffMasterApplyPreset RiffMasterFxCinematic, 0.55!
+RiffMasterApplyPreset RiffMasterFxClean
+```
+
+### Practical Master Preset Usage
+
+```vb
+Public Sub SetNormalMix()
+    RiffMasterApplyPreset RiffMasterFxClean
+    RiffMasterVolume = 1!
+End Sub
+
+Public Sub SetCinematicMix()
+    RiffMasterApplyPreset RiffMasterFxCinematic, 0.65!
+    RiffBusFadeTo RiffBusMusic, 0.5!, 600
+    RiffBusFadeTo RiffBusSfx, 0.85!, 300
+End Sub
+
+Public Sub SetNightMix()
+    RiffMasterApplyPreset RiffMasterFxNight, 0.7!
+    RiffBusFadeTo RiffBusMusic, 0.28!, 800
+    RiffBusFadeTo RiffBusSfx, 0.55!, 300
+End Sub
+```
+
+---
+
 ## Audio Buses API
 
 ### RiffBusVolume
@@ -808,12 +1085,109 @@ Debug.Print "Music bus peak:", l, r
 
 ```vb
 Public Sub RiffBusReset(ByVal busID As RiffBusId)
+Public Sub RiffBusApplyPreset(ByVal busID As RiffBusId, ByVal preset As RiffEffectPreset, Optional ByVal amount As Single = 1!, Optional ByVal persistent As Boolean = True, Optional ByVal applyActive As Boolean = True)
+Public Sub RiffBusClearEffects(ByVal busID As RiffBusId, Optional ByVal clearPersistent As Boolean = True)
+Public Property Get RiffBusPresetEnabled(ByVal busID As RiffBusId) As Boolean
+Public Property Let RiffBusPresetEnabled(ByVal busID As RiffBusId, ByVal value As Boolean)
+Public Property Get RiffBusPreset(ByVal busID As RiffBusId) As RiffEffectPreset
+Public Property Get RiffBusPresetAmount(ByVal busID As RiffBusId) As Single
 ```
 
 Resets a bus to default state: normal volume, no mute, no solo, no pending fade, cleared peak values.
 
 ```vb
 RiffBusReset RiffBusSfx
+```
+
+### RiffBusApplyPreset
+
+```vb
+Public Sub RiffBusApplyPreset( _
+    ByVal busID As RiffBusId, _
+    ByVal preset As RiffEffectPreset, _
+    Optional ByVal amount As Single = 1!, _
+    Optional ByVal persistent As Boolean = True, _
+    Optional ByVal applyActive As Boolean = True _
+)
+```
+
+Applies a voice effect preset to a whole bus.
+
+When `applyActive` is `True`, the preset is applied to voices currently routed to the bus. When `persistent` is `True`, future voices routed to the bus automatically receive the preset as they are created or rerouted.
+
+```vb
+' Apply underwater treatment to current and future music/SFX voices.
+RiffBusApplyPreset RiffBusMusic, RiffFxUnderwater, 0.55!
+RiffBusApplyPreset RiffBusSfx, RiffFxUnderwater, 0.8!
+```
+
+Apply only to future voices:
+
+```vb
+RiffBusApplyPreset RiffBusVoice, RiffFxRadio, 0.65!, True, False
+```
+
+Apply only to currently active voices:
+
+```vb
+RiffBusApplyPreset RiffBusSfx, RiffFxSmallRoom, 0.4!, False, True
+```
+
+### RiffBusClearEffects
+
+```vb
+Public Sub RiffBusClearEffects(ByVal busID As RiffBusId, Optional ByVal clearPersistent As Boolean = True)
+```
+
+Clears effects from active voices on a bus. When `clearPersistent` is `True`, it also removes the stored persistent preset for future voices.
+
+```vb
+RiffBusClearEffects RiffBusMusic
+RiffBusClearEffects RiffBusSfx
+```
+
+Keep the persistent preset but clear only active voices:
+
+```vb
+RiffBusClearEffects RiffBusVoice, False
+```
+
+### RiffBusPresetEnabled
+
+```vb
+Public Property Get RiffBusPresetEnabled(ByVal busID As RiffBusId) As Boolean
+Public Property Let RiffBusPresetEnabled(ByVal busID As RiffBusId, ByVal value As Boolean)
+```
+
+Gets or sets whether the persistent bus preset is enabled.
+
+```vb
+RiffBusPresetEnabled(RiffBusMusic) = False
+RiffBusPresetEnabled(RiffBusMusic) = True
+```
+
+### RiffBusPreset
+
+```vb
+Public Property Get RiffBusPreset(ByVal busID As RiffBusId) As RiffEffectPreset
+```
+
+Returns the stored persistent preset for a bus.
+
+```vb
+Debug.Print RiffBusPreset(RiffBusMusic)
+```
+
+### RiffBusPresetAmount
+
+```vb
+Public Property Get RiffBusPresetAmount(ByVal busID As RiffBusId) As Single
+```
+
+Returns the stored persistent preset amount for a bus.
+
+```vb
+Debug.Print RiffBusPresetAmount(RiffBusMusic)
 ```
 
 ### Bus Pattern: Settings Menu
@@ -1450,6 +1824,98 @@ Public Sub PlayUnderwaterImpact(ByVal buf As Long)
     Dim v As Long
     v = RiffPlay(buf, RiffBusSfx, False, 0.9!)
     If v <> -1 Then RiffVoiceApplyPreset v, RiffFxUnderwater, 1!
+End Sub
+```
+
+---
+
+## Musical Preset Packs
+
+v1.0.9 expands Riff's preset set beyond utility effects into more musical sound-design packs. These presets are still implemented as combinations of existing per-voice DSP controls, so they remain lightweight and compatible with the normal voice pipeline.
+
+### Warm and Tape-Style Presets
+
+```vb
+RiffVoiceApplyPreset v, RiffFxWarmTape, 0.6!
+RiffVoiceApplyPreset v, RiffFxVHS, 0.55!
+RiffVoiceApplyPreset v, RiffFxLoFi, 0.45!
+```
+
+Suggested uses:
+
+| Preset | Use |
+|:---|:---|
+| `RiffFxWarmTape` | Music, ambience, narration, soft retro coloration. |
+| `RiffFxVHS` | Old video, damaged memory, analog scenes. |
+| `RiffFxLoFi` | Old sampler, dusty UI, retro ambience. |
+
+### Space and Ambience Presets
+
+```vb
+RiffVoiceApplyPreset padVoice, RiffFxDreamPad, 0.75!
+RiffVoiceApplyPreset caveVoice, RiffFxDarkCave, 0.8!
+RiffVoiceApplyPreset ambienceVoice, RiffFxSoftFocus, 0.5!
+```
+
+Suggested uses:
+
+| Preset | Use |
+|:---|:---|
+| `RiffFxDreamPad` | Soft pads, dream scenes, emotional ambience. |
+| `RiffFxDarkCave` | Caves, horror scenes, distant indoor ambience. |
+| `RiffFxSoftFocus` | Gentle smoothing for music or dialogue. |
+| `RiffFxAmbient` | General spacious ambience. |
+
+### Speaker and Device Presets
+
+```vb
+RiffVoiceApplyPreset voice, RiffFxTinySpeaker, 0.65!
+RiffVoiceApplyPreset voice, RiffFxMegaphone, 0.7!
+RiffVoiceApplyPreset ui, RiffFxGameBoy, 0.75!
+```
+
+Suggested uses:
+
+| Preset | Use |
+|:---|:---|
+| `RiffFxTinySpeaker` | Phone/laptop/small radio style. |
+| `RiffFxMegaphone` | Announcements, projected voices, PA systems. |
+| `RiffFxGameBoy` | Crunchy handheld game tone. |
+| `RiffFxRadio` | Radio/communication voice. |
+
+### Environmental and Cinematic Presets
+
+```vb
+RiffVoiceApplyPreset windVoice, RiffFxWind, 0.7!
+RiffVoiceApplyPreset rainVoice, RiffFxRain, 0.6!
+RiffVoiceApplyPreset boomVoice, RiffFxCinematicBoom, 0.85!
+RiffVoiceApplyPreset droneVoice, RiffFxHorrorDrone, 0.75!
+```
+
+Suggested uses:
+
+| Preset | Use |
+|:---|:---|
+| `RiffFxWind` | Wind layers, filtered noise, exterior ambience. |
+| `RiffFxRain` | Rain layers and natural noise ambience. |
+| `RiffFxCinematicBoom` | Low impacts, hits, transitions, cinematic UI. |
+| `RiffFxHorrorDrone` | Dark drones and unsettling textures. |
+
+### Bus-Level Preset Pack Usage
+
+Presets can also be applied to entire buses.
+
+```vb
+Public Sub EnterCave()
+    RiffBusApplyPreset RiffBusMusic, RiffFxDarkCave, 0.55!
+    RiffBusApplyPreset RiffBusSfx, RiffFxDarkCave, 0.35!
+    RiffMasterApplyPreset RiffMasterFxDark, 0.5!
+End Sub
+
+Public Sub ExitCave()
+    RiffBusClearEffects RiffBusMusic
+    RiffBusClearEffects RiffBusSfx
+    RiffMasterApplyPreset RiffMasterFxClean
 End Sub
 ```
 
@@ -2118,6 +2584,26 @@ RiffClose
 
 Every active voice has its own DSP chain. Thirty-two voices with reverb, chorus, flanger, delay, compressor, ring mod, and filters all active can become expensive in VBA. Use presets and effects selectively.
 
+### Prefer Bus Presets for Scene-Wide Effects
+
+For global scene states such as underwater, cave, dream, radio, or horror, use bus-level presets instead of manually applying a preset to every individual voice.
+
+```vb
+RiffBusApplyPreset RiffBusMusic, RiffFxUnderwater, 0.55!
+RiffBusApplyPreset RiffBusSfx, RiffFxUnderwater, 0.75!
+```
+
+### Use Master Processors for Final Polish, Not Per-Sound Design
+
+Use voice presets for individual sound design and master presets for broad final mix shaping.
+
+```vb
+RiffVoiceApplyPreset voice, RiffFxRadio, 0.65!
+RiffMasterApplyPreset RiffMasterFxGlue, 0.5!
+```
+
+Avoid stacking heavy master coloration with many already-heavy voice presets unless that is the intended effect.
+
 ---
 
 ## Troubleshooting
@@ -2229,6 +2715,41 @@ Check:
 If Dir$(path) = vbNullString Then Debug.Print "Missing file"
 ```
 
+### A whole bus sounds filtered or processed unexpectedly
+
+Check whether a persistent bus preset is enabled.
+
+```vb
+Debug.Print RiffBusPresetEnabled(RiffBusMusic)
+Debug.Print RiffBusPreset(RiffBusMusic)
+Debug.Print RiffBusPresetAmount(RiffBusMusic)
+```
+
+Clear it if needed:
+
+```vb
+RiffBusClearEffects RiffBusMusic
+```
+
+### The entire mix sounds too dark, compressed, or saturated
+
+Check the master processor state.
+
+```vb
+Debug.Print RiffMasterProcessorEnabled
+Debug.Print RiffMasterLowPass
+Debug.Print RiffMasterDrive
+Debug.Print RiffMasterCompressorThreshold
+Debug.Print RiffMasterCompressorRatio
+```
+
+Reset the master stage:
+
+```vb
+RiffMasterClearProcessors
+RiffMasterApplyPreset RiffMasterFxClean
+```
+
 ---
 
 ## Complete Public API Index
@@ -2239,6 +2760,7 @@ If Dir$(path) = vbNullString Then Debug.Print "Missing file"
 Public Enum RiffWaveType
 Public Enum RiffBusId
 Public Enum RiffEffectPreset
+Public Enum RiffMasterPreset
 Public Enum RiffErrorCode
 ```
 
@@ -2269,11 +2791,37 @@ Public Property Get RiffLastFramesWritten() As Long
 Public Sub RiffResetAdaptiveStats()
 ```
 
-### Master and Buses
+### Master Processors and Buses
 
 ```vb
 Public Property Get RiffMasterVolume() As Single
 Public Property Let RiffMasterVolume(ByVal value As Single)
+Public Property Get RiffSoftClipEnabled() As Boolean
+Public Property Let RiffSoftClipEnabled(ByVal value As Boolean)
+Public Property Get RiffMasterProcessorEnabled() As Boolean
+Public Property Let RiffMasterProcessorEnabled(ByVal value As Boolean)
+Public Property Get RiffMasterLowPass() As Single
+Public Property Let RiffMasterLowPass(ByVal value As Single)
+Public Property Get RiffMasterHighPass() As Single
+Public Property Let RiffMasterHighPass(ByVal value As Single)
+Public Property Get RiffMasterEqBass() As Single
+Public Property Let RiffMasterEqBass(ByVal value As Single)
+Public Property Get RiffMasterEqMid() As Single
+Public Property Let RiffMasterEqMid(ByVal value As Single)
+Public Property Get RiffMasterEqTreble() As Single
+Public Property Let RiffMasterEqTreble(ByVal value As Single)
+Public Property Get RiffMasterCompressorThreshold() As Single
+Public Property Let RiffMasterCompressorThreshold(ByVal value As Single)
+Public Property Get RiffMasterCompressorRatio() As Single
+Public Property Let RiffMasterCompressorRatio(ByVal value As Single)
+Public Property Get RiffMasterDrive() As Single
+Public Property Let RiffMasterDrive(ByVal value As Single)
+Public Property Get RiffMasterStereoWidth() As Single
+Public Property Let RiffMasterStereoWidth(ByVal value As Single)
+Public Property Get RiffMasterOutputGain() As Single
+Public Property Let RiffMasterOutputGain(ByVal value As Single)
+Public Sub RiffMasterClearProcessors()
+Public Sub RiffMasterApplyPreset(ByVal preset As RiffMasterPreset, Optional ByVal amount As Single = 1!)
 Public Sub RiffMasterGetPeak(ByRef peakLeft As Single, ByRef peakRight As Single)
 
 Public Property Get RiffBusVolume(ByVal busID As RiffBusId) As Single
@@ -2285,6 +2833,12 @@ Public Property Let RiffBusSolo(ByVal busID As RiffBusId, ByVal value As Boolean
 Public Sub RiffBusFadeTo(ByVal busID As RiffBusId, ByVal targetVolume As Single, Optional ByVal durationMs As Long = 250)
 Public Sub RiffBusGetPeak(ByVal busID As RiffBusId, ByRef peakLeft As Single, ByRef peakRight As Single)
 Public Sub RiffBusReset(ByVal busID As RiffBusId)
+Public Sub RiffBusApplyPreset(ByVal busID As RiffBusId, ByVal preset As RiffEffectPreset, Optional ByVal amount As Single = 1!, Optional ByVal persistent As Boolean = True, Optional ByVal applyActive As Boolean = True)
+Public Sub RiffBusClearEffects(ByVal busID As RiffBusId, Optional ByVal clearPersistent As Boolean = True)
+Public Property Get RiffBusPresetEnabled(ByVal busID As RiffBusId) As Boolean
+Public Property Let RiffBusPresetEnabled(ByVal busID As RiffBusId, ByVal value As Boolean)
+Public Property Get RiffBusPreset(ByVal busID As RiffBusId) As RiffEffectPreset
+Public Property Get RiffBusPresetAmount(ByVal busID As RiffBusId) As Single
 ```
 
 ### Assets and Export
