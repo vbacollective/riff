@@ -4,9 +4,9 @@ Attribute VB_Name = "Riff"
 ' * @description A high-performance, COM-based WASAPI audio engine for VBA (x86/x64 compatible).
 ' * Contains advanced Array Chunking for zero-latency mixing, Polyphony, and a full
 ' * Studio DSP Pipeline featuring Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad EQ, Bitcrusher,
-' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, and Peak Meters.
+' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, Peak Meters, musical preset packs, and master bus processors.
 ' * @author UesleiDev
-' * @version 1.0.7
+' * @version 1.0.9
 ' */
 
 Option Explicit
@@ -24,11 +24,54 @@ Private Const RIFF_VOICE_COUNT As Long = 32
 '/** @description Highest valid polyphonic voice handle. */
 Private Const RIFF_MAX_VOICE_INDEX As Long = RIFF_VOICE_COUNT - 1
 
+'/** @description Default maximum simultaneous instances of the same static buffer. Use 0 to disable. */
+Private Const RIFF_DEFAULT_MAX_VOICES_PER_BUFFER As Long = 8
+
+'/** @description Default maximum simultaneous voices routed to the same bus. Use 0 to disable. */
+Private Const RIFF_DEFAULT_MAX_VOICES_PER_BUS As Long = 24
+
+'/** @description Voice cap value that disables a cap. */
+Private Const RIFF_VOICE_CAP_DISABLED As Long = 0
+
 '/** @description Total audio bus slots exposed by the engine. */
 Private Const RIFF_BUS_COUNT As Long = 16
 
 '/** @description Highest valid audio bus index. */
 Private Const RIFF_MAX_BUS_INDEX As Long = RIFF_BUS_COUNT - 1
+
+
+'/** @description Default master processor low-pass control. */
+Private Const RIFF_MASTER_DEFAULT_LOWPASS As Single = 1!
+
+'/** @description Default master processor high-pass control. */
+Private Const RIFF_MASTER_DEFAULT_HIGHPASS As Single = 0!
+
+'/** @description Default master processor output gain. */
+Private Const RIFF_MASTER_DEFAULT_OUTPUT_GAIN As Single = 1!
+
+'/** @description Default master processor drive amount. */
+Private Const RIFF_MASTER_DEFAULT_DRIVE As Single = 1!
+
+'/** @description Default master processor compressor threshold. */
+Private Const RIFF_MASTER_DEFAULT_COMP_THRESHOLD As Single = 1!
+
+'/** @description Default master processor compressor ratio. */
+Private Const RIFF_MASTER_DEFAULT_COMP_RATIO As Single = 1!
+
+'/** @description Minimum master compressor envelope floor. */
+Private Const RIFF_MASTER_COMP_ENV_FLOOR As Single = 0.0001!
+
+'/** @description Maximum safe master drive multiplier. */
+Private Const RIFF_MASTER_MAX_DRIVE As Single = 8!
+
+'/** @description Maximum safe master output gain multiplier. */
+Private Const RIFF_MASTER_MAX_OUTPUT_GAIN As Single = 2!
+
+'/** @description Maximum safe master EQ band multiplier. */
+Private Const RIFF_MASTER_MAX_EQ_GAIN As Single = 4!
+
+'/** @description Maximum safe master stereo width multiplier. */
+Private Const RIFF_MASTER_MAX_WIDTH As Single = 3!
 
 
 
@@ -46,6 +89,9 @@ Private Type RiffBus
     PeakR As Single
     Muted As Boolean
     Solo As Boolean
+    FxEnabled As Boolean
+    FxPreset As Long
+    FxAmount As Single
 End Type
 
 #If VBA7 Then
@@ -156,6 +202,29 @@ End Type
         MasterVolume As Single
         MasterPeakL As Single
         MasterPeakR As Single
+        MasterProcessorEnabled As Boolean
+        MasterSoftClipEnabled As Boolean
+        MasterLowPass As Single
+        MasterHighPass As Single
+        MasterEqBass As Single
+        MasterEqMid As Single
+        MasterEqTreble As Single
+        MasterCompressorThreshold As Single
+        MasterCompressorRatio As Single
+        MasterCompressorEnv As Single
+        MasterDrive As Single
+        MasterStereoWidth As Single
+        MasterOutputGain As Single
+        MasterLowPassStateL As Single
+        MasterLowPassStateR As Single
+        MasterHighPassStateL As Single
+        MasterHighPassStateR As Single
+        MasterHighPassPrevL As Single
+        MasterHighPassPrevR As Single
+        MasterEqLowL As Single
+        MasterEqLowR As Single
+        MasterEqHighL As Single
+        MasterEqHighR As Single
         sampleRate As Long
         AvgBytesPerSec As Long
         DeviceEnumerator As LongPtr
@@ -180,6 +249,10 @@ End Type
         TimerCallbackActive As Boolean
         IdleTimerTicks As Long
         AutoSuspendTimer As Boolean
+        PlaySequence As Long
+        MaxVoicesPerBuffer As Long
+        MaxVoicesPerBus As Long
+        VoiceStealingEnabled As Boolean
         HasSoloBus As Boolean
         Buffers(0 To RIFF_MAX_BUFFER_INDEX) As RiffBuffer
         Buses(0 To RIFF_MAX_BUS_INDEX) As RiffBus
@@ -292,6 +365,29 @@ End Type
         MasterVolume As Single
         MasterPeakL As Single
         MasterPeakR As Single
+        MasterProcessorEnabled As Boolean
+        MasterSoftClipEnabled As Boolean
+        MasterLowPass As Single
+        MasterHighPass As Single
+        MasterEqBass As Single
+        MasterEqMid As Single
+        MasterEqTreble As Single
+        MasterCompressorThreshold As Single
+        MasterCompressorRatio As Single
+        MasterCompressorEnv As Single
+        MasterDrive As Single
+        MasterStereoWidth As Single
+        MasterOutputGain As Single
+        MasterLowPassStateL As Single
+        MasterLowPassStateR As Single
+        MasterHighPassStateL As Single
+        MasterHighPassStateR As Single
+        MasterHighPassPrevL As Single
+        MasterHighPassPrevR As Single
+        MasterEqLowL As Single
+        MasterEqLowR As Single
+        MasterEqHighL As Single
+        MasterEqHighR As Single
         sampleRate As Long
         AvgBytesPerSec As Long
         DeviceEnumerator As Long
@@ -316,6 +412,10 @@ End Type
         TimerCallbackActive As Boolean
         IdleTimerTicks As Long
         AutoSuspendTimer As Boolean
+        PlaySequence As Long
+        MaxVoicesPerBuffer As Long
+        MaxVoicesPerBus As Long
+        VoiceStealingEnabled As Boolean
         HasSoloBus As Boolean
         Buffers(0 To RIFF_MAX_BUFFER_INDEX) As RiffBuffer
         Buses(0 To RIFF_MAX_BUS_INDEX) As RiffBus
@@ -378,6 +478,34 @@ Public Enum RiffEffectPreset
     RiffFxWide = 11
     RiffFxRobot = 12
     RiffFxAmbient = 13
+    RiffFxWarmTape = 14
+    RiffFxVHS = 15
+    RiffFxDreamPad = 16
+    RiffFxDarkCave = 17
+    RiffFxTinySpeaker = 18
+    RiffFxMegaphone = 19
+    RiffFxGameBoy = 20
+    RiffFxHorrorDrone = 21
+    RiffFxWind = 22
+    RiffFxRain = 23
+    RiffFxCinematicBoom = 24
+    RiffFxSoftFocus = 25
+End Enum
+
+'/**
+' * @enum RiffMasterPreset
+' * @brief Musical master-bus processor presets for the final mix stage.
+' */
+Public Enum RiffMasterPreset
+    RiffMasterFxClean = 0
+    RiffMasterFxGlue = 1
+    RiffMasterFxWarm = 2
+    RiffMasterFxBright = 3
+    RiffMasterFxDark = 4
+    RiffMasterFxRadio = 5
+    RiffMasterFxCinematic = 6
+    RiffMasterFxNight = 7
+    RiffMasterFxSoftLimiter = 8
 End Enum
 
 '/**
@@ -409,6 +537,7 @@ Private Type RiffVoice
     Playing As Boolean
     Paused As Boolean
     busID As RiffBusId
+    StartSerial As Long
     BufferIndex As Long
 
     IsOscillator As Boolean
@@ -759,6 +888,23 @@ Private Const RIFF_WAV_FORMAT_PCM As Integer = 1
 '/** @description RIFF chunk payload overhead before data bytes. */
 Private Const RIFF_WAV_SIZE_OVERHEAD As Long = 36
 
+'/** @description Internal status returned by the custom WAV fast path when the file should fall back to Media Foundation. */
+Private Const RIFF_FAST_WAV_NOT_HANDLED As Long = -2
+
+'/** @description Internal status returned by the custom WAV fast path when it handled the file but failed fatally. */
+Private Const RIFF_FAST_WAV_FATAL As Long = -3
+
+'/** @description RIFF/WAVE FourCC constants stored as little-endian Long values. */
+Private Const RIFF_FOURCC_RIFF As Long = &H46464952
+Private Const RIFF_FOURCC_WAVE As Long = &H45564157
+Private Const RIFF_FOURCC_FMT As Long = &H20746D66
+Private Const RIFF_FOURCC_DATA As Long = &H61746164
+
+'/** @description PCM8 unsigned midpoint and scale used by the direct WAV loader. */
+Private Const RIFF_PCM8_CENTER As Single = 128!
+Private Const RIFF_PCM8_SCALE As Single = 128!
+
+
 '/** @description PCM16 positive full-scale value. */
 Private Const RIFF_PCM16_MAX As Long = 32767
 
@@ -946,6 +1092,12 @@ Private Const RIFF_BROWN_OUTPUT_GAIN As Single = 3.5!
 
 '/** @description Internal DSP safety clamp for feedback buffers and generated samples. */
 Private Const RIFF_DSP_SAMPLE_LIMIT As Single = 4!
+
+'/** @description Master soft limiter threshold used to avoid hard digital clipping during heavy bursts. */
+Private Const RIFF_MASTER_SOFT_LIMIT_THRESHOLD As Single = 0.85!
+
+'/** @description Inverse headroom used by the master soft limiter curve. */
+Private Const RIFF_MASTER_SOFT_LIMIT_HEADROOM As Single = 0.15!
 
 '/** @description Default voice effect values. */
 Private Const RIFF_DEFAULT_VOICE_VOLUME As Single = 1!
@@ -1149,6 +1301,9 @@ Private Sub RiffResetBusState(ByVal busID As Long)
     rCtx.Buses(busID).PeakR = 0!
     rCtx.Buses(busID).Muted = False
     rCtx.Buses(busID).Solo = False
+    rCtx.Buses(busID).FxEnabled = False
+    rCtx.Buses(busID).FxPreset = CLng(RiffFxDry)
+    rCtx.Buses(busID).FxAmount = 0!
 End Sub
 
 '/**
@@ -1403,6 +1558,7 @@ Public Function RiffOpen() As Boolean
     rCtx.MasterVolume = RIFF_UNITY_GAIN
     rCtx.MasterPeakL = 0!
     rCtx.MasterPeakR = 0!
+    RiffResetMasterProcessorState
     rCtx.RenderPeriodMs = RIFF_RENDER_PERIOD_MS
     rCtx.MaxWriteFrames = 0
     rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_MIN_MS
@@ -1413,6 +1569,10 @@ Public Function RiffOpen() As Boolean
     rCtx.LastPaddingFrames = 0
     rCtx.LastFramesAvailable = 0
     rCtx.LastFramesWritten = 0
+    rCtx.PlaySequence = 0
+    rCtx.MaxVoicesPerBuffer = RIFF_DEFAULT_MAX_VOICES_PER_BUFFER
+    rCtx.MaxVoicesPerBus = RIFF_DEFAULT_MAX_VOICES_PER_BUS
+    rCtx.VoiceStealingEnabled = True
 
     Dim i As Long
     For i = 0 To RIFF_MAX_BUS_INDEX
@@ -1558,6 +1718,102 @@ End Property
 Public Property Get RiffMaxBuses() As Long
     RiffMaxBuses = RIFF_BUS_COUNT
 End Property
+
+'/**
+' * @property RiffVoiceStealingEnabled
+' * @brief Enables or disables automatic voice stealing when rapid playback fills the voice pool.
+' * @return {Boolean} True when voice stealing is enabled.
+' */
+Public Property Get RiffVoiceStealingEnabled() As Boolean
+    RiffVoiceStealingEnabled = rCtx.VoiceStealingEnabled
+End Property
+
+'/**
+' * @property RiffVoiceStealingEnabled
+' * @brief Enables or disables automatic voice stealing when rapid playback fills the voice pool.
+' * @param value True to enable voice stealing.
+' */
+Public Property Let RiffVoiceStealingEnabled(ByVal value As Boolean)
+    rCtx.VoiceStealingEnabled = value
+End Property
+
+'/**
+' * @property RiffMaxVoicesPerBuffer
+' * @brief Maximum simultaneous instances allowed for the same static buffer on the same bus. Use 0 to disable.
+' * @return {Long} Current per-buffer voice cap.
+' */
+Public Property Get RiffMaxVoicesPerBuffer() As Long
+    RiffMaxVoicesPerBuffer = rCtx.MaxVoicesPerBuffer
+End Property
+
+'/**
+' * @property RiffMaxVoicesPerBuffer
+' * @brief Maximum simultaneous instances allowed for the same static buffer on the same bus. Use 0 to disable.
+' * @param value New cap from 0 to RiffMaxVoices.
+' */
+Public Property Let RiffMaxVoicesPerBuffer(ByVal value As Long)
+    If value < RIFF_VOICE_CAP_DISABLED Then value = RIFF_VOICE_CAP_DISABLED
+    If value > RIFF_VOICE_COUNT Then value = RIFF_VOICE_COUNT
+    rCtx.MaxVoicesPerBuffer = value
+End Property
+
+'/**
+' * @property RiffMaxVoicesPerBus
+' * @brief Maximum simultaneous voices allowed on one mixer bus. Use 0 to disable.
+' * @return {Long} Current per-bus voice cap.
+' */
+Public Property Get RiffMaxVoicesPerBus() As Long
+    RiffMaxVoicesPerBus = rCtx.MaxVoicesPerBus
+End Property
+
+'/**
+' * @property RiffMaxVoicesPerBus
+' * @brief Maximum simultaneous voices allowed on one mixer bus. Use 0 to disable.
+' * @param value New cap from 0 to RiffMaxVoices.
+' */
+Public Property Let RiffMaxVoicesPerBus(ByVal value As Long)
+    If value < RIFF_VOICE_CAP_DISABLED Then value = RIFF_VOICE_CAP_DISABLED
+    If value > RIFF_VOICE_COUNT Then value = RIFF_VOICE_COUNT
+    rCtx.MaxVoicesPerBus = value
+End Property
+
+'/**
+' * @function RiffActiveVoiceCount
+' * @brief Counts currently active and playing voices across all buses.
+' * @return {Long} Number of active playing voices.
+' */
+Public Function RiffActiveVoiceCount() As Long
+    Dim i As Long
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active And rVoices(i).Playing Then
+            RiffActiveVoiceCount = RiffActiveVoiceCount + 1
+        End If
+    Next i
+End Function
+
+'/**
+' * @function RiffBusVoiceCount
+' * @brief Counts currently active and playing voices on a mixer bus.
+' * @param busID Bus to inspect.
+' * @return {Long} Number of active voices on the bus.
+' */
+Public Function RiffBusVoiceCount(ByVal busID As RiffBusId) As Long
+    busID = RiffClampBusId(busID)
+    RiffBusVoiceCount = RiffCountVoicesForBus(busID)
+End Function
+
+'/**
+' * @function RiffBufferVoiceCount
+' * @brief Counts currently active and playing instances of a static buffer on a mixer bus.
+' * @param bufferHandle Static buffer handle.
+' * @param busID Optional bus filter.
+' * @return {Long} Number of active matching voices.
+' */
+Public Function RiffBufferVoiceCount(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain) As Long
+    If Not RiffRequireBufferHandle(bufferHandle) Then Exit Function
+    busID = RiffClampBusId(busID)
+    RiffBufferVoiceCount = RiffCountVoicesForBuffer(bufferHandle, busID)
+End Function
 
 '/**
 ' * @property RiffMasterVolume
@@ -1747,6 +2003,366 @@ Public Sub RiffBusReset(ByVal busID As RiffBusId)
 End Sub
 
 '/**
+' * @function RiffBusApplyPreset
+' * @brief Applies a high-level DSP preset to all active voices routed to a bus and optionally makes it persistent for future voices.
+' * @param busID The target bus index.
+' * @param preset Built-in RiffEffectPreset value.
+' * @param amount Preset strength from 0 to 1.
+' * @param persistent True to make newly-created voices on this bus inherit the preset.
+' * @param applyActive True to apply immediately to voices already routed to this bus.
+' */
+Public Sub RiffBusApplyPreset(ByVal busID As RiffBusId, ByVal preset As RiffEffectPreset, Optional ByVal amount As Single = 1!, Optional ByVal persistent As Boolean = True, Optional ByVal applyActive As Boolean = True)
+    Dim i As Long
+
+    If Not RiffRequireInitialized() Then
+        Exit Sub
+    End If
+
+    busID = RiffClampBusId(busID)
+    amount = RiffClampUnit(amount)
+
+    If Not RiffIsValidEffectPreset(preset) Then
+        RiffSetLastError RiffErrorInvalidArgument
+        Exit Sub
+    End If
+
+    If persistent Then
+        If amount <= 0! Or preset = RiffFxDry Then
+            rCtx.Buses(busID).FxEnabled = False
+            rCtx.Buses(busID).FxPreset = CLng(RiffFxDry)
+            rCtx.Buses(busID).FxAmount = 0!
+        Else
+            rCtx.Buses(busID).FxEnabled = True
+            rCtx.Buses(busID).FxPreset = CLng(preset)
+            rCtx.Buses(busID).FxAmount = amount
+        End If
+    End If
+
+    If Not applyActive Then
+        Exit Sub
+    End If
+
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active Then
+            If rVoices(i).busID = busID Then
+                If amount <= 0! Or preset = RiffFxDry Then
+                    InternalClearVoiceEffects i
+                Else
+                    RiffVoiceApplyPreset i, preset, amount
+                End If
+            End If
+        End If
+    Next i
+End Sub
+
+'/**
+' * @function RiffBusClearEffects
+' * @brief Clears DSP effects from all active voices routed to a bus and optionally removes the persistent bus preset.
+' * @param busID The target bus index.
+' * @param clearPersistent True to stop future voices on this bus from inheriting an effect preset.
+' */
+Public Sub RiffBusClearEffects(ByVal busID As RiffBusId, Optional ByVal clearPersistent As Boolean = True)
+    Dim i As Long
+
+    If Not RiffRequireInitialized() Then
+        Exit Sub
+    End If
+
+    busID = RiffClampBusId(busID)
+
+    If clearPersistent Then
+        rCtx.Buses(busID).FxEnabled = False
+        rCtx.Buses(busID).FxPreset = CLng(RiffFxDry)
+        rCtx.Buses(busID).FxAmount = 0!
+    End If
+
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active Then
+            If rVoices(i).busID = busID Then
+                InternalClearVoiceEffects i
+            End If
+        End If
+    Next i
+End Sub
+
+'/**
+' * @property RiffBusPresetEnabled
+' * @brief Gets or sets whether newly-created voices on a bus inherit the stored bus effect preset.
+' * @param busID The target bus index.
+' */
+Public Property Get RiffBusPresetEnabled(ByVal busID As RiffBusId) As Boolean
+    If Not RiffRequireInitialized() Then
+        Exit Property
+    End If
+
+    busID = RiffClampBusId(busID)
+    RiffBusPresetEnabled = rCtx.Buses(busID).FxEnabled
+End Property
+Public Property Let RiffBusPresetEnabled(ByVal busID As RiffBusId, ByVal value As Boolean)
+    If Not RiffRequireInitialized() Then
+        Exit Property
+    End If
+
+    busID = RiffClampBusId(busID)
+    rCtx.Buses(busID).FxEnabled = value
+    If Not value Then
+        rCtx.Buses(busID).FxPreset = CLng(RiffFxDry)
+        rCtx.Buses(busID).FxAmount = 0!
+    End If
+End Property
+
+'/**
+' * @property RiffBusPreset
+' * @brief Returns the persistent effect preset currently stored on a bus.
+' * @param busID The target bus index.
+' */
+Public Property Get RiffBusPreset(ByVal busID As RiffBusId) As RiffEffectPreset
+    If Not RiffRequireInitialized() Then
+        RiffBusPreset = RiffFxDry
+        Exit Property
+    End If
+
+    busID = RiffClampBusId(busID)
+    RiffBusPreset = rCtx.Buses(busID).FxPreset
+End Property
+
+'/**
+' * @property RiffBusPresetAmount
+' * @brief Returns the persistent effect preset amount currently stored on a bus.
+' * @param busID The target bus index.
+' */
+Public Property Get RiffBusPresetAmount(ByVal busID As RiffBusId) As Single
+    If Not RiffRequireInitialized() Then
+        Exit Property
+    End If
+
+    busID = RiffClampBusId(busID)
+    RiffBusPresetAmount = rCtx.Buses(busID).FxAmount
+End Property
+
+
+'/**
+' * @property RiffSoftClipEnabled
+' * @brief Enables or disables the final master soft clipper.
+' */
+Public Property Get RiffSoftClipEnabled() As Boolean
+    RiffSoftClipEnabled = rCtx.MasterSoftClipEnabled
+End Property
+Public Property Let RiffSoftClipEnabled(ByVal value As Boolean)
+    rCtx.MasterSoftClipEnabled = value
+End Property
+
+'/**
+' * @property RiffMasterProcessorEnabled
+' * @brief Enables or disables the additional master processor stage while preserving its settings.
+' */
+Public Property Get RiffMasterProcessorEnabled() As Boolean
+    RiffMasterProcessorEnabled = rCtx.MasterProcessorEnabled
+End Property
+Public Property Let RiffMasterProcessorEnabled(ByVal value As Boolean)
+    rCtx.MasterProcessorEnabled = value
+End Property
+
+'/**
+' * @property RiffMasterLowPass
+' * @brief Final mix low-pass control. 1.0 is open/neutral, lower values darken the whole mix.
+' */
+Public Property Get RiffMasterLowPass() As Single
+    RiffMasterLowPass = rCtx.MasterLowPass
+End Property
+Public Property Let RiffMasterLowPass(ByVal value As Single)
+    If value < RIFF_MIN_LOWPASS_CONTROL Then value = RIFF_MIN_LOWPASS_CONTROL
+    If value > 1! Then value = 1!
+    rCtx.MasterLowPass = value
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterHighPass
+' * @brief Final mix high-pass control. 0.0 is neutral, higher values remove more low end.
+' */
+Public Property Get RiffMasterHighPass() As Single
+    RiffMasterHighPass = rCtx.MasterHighPass
+End Property
+Public Property Let RiffMasterHighPass(ByVal value As Single)
+    rCtx.MasterHighPass = RiffClampUnit(value)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterEqBass
+' * @brief Final mix low-band gain. 1.0 is neutral.
+' */
+Public Property Get RiffMasterEqBass() As Single
+    RiffMasterEqBass = rCtx.MasterEqBass
+End Property
+Public Property Let RiffMasterEqBass(ByVal value As Single)
+    rCtx.MasterEqBass = RiffClamp(value, 0!, RIFF_MASTER_MAX_EQ_GAIN)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterEqMid
+' * @brief Final mix mid-band gain. 1.0 is neutral.
+' */
+Public Property Get RiffMasterEqMid() As Single
+    RiffMasterEqMid = rCtx.MasterEqMid
+End Property
+Public Property Let RiffMasterEqMid(ByVal value As Single)
+    rCtx.MasterEqMid = RiffClamp(value, 0!, RIFF_MASTER_MAX_EQ_GAIN)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterEqTreble
+' * @brief Final mix high-band gain. 1.0 is neutral.
+' */
+Public Property Get RiffMasterEqTreble() As Single
+    RiffMasterEqTreble = rCtx.MasterEqTreble
+End Property
+Public Property Let RiffMasterEqTreble(ByVal value As Single)
+    rCtx.MasterEqTreble = RiffClamp(value, 0!, RIFF_MASTER_MAX_EQ_GAIN)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterCompressorThreshold
+' * @brief Final mix compressor threshold. 1.0 disables compression with the default ratio.
+' */
+Public Property Get RiffMasterCompressorThreshold() As Single
+    RiffMasterCompressorThreshold = rCtx.MasterCompressorThreshold
+End Property
+Public Property Let RiffMasterCompressorThreshold(ByVal value As Single)
+    rCtx.MasterCompressorThreshold = RiffClamp(value, 0.05!, 1!)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterCompressorRatio
+' * @brief Final mix compressor ratio. 1.0 is neutral.
+' */
+Public Property Get RiffMasterCompressorRatio() As Single
+    RiffMasterCompressorRatio = rCtx.MasterCompressorRatio
+End Property
+Public Property Let RiffMasterCompressorRatio(ByVal value As Single)
+    rCtx.MasterCompressorRatio = RiffClamp(value, 1!, RIFF_MAX_COMPRESSOR_RATIO)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterDrive
+' * @brief Final mix musical drive before the output stage. 1.0 is neutral.
+' */
+Public Property Get RiffMasterDrive() As Single
+    RiffMasterDrive = rCtx.MasterDrive
+End Property
+Public Property Let RiffMasterDrive(ByVal value As Single)
+    rCtx.MasterDrive = RiffClamp(value, 1!, RIFF_MASTER_MAX_DRIVE)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterStereoWidth
+' * @brief Final mix stereo width. 1.0 is neutral, 0.0 is mono.
+' */
+Public Property Get RiffMasterStereoWidth() As Single
+    RiffMasterStereoWidth = rCtx.MasterStereoWidth
+End Property
+Public Property Let RiffMasterStereoWidth(ByVal value As Single)
+    rCtx.MasterStereoWidth = RiffClamp(value, 0!, RIFF_MASTER_MAX_WIDTH)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterOutputGain
+' * @brief Final output gain after master processing and before soft clipping.
+' */
+Public Property Get RiffMasterOutputGain() As Single
+    RiffMasterOutputGain = rCtx.MasterOutputGain
+End Property
+Public Property Let RiffMasterOutputGain(ByVal value As Single)
+    rCtx.MasterOutputGain = RiffClamp(value, 0!, RIFF_MASTER_MAX_OUTPUT_GAIN)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @function RiffMasterClearProcessors
+' * @brief Resets the additional master processor chain to a clean neutral state.
+' */
+Public Sub RiffMasterClearProcessors()
+    RiffResetMasterProcessorState
+End Sub
+
+'/**
+' * @function RiffMasterApplyPreset
+' * @brief Applies a musical master-bus processor preset to the final mix stage.
+' * @param preset Master preset to apply.
+' * @param amount Preset strength from 0 to 1.
+' */
+Public Sub RiffMasterApplyPreset(ByVal preset As RiffMasterPreset, Optional ByVal amount As Single = 1!)
+    amount = RiffClampUnit(amount)
+    RiffResetMasterProcessorState
+
+    If amount <= 0! Or preset = RiffMasterFxClean Then
+        Exit Sub
+    End If
+
+    Select Case preset
+        Case RiffMasterFxGlue
+            rCtx.MasterCompressorThreshold = 0.78! - (0.18! * amount)
+            rCtx.MasterCompressorRatio = 1.2! + (1.4! * amount)
+            rCtx.MasterOutputGain = 1! + (0.04! * amount)
+        Case RiffMasterFxWarm
+            rCtx.MasterDrive = 1! + (0.35! * amount)
+            rCtx.MasterEqBass = 1! + (0.12! * amount)
+            rCtx.MasterEqMid = 1! + (0.04! * amount)
+            rCtx.MasterEqTreble = 1! - (0.1! * amount)
+            rCtx.MasterLowPass = 1! - (0.08! * amount)
+        Case RiffMasterFxBright
+            rCtx.MasterEqBass = 1! - (0.08! * amount)
+            rCtx.MasterEqMid = 1! + (0.02! * amount)
+            rCtx.MasterEqTreble = 1! + (0.2! * amount)
+            rCtx.MasterHighPass = 0.025! * amount
+        Case RiffMasterFxDark
+            rCtx.MasterLowPass = 1! - (0.35! * amount)
+            If rCtx.MasterLowPass < 0.45! Then rCtx.MasterLowPass = 0.45!
+            rCtx.MasterEqTreble = 1! - (0.3! * amount)
+            rCtx.MasterEqBass = 1! + (0.06! * amount)
+        Case RiffMasterFxRadio
+            rCtx.MasterLowPass = 1! - (0.5! * amount)
+            If rCtx.MasterLowPass < 0.5! Then rCtx.MasterLowPass = 0.5!
+            rCtx.MasterHighPass = 0.18! * amount
+            rCtx.MasterEqBass = 1! - (0.45! * amount)
+            rCtx.MasterEqMid = 1! + (0.35! * amount)
+            rCtx.MasterEqTreble = 1! - (0.18! * amount)
+            rCtx.MasterCompressorThreshold = 0.68! - (0.18! * amount)
+            rCtx.MasterCompressorRatio = 1.4! + (2.2! * amount)
+        Case RiffMasterFxCinematic
+            rCtx.MasterEqBass = 1! + (0.2! * amount)
+            rCtx.MasterEqMid = 1! - (0.08! * amount)
+            rCtx.MasterEqTreble = 1! + (0.1! * amount)
+            rCtx.MasterStereoWidth = 1! + (0.25! * amount)
+            rCtx.MasterCompressorThreshold = 0.82! - (0.12! * amount)
+            rCtx.MasterCompressorRatio = 1.15! + (0.85! * amount)
+        Case RiffMasterFxNight
+            rCtx.MasterLowPass = 1! - (0.22! * amount)
+            rCtx.MasterHighPass = 0.015! * amount
+            rCtx.MasterEqTreble = 1! - (0.18! * amount)
+            rCtx.MasterStereoWidth = 1! - (0.18! * amount)
+            rCtx.MasterOutputGain = 1! - (0.1! * amount)
+        Case RiffMasterFxSoftLimiter
+            rCtx.MasterCompressorThreshold = 0.72! - (0.15! * amount)
+            rCtx.MasterCompressorRatio = 2! + (4! * amount)
+            rCtx.MasterDrive = 1! + (0.08! * amount)
+        Case Else
+            RiffSetLastError RiffErrorInvalidArgument
+            Exit Sub
+    End Select
+
+    RiffUpdateMasterProcessorEnabled
+End Sub
+
+'/**
 ' * @function RiffMasterGetPeak
 ' * @brief Retrieves the absolute peak amplitude of the master output for VU Meters.
 ' * @param peakLeft Variable to store the left channel peak.
@@ -1766,6 +2382,7 @@ End Sub
 '/**
 ' * @function RiffLoad
 ' * @brief Decodes an audio file from disk into memory for zero-latency playback.
+' * @description PCM WAV files use a direct RIFF parser fast path before falling back to Media Foundation.
 ' * @param filePath Full path to the audio file (WAV, MP3, etc.).
 ' * @return {Long} Buffer handle (0-63), or -1 if failed.
 ' */
@@ -1933,6 +2550,402 @@ Public Function RiffLoadFromMemory(ByRef audioData() As Byte) As Long
     End If
 End Function
 
+
+'/**
+' * @function RiffTryLoadWavFast
+' * @brief Loads PCM/float WAV files through a direct RIFF parser, bypassing Media Foundation for faster startup.
+' * @param filePath WAV file path.
+' * @param slot Target buffer slot.
+' * @return {Long} Buffer handle on success, RIFF_FAST_WAV_NOT_HANDLED for fallback, or RIFF_FAST_WAV_FATAL on fatal failure.
+' */
+Private Function RiffTryLoadWavFast(ByVal filePath As String, ByVal slot As Long) As Long
+    RiffTryLoadWavFast = RIFF_FAST_WAV_NOT_HANDLED
+
+    If LenB(filePath) = 0 Then
+        Exit Function
+    End If
+
+    If LCase$(Right$(filePath, 4)) <> ".wav" Then
+        Exit Function
+    End If
+
+    Dim f As Integer
+    Dim fileSize As Long
+    Dim wavBytes() As Byte
+
+    f = FreeFile
+    Open filePath For Binary Access Read As #f
+    fileSize = LOF(f)
+    If fileSize < 44 Then
+        Close #f
+        Exit Function
+    End If
+
+    ReDim wavBytes(0 To fileSize - 1)
+    Get #f, , wavBytes
+    Close #f
+
+    If RiffReadFourCC(wavBytes, 0) <> RIFF_FOURCC_RIFF Then
+        Exit Function
+    End If
+    If RiffReadFourCC(wavBytes, 8) <> RIFF_FOURCC_WAVE Then
+        Exit Function
+    End If
+
+    Dim cursor As Long
+    Dim chunkId As Long
+    Dim chunkSize As Long
+    Dim chunkData As Long
+    Dim fmtOffset As Long
+    Dim fmtSize As Long
+    Dim dataOffset As Long
+    Dim dataSize As Long
+
+    cursor = 12
+    Do While cursor + 8 <= fileSize
+        chunkId = RiffReadFourCC(wavBytes, cursor)
+        chunkSize = RiffReadLongLE(wavBytes, cursor + 4)
+        If chunkSize < 0 Then
+            RiffSetLastError RiffErrorDecodeFailed
+            RiffTryLoadWavFast = RIFF_FAST_WAV_FATAL
+            Exit Function
+        End If
+
+        chunkData = cursor + 8
+        If chunkData + chunkSize > fileSize Then
+            RiffSetLastError RiffErrorDecodeFailed
+            RiffTryLoadWavFast = RIFF_FAST_WAV_FATAL
+            Exit Function
+        End If
+
+        If chunkId = RIFF_FOURCC_FMT Then
+            fmtOffset = chunkData
+            fmtSize = chunkSize
+        ElseIf chunkId = RIFF_FOURCC_DATA Then
+            dataOffset = chunkData
+            dataSize = chunkSize
+        End If
+
+        cursor = chunkData + chunkSize
+        If (chunkSize And 1) <> 0 Then
+            cursor = cursor + 1
+        End If
+
+        If fmtOffset <> 0 And dataOffset <> 0 Then
+            Exit Do
+        End If
+    Loop
+
+    If fmtOffset = 0 Or dataOffset = 0 Or fmtSize < 16 Or dataSize <= 0 Then
+        RiffSetLastError RiffErrorDecodeFailed
+        RiffTryLoadWavFast = RIFF_FAST_WAV_FATAL
+        Exit Function
+    End If
+
+    Dim srcFormat As Integer
+    Dim srcChannels As Integer
+    Dim srcSampleRate As Long
+    Dim srcBlockAlign As Integer
+    Dim srcBits As Integer
+    Dim srcIsFloat As Boolean
+    Dim srcSubFormat As Long
+
+    srcFormat = RiffReadInt16LE(wavBytes, fmtOffset)
+    srcChannels = RiffReadInt16LE(wavBytes, fmtOffset + 2)
+    srcSampleRate = RiffReadLongLE(wavBytes, fmtOffset + 4)
+    srcBlockAlign = RiffReadInt16LE(wavBytes, fmtOffset + 12)
+    srcBits = RiffReadInt16LE(wavBytes, fmtOffset + 14)
+
+    If srcFormat = RIFF_WAVE_FORMAT_EXTENSIBLE Then
+        If fmtSize < 40 Then
+            RiffTryLoadWavFast = RIFF_FAST_WAV_NOT_HANDLED
+            Exit Function
+        End If
+
+        srcSubFormat = RiffReadLongLE(wavBytes, fmtOffset + RIFF_WFX_SUBFORMAT_OFFSET)
+        If srcSubFormat = RIFF_WAV_FORMAT_PCM Then
+            srcFormat = RIFF_WAV_FORMAT_PCM
+        ElseIf srcSubFormat = RIFF_WAVE_FORMAT_IEEE_FLOAT Then
+            srcFormat = CInt(RIFF_WAVE_FORMAT_IEEE_FLOAT)
+        Else
+            RiffTryLoadWavFast = RIFF_FAST_WAV_NOT_HANDLED
+            Exit Function
+        End If
+    End If
+
+    srcIsFloat = (CLng(srcFormat) = RIFF_WAVE_FORMAT_IEEE_FLOAT)
+
+    If srcChannels < 1 Or srcChannels > 2 Then
+        RiffTryLoadWavFast = RIFF_FAST_WAV_NOT_HANDLED
+        Exit Function
+    End If
+    If srcSampleRate <= 0 Or srcBlockAlign <= 0 Then
+        RiffTryLoadWavFast = RIFF_FAST_WAV_NOT_HANDLED
+        Exit Function
+    End If
+    If srcFormat <> RIFF_WAV_FORMAT_PCM And Not srcIsFloat Then
+        RiffTryLoadWavFast = RIFF_FAST_WAV_NOT_HANDLED
+        Exit Function
+    End If
+    If Not RiffWavBitsSupported(srcBits, srcIsFloat) Then
+        RiffTryLoadWavFast = RIFF_FAST_WAV_NOT_HANDLED
+        Exit Function
+    End If
+
+    Dim mixChannels As Integer
+    Dim mixSampleRate As Long
+    Dim mixBlockAlign As Integer
+    Dim mixBits As Integer
+    Dim mixIsFloat As Boolean
+
+    RtlMoveMemory VarPtr(mixChannels), ByVal (rCtx.MixFormatPtr + RIFF_WFX_CHANNELS_OFFSET), LenB(mixChannels)
+    RtlMoveMemory VarPtr(mixSampleRate), ByVal (rCtx.MixFormatPtr + RIFF_WFX_SAMPLE_RATE_OFFSET), LenB(mixSampleRate)
+    RtlMoveMemory VarPtr(mixBlockAlign), ByVal (rCtx.MixFormatPtr + RIFF_WFX_BLOCK_ALIGN_OFFSET), LenB(mixBlockAlign)
+    RtlMoveMemory VarPtr(mixBits), ByVal (rCtx.MixFormatPtr + RIFF_WFX_BITS_OFFSET), LenB(mixBits)
+    mixIsFloat = RiffMixFormatIsFloat32()
+
+    If mixChannels < 1 Or mixChannels > 2 Or mixSampleRate <= 0 Or mixBlockAlign <= 0 Then
+        RiffTryLoadWavFast = RIFF_FAST_WAV_NOT_HANDLED
+        Exit Function
+    End If
+    If Not RiffWavBitsSupported(mixBits, mixIsFloat) Then
+        RiffTryLoadWavFast = RIFF_FAST_WAV_NOT_HANDLED
+        Exit Function
+    End If
+
+    Dim srcFrames As Long
+    Dim outFrames As Long
+    Dim outBytes As Long
+
+    srcFrames = dataSize \ CLng(srcBlockAlign)
+    If srcFrames <= 0 Then
+        RiffSetLastError RiffErrorDecodeFailed
+        RiffTryLoadWavFast = RIFF_FAST_WAV_FATAL
+        Exit Function
+    End If
+
+    dataSize = srcFrames * CLng(srcBlockAlign)
+
+    If srcSampleRate = mixSampleRate Then
+        outFrames = srcFrames
+    Else
+        outFrames = CLng((CDbl(srcFrames) * CDbl(mixSampleRate)) / CDbl(srcSampleRate))
+        If outFrames <= 0 Then
+            outFrames = 1
+        End If
+    End If
+
+    outBytes = outFrames * CLng(mixBlockAlign)
+
+    #If VBA7 Then
+        Dim pOut As LongPtr
+        Dim pBytes As LongPtr
+    #Else
+        Dim pOut As Long
+        Dim pBytes As Long
+    #End If
+
+    pOut = VirtualAlloc(0, outBytes, MEM_COMMIT Or MEM_RESERVE, PAGE_READWRITE)
+    If pOut = 0 Then
+        RiffSetLastError RiffErrorMemoryAllocation
+        RiffTryLoadWavFast = RIFF_FAST_WAV_FATAL
+        Exit Function
+    End If
+
+    If Not RiffTryGetByteArrayData(wavBytes, pBytes, fileSize) Then
+        VirtualFree pOut, 0, MEM_RELEASE
+        RiffSetLastError RiffErrorMemoryAllocation
+        RiffTryLoadWavFast = RIFF_FAST_WAV_FATAL
+        Exit Function
+    End If
+
+    If srcSampleRate = mixSampleRate And srcChannels = mixChannels And srcBits = mixBits And srcIsFloat = mixIsFloat And srcBlockAlign = mixBlockAlign Then
+        RtlMoveMemory ByVal pOut, ByVal (pBytes + dataOffset), dataSize
+    Else
+        RiffConvertWavToMixBuffer wavBytes, dataOffset, srcFrames, srcChannels, srcSampleRate, srcBlockAlign, srcBits, srcIsFloat, pOut, outFrames, mixChannels, mixSampleRate, mixBlockAlign, mixBits, mixIsFloat
+    End If
+
+    rCtx.Buffers(slot).BufferPtr = pOut
+    rCtx.Buffers(slot).BufferLen = outBytes
+    rCtx.Buffers(slot).Active = True
+
+    RiffSetLastError RiffErrorNone
+    RiffTryLoadWavFast = slot
+End Function
+
+'/**
+' * @function RiffWavBitsSupported
+' * @brief Checks whether a sample format can be read or written by the direct WAV fast path.
+' */
+Private Function RiffWavBitsSupported(ByVal bitsPerSample As Integer, ByVal isFloat As Boolean) As Boolean
+    If isFloat Then
+        RiffWavBitsSupported = (bitsPerSample = RIFF_FLOAT32_BITS)
+    Else
+        RiffWavBitsSupported = (bitsPerSample = 8 Or bitsPerSample = RIFF_PCM16_BITS Or bitsPerSample = RIFF_PCM24_BITS Or bitsPerSample = RIFF_FLOAT32_BITS)
+    End If
+End Function
+
+'/**
+' * @function RiffConvertWavToMixBuffer
+' * @brief Converts PCM/float WAV frames into the current WASAPI mix buffer format.
+' */
+#If VBA7 Then
+Private Sub RiffConvertWavToMixBuffer(ByRef wavBytes() As Byte, ByVal dataOffset As Long, ByVal srcFrames As Long, ByVal srcChannels As Integer, ByVal srcSampleRate As Long, ByVal srcBlockAlign As Integer, ByVal srcBits As Integer, ByVal srcIsFloat As Boolean, ByVal pOut As LongPtr, ByVal outFrames As Long, ByVal mixChannels As Integer, ByVal mixSampleRate As Long, ByVal mixBlockAlign As Integer, ByVal mixBits As Integer, ByVal mixIsFloat As Boolean)
+#Else
+Private Sub RiffConvertWavToMixBuffer(ByRef wavBytes() As Byte, ByVal dataOffset As Long, ByVal srcFrames As Long, ByVal srcChannels As Integer, ByVal srcSampleRate As Long, ByVal srcBlockAlign As Integer, ByVal srcBits As Integer, ByVal srcIsFloat As Boolean, ByVal pOut As Long, ByVal outFrames As Long, ByVal mixChannels As Integer, ByVal mixSampleRate As Long, ByVal mixBlockAlign As Integer, ByVal mixBits As Integer, ByVal mixIsFloat As Boolean)
+#End If
+    Dim outFrame As Long
+    Dim outCh As Long
+    Dim srcFrame As Long
+    Dim srcCh As Long
+    Dim sample As Single
+    Dim srcRatio As Double
+
+    If outFrames <= 0 Or srcFrames <= 0 Then
+        Exit Sub
+    End If
+
+    srcRatio = CDbl(srcSampleRate) / CDbl(mixSampleRate)
+
+    For outFrame = 0 To outFrames - 1
+        If srcSampleRate = mixSampleRate Then
+            srcFrame = outFrame
+        Else
+            srcFrame = CLng(CDbl(outFrame) * srcRatio)
+        End If
+
+        If srcFrame < 0 Then
+            srcFrame = 0
+        ElseIf srcFrame >= srcFrames Then
+            srcFrame = srcFrames - 1
+        End If
+
+        For outCh = 0 To mixChannels - 1
+            If srcChannels = 1 Then
+                srcCh = 0
+            ElseIf outCh >= srcChannels Then
+                srcCh = srcChannels - 1
+            Else
+                srcCh = outCh
+            End If
+
+            sample = RiffReadWavByteSample(wavBytes, dataOffset, srcFrame, srcCh, srcChannels, srcBlockAlign, srcBits, srcIsFloat)
+            RiffWriteMixByteSample pOut, outFrame, outCh, mixChannels, mixBlockAlign, mixBits, mixIsFloat, sample
+        Next outCh
+    Next outFrame
+End Sub
+
+'/**
+' * @function RiffReadWavByteSample
+' * @brief Reads and normalizes one sample from a WAV byte array.
+' */
+Private Function RiffReadWavByteSample(ByRef wavBytes() As Byte, ByVal dataOffset As Long, ByVal frameIndex As Long, ByVal channelIndex As Long, ByVal nChannels As Integer, ByVal nBlockAlign As Integer, ByVal wBits As Integer, ByVal isFloat As Boolean) As Single
+    Dim pSample As Long
+    pSample = dataOffset + (frameIndex * CLng(nBlockAlign)) + (channelIndex * (CLng(wBits) \ 8))
+
+    If isFloat Then
+        Dim f As Single
+        RtlMoveMemory VarPtr(f), VarPtr(wavBytes(pSample)), LenB(f)
+        RiffReadWavByteSample = RiffSanitizeSample(f)
+    ElseIf wBits = RIFF_FLOAT32_BITS Then
+        Dim l As Long
+        RtlMoveMemory VarPtr(l), VarPtr(wavBytes(pSample)), LenB(l)
+        RiffReadWavByteSample = CSng(CDbl(l) / RIFF_PCM32_SCALE)
+    ElseIf wBits = RIFF_PCM24_BITS Then
+        Dim b0 As Byte
+        Dim b1 As Byte
+        Dim b2 As Byte
+        Dim v As Long
+
+        b0 = wavBytes(pSample)
+        b1 = wavBytes(pSample + 1)
+        b2 = wavBytes(pSample + 2)
+        v = CLng(b0) Or (CLng(b1) * RIFF_BYTE_SHIFT_8) Or (CLng(b2) * RIFF_BYTE_SHIFT_16)
+        If (b2 And RIFF_PCM24_SIGN_BIT) <> 0 Then
+            v = v Or RIFF_PCM24_SIGN_EXTEND
+        End If
+        RiffReadWavByteSample = CSng(CDbl(v) / RIFF_PCM24_SCALE)
+    ElseIf wBits = RIFF_PCM16_BITS Then
+        Dim i As Integer
+        RtlMoveMemory VarPtr(i), VarPtr(wavBytes(pSample)), LenB(i)
+        RiffReadWavByteSample = CSng(CDbl(i) / CDbl(RIFF_PCM16_MIN_MAGNITUDE))
+    ElseIf wBits = 8 Then
+        RiffReadWavByteSample = (CSng(wavBytes(pSample)) - RIFF_PCM8_CENTER) / RIFF_PCM8_SCALE
+    End If
+End Function
+
+'/**
+' * @function RiffWriteMixByteSample
+' * @brief Writes one normalized sample into an allocated mix-format buffer.
+' */
+#If VBA7 Then
+Private Sub RiffWriteMixByteSample(ByVal basePtr As LongPtr, ByVal frameIndex As Long, ByVal channelIndex As Long, ByVal nChannels As Integer, ByVal nBlockAlign As Integer, ByVal wBits As Integer, ByVal isFloat As Boolean, ByVal sample As Single)
+#Else
+Private Sub RiffWriteMixByteSample(ByVal basePtr As Long, ByVal frameIndex As Long, ByVal channelIndex As Long, ByVal nChannels As Integer, ByVal nBlockAlign As Integer, ByVal wBits As Integer, ByVal isFloat As Boolean, ByVal sample As Single)
+#End If
+    #If VBA7 Then
+        Dim pSample As LongPtr
+    #Else
+        Dim pSample As Long
+    #End If
+
+    pSample = basePtr + (frameIndex * CLng(nBlockAlign)) + (channelIndex * (CLng(wBits) \ 8))
+    sample = RiffClamp(sample, RIFF_NEGATIVE_UNITY_GAIN, RIFF_UNITY_GAIN)
+
+    If isFloat Then
+        RtlMoveMemory ByVal pSample, VarPtr(sample), RIFF_SINGLE_BYTES
+    ElseIf wBits = RIFF_FLOAT32_BITS Then
+        Dim l As Long
+        If sample >= 0! Then
+            l = CLng(CDbl(sample) * RIFF_PCM32_MAX)
+        Else
+            l = CLng(CDbl(sample) * RIFF_PCM32_SCALE)
+        End If
+        RtlMoveMemory ByVal pSample, VarPtr(l), RIFF_LONG_BYTES
+    ElseIf wBits = RIFF_PCM24_BITS Then
+        Dim v As Long
+        If sample >= 0! Then
+            v = CLng(CDbl(sample) * 8388607#)
+        Else
+            v = CLng(CDbl(sample) * RIFF_PCM24_SCALE)
+        End If
+        RtlMoveMemory ByVal pSample, VarPtr(v), 3
+    ElseIf wBits = RIFF_PCM16_BITS Then
+        Dim i As Integer
+        i = RiffFloatToPcm16(sample)
+        RtlMoveMemory ByVal pSample, VarPtr(i), RIFF_INTEGER_BYTES
+    ElseIf wBits = 8 Then
+        Dim b As Byte
+        b = CByte(RiffClamp((sample * RIFF_PCM8_SCALE) + RIFF_PCM8_CENTER, 0!, 255!))
+        RtlMoveMemory ByVal pSample, VarPtr(b), RIFF_BYTE_BYTES
+    End If
+End Sub
+
+'/**
+' * @function RiffReadFourCC
+' * @brief Reads a little-endian FourCC value from a byte array.
+' */
+Private Function RiffReadFourCC(ByRef data() As Byte, ByVal offset As Long) As Long
+    RiffReadFourCC = CLng(data(offset)) Or (CLng(data(offset + 1)) * RIFF_BYTE_SHIFT_8) Or (CLng(data(offset + 2)) * RIFF_BYTE_SHIFT_16) Or (CLng(data(offset + 3)) * &H1000000)
+End Function
+
+'/**
+' * @function RiffReadLongLE
+' * @brief Reads a signed little-endian Long from a byte array.
+' */
+Private Function RiffReadLongLE(ByRef data() As Byte, ByVal offset As Long) As Long
+    RtlMoveMemory VarPtr(RiffReadLongLE), VarPtr(data(offset)), RIFF_LONG_BYTES
+End Function
+
+'/**
+' * @function RiffReadInt16LE
+' * @brief Reads a signed little-endian Integer from a byte array.
+' */
+Private Function RiffReadInt16LE(ByRef data() As Byte, ByVal offset As Long) As Integer
+    RtlMoveMemory VarPtr(RiffReadInt16LE), VarPtr(data(offset)), RIFF_INTEGER_BYTES
+End Function
+
+
 '/**
 ' * @function CoreProcessSourceReader
 ' * @brief Private helper to extract uncompressed PCM data from an IMFSourceReader into memory.
@@ -2049,7 +3062,7 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
     tempPtr = VirtualAlloc(0, currentCap, MEM_COMMIT Or MEM_RESERVE, PAGE_READWRITE)
     
     If tempPtr = 0 Then
-        vCall0 pReader, VTI_IUNKNOWN_RELEASE
+        FastVCall0 pReader, VTI_IUNKNOWN_RELEASE
         RiffSetLastError RiffErrorMemoryAllocation
         Exit Function
     End If
@@ -2061,6 +3074,7 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
         pAudioData = 0
         cbMax = 0
         cbLen = 0
+        ' Decode hot path: direct v-table invocation with prebuilt argument descriptors.
         hrInvoke = DispCallFunc(pReader, VTI_MF_SOURCE_READER_READ_SAMPLE * pSz, CC_STDCALL, vbLong, 6, rTypes(0), rPtrs(0), vRet)
         
         If hrInvoke <> 0 Then
@@ -2074,10 +3088,10 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
         End If
         
         If pSample <> 0 Then
-            hr = vCall(pSample, VTI_MF_SAMPLE_CONVERT_TO_CONTIGUOUS_BUFFER, VarPtr(pBuffer))
+            hr = FastVCall1(pSample, VTI_MF_SAMPLE_CONVERT_TO_CONTIGUOUS_BUFFER, VarPtr(pBuffer))
 
             If hr = 0 And pBuffer <> 0 Then
-                hr = vCall(pBuffer, VTI_MF_MEDIA_BUFFER_LOCK, VarPtr(pAudioData), VarPtr(cbMax), VarPtr(cbLen))
+                hr = FastVCall3(pBuffer, VTI_MF_MEDIA_BUFFER_LOCK, VarPtr(pAudioData), VarPtr(cbMax), VarPtr(cbLen))
                 
                 If hr = 0 And pAudioData <> 0 And cbLen > 0 Then
                     If totalSize + cbLen > currentCap Then
@@ -2085,10 +3099,10 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
                         newPtr = VirtualAlloc(0, currentCap, MEM_COMMIT Or MEM_RESERVE, PAGE_READWRITE)
                         
                         If newPtr = 0 Then
-                            vCall0 pBuffer, VTI_MF_MEDIA_BUFFER_UNLOCK
-                            vCall0 pBuffer, VTI_IUNKNOWN_RELEASE
-                            vCall0 pSample, VTI_IUNKNOWN_RELEASE
-                            vCall0 pReader, VTI_IUNKNOWN_RELEASE
+                            FastVCall0 pBuffer, VTI_MF_MEDIA_BUFFER_UNLOCK
+                            FastVCall0 pBuffer, VTI_IUNKNOWN_RELEASE
+                            FastVCall0 pSample, VTI_IUNKNOWN_RELEASE
+                            FastVCall0 pReader, VTI_IUNKNOWN_RELEASE
                             If tempPtr <> 0 Then
                                 VirtualFree tempPtr, 0, MEM_RELEASE
                             End If
@@ -2106,19 +3120,19 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
                         totalSize = totalSize + cbLen
                     End If
                     
-                    vCall0 pBuffer, VTI_MF_MEDIA_BUFFER_UNLOCK
+                    FastVCall0 pBuffer, VTI_MF_MEDIA_BUFFER_UNLOCK
                 End If
             End If
 
             If pBuffer <> 0 Then
-                vCall0 pBuffer, VTI_IUNKNOWN_RELEASE
+                FastVCall0 pBuffer, VTI_IUNKNOWN_RELEASE
             End If
 
-            vCall0 pSample, VTI_IUNKNOWN_RELEASE
+            FastVCall0 pSample, VTI_IUNKNOWN_RELEASE
         End If
     Loop
 
-    vCall0 pReader, VTI_IUNKNOWN_RELEASE
+    FastVCall0 pReader, VTI_IUNKNOWN_RELEASE
     
     If totalSize > 0 Then
         rCtx.Buffers(slot).BufferPtr = VirtualAlloc(0, totalSize, MEM_COMMIT Or MEM_RESERVE, PAGE_READWRITE)
@@ -2561,7 +3575,7 @@ Private Function InternalPlayBuffer(ByVal bufferHandle As Long, ByVal busID As R
     pan = RiffClampVoicePan(pan)
 
     Dim voiceSlot As Long
-    voiceSlot = InternalGetFreeVoice()
+    voiceSlot = InternalGetFreeVoice(bufferHandle, busID)
 
     If voiceSlot = -1 Then
         RiffSetLastError RiffErrorNoFreeVoice
@@ -2579,6 +3593,10 @@ Private Function InternalPlayBuffer(ByVal bufferHandle As Long, ByVal busID As R
     rVoices(voiceSlot).busID = busID
     rVoices(voiceSlot).volume = volume
     rVoices(voiceSlot).pan = pan
+    InternalApplyBusEffectsToVoice voiceSlot, busID
+
+    rCtx.PlaySequence = rCtx.PlaySequence + 1
+    rVoices(voiceSlot).StartSerial = rCtx.PlaySequence
 
     If Not RiffEnsureRenderTimer() Then
         rVoices(voiceSlot).Playing = False
@@ -2590,6 +3608,7 @@ Private Function InternalPlayBuffer(ByVal bufferHandle As Long, ByVal busID As R
     rVoices(voiceSlot).Playing = True
     rVoices(voiceSlot).Active = True
     rCtx.IdleTimerTicks = 0
+    RiffAdaptiveRaiseForVoiceBurst
 
     InternalPlayBuffer = voiceSlot
 End Function
@@ -2676,7 +3695,7 @@ Private Function InternalPlayOscillator(ByVal waveType As RiffWaveType, ByVal fr
     End If
 
     Dim voiceSlot As Long
-    voiceSlot = InternalGetFreeVoice()
+    voiceSlot = InternalGetFreeVoice(-1, busID)
 
     If voiceSlot = -1 Then
         RiffSetLastError RiffErrorNoFreeVoice
@@ -2694,6 +3713,10 @@ Private Function InternalPlayOscillator(ByVal waveType As RiffWaveType, ByVal fr
     rVoices(voiceSlot).busID = busID
     rVoices(voiceSlot).volume = volume
     rVoices(voiceSlot).pan = pan
+    InternalApplyBusEffectsToVoice voiceSlot, busID
+
+    rCtx.PlaySequence = rCtx.PlaySequence + 1
+    rVoices(voiceSlot).StartSerial = rCtx.PlaySequence
 
     If Not RiffEnsureRenderTimer() Then
         rVoices(voiceSlot).Playing = False
@@ -2705,23 +3728,186 @@ Private Function InternalPlayOscillator(ByVal waveType As RiffWaveType, ByVal fr
     rVoices(voiceSlot).Playing = True
     rVoices(voiceSlot).Active = True
     rCtx.IdleTimerTicks = 0
+    RiffAdaptiveRaiseForVoiceBurst
 
     InternalPlayOscillator = voiceSlot
 End Function
 
 '/**
 ' * @function InternalGetFreeVoice
-' * @brief Scans for an inactive voice channel.
+' * @brief Finds a free voice or safely steals a non-critical voice when burst playback would overload the mixer.
+' * @param bufferHandle Static buffer requested by playback, or -1 for oscillator/noise voices.
+' * @param busID Target mixer bus for the new voice.
 ' * @return {Long} Voice index, or -1.
 ' */
-Private Function InternalGetFreeVoice() As Long
+Private Function InternalGetFreeVoice(Optional ByVal bufferHandle As Long = -1, Optional ByVal busID As RiffBusId = RiffBusMain) As Long
     Dim i As Long
     InternalGetFreeVoice = -1
+    
+    If rCtx.VoiceStealingEnabled Then
+        If bufferHandle >= 0 Then
+            If rCtx.MaxVoicesPerBuffer > RIFF_VOICE_CAP_DISABLED Then
+                If RiffCountVoicesForBuffer(bufferHandle, busID) >= rCtx.MaxVoicesPerBuffer Then
+                    InternalGetFreeVoice = RiffFindStealVoiceForBuffer(bufferHandle, busID)
+                    If InternalGetFreeVoice >= 0 Then
+                        RiffReleaseVoice InternalGetFreeVoice
+                        Exit Function
+                    End If
+                End If
+            End If
+        End If
+        
+        If rCtx.MaxVoicesPerBus > RIFF_VOICE_CAP_DISABLED Then
+            If RiffCountVoicesForBus(busID) >= rCtx.MaxVoicesPerBus Then
+                InternalGetFreeVoice = RiffFindStealVoiceForBus(busID)
+                If InternalGetFreeVoice >= 0 Then
+                    RiffReleaseVoice InternalGetFreeVoice
+                    Exit Function
+                End If
+            End If
+        End If
+    End If
     
     For i = 0 To RIFF_MAX_VOICE_INDEX
         If Not rVoices(i).Active Then
             InternalGetFreeVoice = i
-            Exit For
+            Exit Function
+        End If
+    Next i
+    
+    If Not rCtx.VoiceStealingEnabled Then
+        Exit Function
+    End If
+    
+    InternalGetFreeVoice = RiffFindGlobalStealVoice()
+    If InternalGetFreeVoice >= 0 Then
+        RiffReleaseVoice InternalGetFreeVoice
+    End If
+End Function
+
+'/**
+' * @function RiffReleaseVoice
+' * @brief Immediately releases a voice slot without touching global render state.
+' * @param voiceHandle Voice slot to release.
+' */
+Private Sub RiffReleaseVoice(ByVal voiceHandle As Long)
+    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then Exit Sub
+    rVoices(voiceHandle).Playing = False
+    rVoices(voiceHandle).Active = False
+    rVoices(voiceHandle).Paused = False
+End Sub
+
+'/**
+' * @function RiffCountVoicesForBuffer
+' * @brief Counts active non-looping voices currently playing a static buffer on a specific bus.
+' * @param bufferHandle Static buffer handle.
+' * @param busID Bus filter.
+' * @return {Long} Number of matching active voices.
+' */
+Private Function RiffCountVoicesForBuffer(ByVal bufferHandle As Long, ByVal busID As RiffBusId) As Long
+    Dim i As Long
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active And rVoices(i).Playing Then
+            If Not rVoices(i).IsOscillator Then
+                If rVoices(i).BufferIndex = bufferHandle And rVoices(i).busID = busID Then
+                    RiffCountVoicesForBuffer = RiffCountVoicesForBuffer + 1
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+'/**
+' * @function RiffCountVoicesForBus
+' * @brief Counts active voices routed to a mixer bus.
+' * @param busID Bus filter.
+' * @return {Long} Number of matching active voices.
+' */
+Private Function RiffCountVoicesForBus(ByVal busID As RiffBusId) As Long
+    Dim i As Long
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active And rVoices(i).Playing Then
+            If rVoices(i).busID = busID Then
+                RiffCountVoicesForBus = RiffCountVoicesForBus + 1
+            End If
+        End If
+    Next i
+End Function
+
+'/**
+' * @function RiffFindStealVoiceForBuffer
+' * @brief Finds the oldest matching non-looping voice for same-sound burst replacement.
+' * @param bufferHandle Static buffer handle.
+' * @param busID Bus filter.
+' * @return {Long} Voice handle, or -1.
+' */
+Private Function RiffFindStealVoiceForBuffer(ByVal bufferHandle As Long, ByVal busID As RiffBusId) As Long
+    Dim i As Long
+    Dim bestSerial As Long
+    RiffFindStealVoiceForBuffer = -1
+    bestSerial = 2147483647
+    
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active And rVoices(i).Playing Then
+            If Not rVoices(i).IsOscillator Then
+                If rVoices(i).BufferIndex = bufferHandle And rVoices(i).busID = busID Then
+                    If Not rVoices(i).Looping Then
+                        If rVoices(i).StartSerial < bestSerial Then
+                            bestSerial = rVoices(i).StartSerial
+                            RiffFindStealVoiceForBuffer = i
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+'/**
+' * @function RiffFindStealVoiceForBus
+' * @brief Finds the oldest non-looping voice on a bus when bus density is too high.
+' * @param busID Bus filter.
+' * @return {Long} Voice handle, or -1.
+' */
+Private Function RiffFindStealVoiceForBus(ByVal busID As RiffBusId) As Long
+    Dim i As Long
+    Dim bestSerial As Long
+    RiffFindStealVoiceForBus = -1
+    bestSerial = 2147483647
+    
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active And rVoices(i).Playing Then
+            If rVoices(i).busID = busID Then
+                If Not rVoices(i).Looping Then
+                    If rVoices(i).StartSerial < bestSerial Then
+                        bestSerial = rVoices(i).StartSerial
+                        RiffFindStealVoiceForBus = i
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Function
+
+'/**
+' * @function RiffFindGlobalStealVoice
+' * @brief Finds the safest global voice to steal when the full voice pool is occupied.
+' * @return {Long} Voice handle, or -1.
+' */
+Private Function RiffFindGlobalStealVoice() As Long
+    Dim i As Long
+    Dim bestSerial As Long
+    RiffFindGlobalStealVoice = -1
+    bestSerial = 2147483647
+    
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active And rVoices(i).Playing Then
+            If Not rVoices(i).Looping Then
+                If rVoices(i).StartSerial < bestSerial Then
+                    bestSerial = rVoices(i).StartSerial
+                    RiffFindGlobalStealVoice = i
+                End If
+            End If
         End If
     Next i
 End Function
@@ -3150,6 +4336,7 @@ Public Property Let RiffVoiceBus(ByVal voiceHandle As Long, ByVal value As RiffB
     value = RiffClampBusId(value)
 
     rVoices(voiceHandle).busID = value
+    InternalApplyBusEffectsToVoice voiceHandle, value
 End Property
 
 '/**
@@ -3360,9 +4547,142 @@ Public Sub RiffVoiceApplyPreset(ByVal voiceHandle As Long, ByVal preset As RiffE
             RiffVoiceSetReverb voiceHandle, 0.4! * amount, 0.65! + (0.2! * amount)
             RiffVoiceSetDelay voiceHandle, 0.42!, 0.28! * amount, 0.22! * amount
             rVoices(voiceHandle).StereoWidth = 1! + (0.8! * amount)
+
+        Case RiffFxWarmTape
+            rVoices(voiceHandle).BitcrushSteps = 2 ^ (15.5! - (2.5! * amount))
+            rVoices(voiceHandle).BitcrushDownsample = 1
+            rVoices(voiceHandle).Distortion = 1! + (0.28! * amount)
+            rVoices(voiceHandle).lowPass = 1! - (0.18! * amount)
+            If rVoices(voiceHandle).lowPass < 0.78! Then rVoices(voiceHandle).lowPass = 0.78!
+            rVoices(voiceHandle).highPass = 0.018! * amount
+            rVoices(voiceHandle).EqBass = 1! + (0.08! * amount)
+            rVoices(voiceHandle).EqMid = 1! + (0.04! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.12! * amount)
+            RiffVoiceSetChorus voiceHandle, 0.025! * amount, 0.22! + (0.12! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.8! - (0.12! * amount)
+            rVoices(voiceHandle).CompRatio = 1.15! + (0.75! * amount)
+        Case RiffFxVHS
+            rVoices(voiceHandle).BitcrushSteps = 2 ^ (14! - (3! * amount))
+            rVoices(voiceHandle).BitcrushDownsample = 1 + CLng(1.5! * amount)
+            rVoices(voiceHandle).lowPass = 1! - (0.28! * amount)
+            If rVoices(voiceHandle).lowPass < 0.62! Then rVoices(voiceHandle).lowPass = 0.62!
+            rVoices(voiceHandle).highPass = 0.035! * amount
+            rVoices(voiceHandle).StereoWidth = 1! - (0.2! * amount)
+            RiffVoiceSetChorus voiceHandle, 0.08! * amount, 0.18! + (0.08! * amount)
+            RiffVoiceSetDelay voiceHandle, 0.075!, 0.12! * amount, 0.08! * amount
+        Case RiffFxDreamPad
+            RiffVoiceSetReverb voiceHandle, 0.45! * amount, 0.72! + (0.2! * amount)
+            RiffVoiceSetDelay voiceHandle, 0.38!, 0.22! * amount, 0.2! * amount
+            RiffVoiceSetChorus voiceHandle, 0.35! * amount, 0.55! + (0.2! * amount)
+            rVoices(voiceHandle).StereoWidth = 1! + (1.1! * amount)
+            rVoices(voiceHandle).lowPass = 1! - (0.12! * amount)
+        Case RiffFxDarkCave
+            RiffVoiceSetReverb voiceHandle, 0.58! * amount, 0.78! + (0.17! * amount)
+            RiffVoiceSetDelay voiceHandle, 0.48!, 0.24! * amount, 0.18! * amount
+            rVoices(voiceHandle).lowPass = 1! - (0.42! * amount)
+            If rVoices(voiceHandle).lowPass < 0.42! Then rVoices(voiceHandle).lowPass = 0.42!
+            rVoices(voiceHandle).EqBass = 1! + (0.18! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.35! * amount)
+        Case RiffFxTinySpeaker
+            rVoices(voiceHandle).lowPass = 1! - (0.45! * amount)
+            If rVoices(voiceHandle).lowPass < 0.48! Then rVoices(voiceHandle).lowPass = 0.48!
+            rVoices(voiceHandle).highPass = 0.22! * amount
+            rVoices(voiceHandle).EqBass = 1! - (0.65! * amount)
+            rVoices(voiceHandle).EqMid = 1! + (0.25! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.12! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.7! - (0.18! * amount)
+            rVoices(voiceHandle).CompRatio = 1.5! + (2.5! * amount)
+        Case RiffFxMegaphone
+            rVoices(voiceHandle).lowPass = 1! - (0.52! * amount)
+            If rVoices(voiceHandle).lowPass < 0.42! Then rVoices(voiceHandle).lowPass = 0.42!
+            rVoices(voiceHandle).highPass = 0.32! * amount
+            rVoices(voiceHandle).EqBass = 1! - (0.75! * amount)
+            rVoices(voiceHandle).EqMid = 1! + (0.65! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.1! * amount)
+            rVoices(voiceHandle).Distortion = 1! + (0.75! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.55! - (0.15! * amount)
+            rVoices(voiceHandle).CompRatio = 2.5! + (3! * amount)
+        Case RiffFxGameBoy
+            rVoices(voiceHandle).BitcrushSteps = 2 ^ (8! + (2! * (1! - amount)))
+            rVoices(voiceHandle).BitcrushDownsample = 2 + CLng(3! * amount)
+            If rVoices(voiceHandle).BitcrushDownsample > 6 Then rVoices(voiceHandle).BitcrushDownsample = 6
+            rVoices(voiceHandle).lowPass = 1! - (0.25! * amount)
+            rVoices(voiceHandle).EqBass = 1! - (0.18! * amount)
+            rVoices(voiceHandle).EqMid = 1! + (0.18! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.08! * amount)
+        Case RiffFxHorrorDrone
+            RiffVoiceSetReverb voiceHandle, 0.55! * amount, 0.82! + (0.13! * amount)
+            RiffVoiceSetDelay voiceHandle, 0.62!, 0.3! * amount, 0.22! * amount
+            rVoices(voiceHandle).RingModFreq = 18! + (42! * amount)
+            rVoices(voiceHandle).RingModMix = 0.08! + (0.25! * amount)
+            rVoices(voiceHandle).lowPass = 1! - (0.3! * amount)
+            rVoices(voiceHandle).StereoWidth = 1! + (0.7! * amount)
+        Case RiffFxWind
+            rVoices(voiceHandle).lowPass = 0.48! - (0.12! * amount)
+            If rVoices(voiceHandle).lowPass < 0.28! Then rVoices(voiceHandle).lowPass = 0.28!
+            rVoices(voiceHandle).highPass = 0.04! * amount
+            RiffVoiceSetChorus voiceHandle, 0.18! * amount, 0.25! + (0.18! * amount)
+            rVoices(voiceHandle).AutoPanRate = 0.08! + (0.12! * amount)
+            rVoices(voiceHandle).AutoPanDepth = 0.15! * amount
+            rVoices(voiceHandle).StereoWidth = 1! + (0.45! * amount)
+        Case RiffFxRain
+            rVoices(voiceHandle).lowPass = 0.72! - (0.1! * amount)
+            rVoices(voiceHandle).highPass = 0.08! + (0.08! * amount)
+            RiffVoiceSetReverb voiceHandle, 0.12! * amount, 0.35! + (0.18! * amount)
+            rVoices(voiceHandle).StereoWidth = 1! + (0.55! * amount)
+            rVoices(voiceHandle).EqTreble = 1! + (0.08! * amount)
+        Case RiffFxCinematicBoom
+            rVoices(voiceHandle).EqBass = 1! + (0.65! * amount)
+            rVoices(voiceHandle).EqMid = 1! - (0.18! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.22! * amount)
+            rVoices(voiceHandle).lowPass = 1! - (0.32! * amount)
+            If rVoices(voiceHandle).lowPass < 0.52! Then rVoices(voiceHandle).lowPass = 0.52!
+            RiffVoiceSetReverb voiceHandle, 0.26! * amount, 0.55! + (0.25! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.62! - (0.12! * amount)
+            rVoices(voiceHandle).CompRatio = 2! + (2.5! * amount)
+        Case RiffFxSoftFocus
+            rVoices(voiceHandle).lowPass = 1! - (0.22! * amount)
+            If rVoices(voiceHandle).lowPass < 0.65! Then rVoices(voiceHandle).lowPass = 0.65!
+            RiffVoiceSetReverb voiceHandle, 0.22! * amount, 0.48! + (0.22! * amount)
+            RiffVoiceSetChorus voiceHandle, 0.12! * amount, 0.35! + (0.12! * amount)
+            rVoices(voiceHandle).StereoWidth = 1! + (0.35! * amount)
+
         Case Else
             RiffSetLastError RiffErrorInvalidArgument
     End Select
+End Sub
+
+'/**
+' * @function RiffIsValidEffectPreset
+' * @brief Returns whether a preset value maps to a built-in Riff effect preset.
+' * @param preset Preset value to validate.
+' * @return {Boolean} True when the preset is supported.
+' */
+Private Function RiffIsValidEffectPreset(ByVal preset As RiffEffectPreset) As Boolean
+    Select Case preset
+        Case RiffFxDry, RiffFxSmallRoom, RiffFxHall, RiffFxCathedral, RiffFxSlapback, RiffFxEcho, RiffFxChorus, RiffFxFlanger, RiffFxLoFi, RiffFxRadio, RiffFxUnderwater, RiffFxWide, RiffFxRobot, RiffFxAmbient, RiffFxWarmTape, RiffFxVHS, RiffFxDreamPad, RiffFxDarkCave, RiffFxTinySpeaker, RiffFxMegaphone, RiffFxGameBoy, RiffFxHorrorDrone, RiffFxWind, RiffFxRain, RiffFxCinematicBoom, RiffFxSoftFocus
+            RiffIsValidEffectPreset = True
+    End Select
+End Function
+
+'/**
+' * @function InternalApplyBusEffectsToVoice
+' * @brief Applies a bus-level persistent preset to a voice before or after activation.
+' * @param voiceHandle Target voice slot.
+' * @param busID Source bus preset slot.
+' */
+Private Sub InternalApplyBusEffectsToVoice(ByVal voiceHandle As Long, ByVal busID As RiffBusId)
+    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then
+        Exit Sub
+    End If
+    If busID < 0 Or busID > RIFF_MAX_BUS_INDEX Then
+        Exit Sub
+    End If
+    If Not rCtx.Buses(busID).FxEnabled Then
+        Exit Sub
+    End If
+
+    RiffVoiceApplyPreset voiceHandle, rCtx.Buses(busID).FxPreset, rCtx.Buses(busID).FxAmount
 End Sub
 
 '/**
@@ -4235,6 +5555,229 @@ Private Function RiffSanitizeSample(ByVal value As Single) As Single
 End Function
 
 '/**
+' * @function RiffSoftLimitSample
+' * @brief Applies a lightweight master soft limiter to prevent stacked voices from hard clipping.
+' */
+Private Function RiffSoftLimitSample(ByVal value As Single) As Single
+    Dim a As Single
+    Dim over As Single
+    Dim limited As Single
+    
+    value = RiffSanitizeSample(value)
+    a = Abs(value)
+    
+    If a <= RIFF_MASTER_SOFT_LIMIT_THRESHOLD Then
+        RiffSoftLimitSample = value
+        Exit Function
+    End If
+    
+    over = (a - RIFF_MASTER_SOFT_LIMIT_THRESHOLD) / RIFF_MASTER_SOFT_LIMIT_HEADROOM
+    limited = RIFF_MASTER_SOFT_LIMIT_THRESHOLD + (RIFF_MASTER_SOFT_LIMIT_HEADROOM * (over / (1! + over)))
+    
+    If value < 0! Then
+        RiffSoftLimitSample = -limited
+    Else
+        RiffSoftLimitSample = limited
+    End If
+End Function
+
+'/**
+' * @function RiffResetMasterProcessorState
+' * @brief Resets all final mix processors, states, and defaults.
+' */
+Private Sub RiffResetMasterProcessorState()
+    rCtx.MasterProcessorEnabled = False
+    rCtx.MasterSoftClipEnabled = True
+    rCtx.MasterLowPass = RIFF_MASTER_DEFAULT_LOWPASS
+    rCtx.MasterHighPass = RIFF_MASTER_DEFAULT_HIGHPASS
+    rCtx.MasterEqBass = RIFF_UNITY_GAIN
+    rCtx.MasterEqMid = RIFF_UNITY_GAIN
+    rCtx.MasterEqTreble = RIFF_UNITY_GAIN
+    rCtx.MasterCompressorThreshold = RIFF_MASTER_DEFAULT_COMP_THRESHOLD
+    rCtx.MasterCompressorRatio = RIFF_MASTER_DEFAULT_COMP_RATIO
+    rCtx.MasterCompressorEnv = RIFF_MASTER_COMP_ENV_FLOOR
+    rCtx.MasterDrive = RIFF_MASTER_DEFAULT_DRIVE
+    rCtx.MasterStereoWidth = RIFF_UNITY_GAIN
+    rCtx.MasterOutputGain = RIFF_MASTER_DEFAULT_OUTPUT_GAIN
+    rCtx.MasterLowPassStateL = 0!
+    rCtx.MasterLowPassStateR = 0!
+    rCtx.MasterHighPassStateL = 0!
+    rCtx.MasterHighPassStateR = 0!
+    rCtx.MasterHighPassPrevL = 0!
+    rCtx.MasterHighPassPrevR = 0!
+    rCtx.MasterEqLowL = 0!
+    rCtx.MasterEqLowR = 0!
+    rCtx.MasterEqHighL = 0!
+    rCtx.MasterEqHighR = 0!
+End Sub
+
+'/**
+' * @function RiffUpdateMasterProcessorEnabled
+' * @brief Recomputes whether the final mix processor stage needs to run.
+' */
+Private Sub RiffUpdateMasterProcessorEnabled()
+    rCtx.MasterProcessorEnabled = _
+        (Abs(rCtx.MasterLowPass - RIFF_MASTER_DEFAULT_LOWPASS) > 0.0001!) Or _
+        (Abs(rCtx.MasterHighPass - RIFF_MASTER_DEFAULT_HIGHPASS) > 0.0001!) Or _
+        (Abs(rCtx.MasterEqBass - RIFF_UNITY_GAIN) > 0.0001!) Or _
+        (Abs(rCtx.MasterEqMid - RIFF_UNITY_GAIN) > 0.0001!) Or _
+        (Abs(rCtx.MasterEqTreble - RIFF_UNITY_GAIN) > 0.0001!) Or _
+        (Abs(rCtx.MasterCompressorThreshold - RIFF_MASTER_DEFAULT_COMP_THRESHOLD) > 0.0001!) Or _
+        (Abs(rCtx.MasterCompressorRatio - RIFF_MASTER_DEFAULT_COMP_RATIO) > 0.0001!) Or _
+        (Abs(rCtx.MasterDrive - RIFF_MASTER_DEFAULT_DRIVE) > 0.0001!) Or _
+        (Abs(rCtx.MasterStereoWidth - RIFF_UNITY_GAIN) > 0.0001!) Or _
+        (Abs(rCtx.MasterOutputGain - RIFF_MASTER_DEFAULT_OUTPUT_GAIN) > 0.0001!)
+End Sub
+
+'/**
+' * @function RiffMasterShapeSample
+' * @brief Applies musical drive with a smooth saturating transfer curve.
+' */
+Private Function RiffMasterShapeSample(ByVal value As Single, ByVal drive As Single) As Single
+    value = RiffSanitizeSample(value * drive)
+    RiffMasterShapeSample = value / (1! + (Abs(value) * 0.45!))
+End Function
+
+'/**
+' * @function RiffProcessMasterPair
+' * @brief Processes one final stereo frame through master processors and optional soft clipping.
+' */
+Private Sub RiffProcessMasterPair(ByRef leftSample As Single, ByRef rightSample As Single)
+    Dim l As Single
+    Dim r As Single
+    Dim lpAlpha As Single
+    Dim hpAlpha As Single
+    Dim lowL As Single
+    Dim lowR As Single
+    Dim highL As Single
+    Dim highR As Single
+    Dim midL As Single
+    Dim midR As Single
+    Dim midS As Single
+    Dim sideS As Single
+    Dim pk As Single
+    Dim gain As Single
+
+    l = RiffSanitizeSample(leftSample)
+    r = RiffSanitizeSample(rightSample)
+
+    If rCtx.MasterProcessorEnabled Then
+        If rCtx.MasterDrive > 1.0001! Then
+            l = RiffMasterShapeSample(l, rCtx.MasterDrive)
+            r = RiffMasterShapeSample(r, rCtx.MasterDrive)
+        End If
+
+        If rCtx.MasterLowPass < 0.9999! Then
+            lpAlpha = RiffClamp(rCtx.MasterLowPass * rCtx.MasterLowPass, 0.002!, 1!)
+            rCtx.MasterLowPassStateL = rCtx.MasterLowPassStateL + ((l - rCtx.MasterLowPassStateL) * lpAlpha)
+            rCtx.MasterLowPassStateR = rCtx.MasterLowPassStateR + ((r - rCtx.MasterLowPassStateR) * lpAlpha)
+            l = rCtx.MasterLowPassStateL
+            r = rCtx.MasterLowPassStateR
+        End If
+
+        If rCtx.MasterHighPass > 0.0001! Then
+            hpAlpha = RiffClamp(0.002! + (rCtx.MasterHighPass * 0.65!), 0.002!, 0.98!)
+            rCtx.MasterHighPassStateL = rCtx.MasterHighPassStateL + ((l - rCtx.MasterHighPassStateL) * hpAlpha)
+            rCtx.MasterHighPassStateR = rCtx.MasterHighPassStateR + ((r - rCtx.MasterHighPassStateR) * hpAlpha)
+            l = l - rCtx.MasterHighPassStateL
+            r = r - rCtx.MasterHighPassStateR
+        End If
+
+        If Abs(rCtx.MasterEqBass - 1!) > 0.0001! Or Abs(rCtx.MasterEqMid - 1!) > 0.0001! Or Abs(rCtx.MasterEqTreble - 1!) > 0.0001! Then
+            rCtx.MasterEqLowL = rCtx.MasterEqLowL + ((l - rCtx.MasterEqLowL) * 0.035!)
+            rCtx.MasterEqLowR = rCtx.MasterEqLowR + ((r - rCtx.MasterEqLowR) * 0.035!)
+            rCtx.MasterEqHighL = rCtx.MasterEqHighL + ((l - rCtx.MasterEqHighL) * 0.32!)
+            rCtx.MasterEqHighR = rCtx.MasterEqHighR + ((r - rCtx.MasterEqHighR) * 0.32!)
+
+            lowL = rCtx.MasterEqLowL
+            lowR = rCtx.MasterEqLowR
+            highL = l - rCtx.MasterEqHighL
+            highR = r - rCtx.MasterEqHighR
+            midL = l - lowL - highL
+            midR = r - lowR - highR
+
+            l = (lowL * rCtx.MasterEqBass) + (midL * rCtx.MasterEqMid) + (highL * rCtx.MasterEqTreble)
+            r = (lowR * rCtx.MasterEqBass) + (midR * rCtx.MasterEqMid) + (highR * rCtx.MasterEqTreble)
+        End If
+
+        If Abs(rCtx.MasterStereoWidth - 1!) > 0.0001! Then
+            midS = (l + r) * RIFF_HALF_SCALE
+            sideS = (l - r) * RIFF_HALF_SCALE
+            l = midS + sideS * rCtx.MasterStereoWidth
+            r = midS - sideS * rCtx.MasterStereoWidth
+        End If
+
+        If rCtx.MasterCompressorRatio > 1.0001! Then
+            pk = Abs(l)
+            If Abs(r) > pk Then pk = Abs(r)
+
+            If pk > rCtx.MasterCompressorEnv Then
+                rCtx.MasterCompressorEnv = rCtx.MasterCompressorEnv + (RIFF_COMP_ATTACK_COEFF * (pk - rCtx.MasterCompressorEnv))
+            Else
+                rCtx.MasterCompressorEnv = rCtx.MasterCompressorEnv + (RIFF_COMP_RELEASE_COEFF * (pk - rCtx.MasterCompressorEnv))
+            End If
+
+            If rCtx.MasterCompressorEnv > rCtx.MasterCompressorThreshold And rCtx.MasterCompressorEnv > RIFF_MASTER_COMP_ENV_FLOOR Then
+                gain = rCtx.MasterCompressorThreshold + ((rCtx.MasterCompressorEnv - rCtx.MasterCompressorThreshold) / rCtx.MasterCompressorRatio)
+                gain = gain / rCtx.MasterCompressorEnv
+                l = l * gain
+                r = r * gain
+            End If
+        End If
+
+        If Abs(rCtx.MasterOutputGain - 1!) > 0.0001! Then
+            l = l * rCtx.MasterOutputGain
+            r = r * rCtx.MasterOutputGain
+        End If
+    End If
+
+    If rCtx.MasterSoftClipEnabled Then
+        leftSample = RiffSoftLimitSample(l)
+        rightSample = RiffSoftLimitSample(r)
+    Else
+        leftSample = RiffSanitizeSample(l)
+        rightSample = RiffSanitizeSample(r)
+    End If
+End Sub
+
+'/**
+' * @function RiffProcessMasterInterleavedSingles
+' * @brief Applies master processing to an interleaved Single stereo buffer.
+' */
+Private Sub RiffProcessMasterInterleavedSingles(ByRef samples() As Single, ByVal sampleCount As Long)
+    Dim i As Long
+    Dim l As Single
+    Dim r As Single
+
+    For i = 0 To sampleCount - 2 Step RIFF_WAV_EXPORT_CHANNELS
+        l = samples(i)
+        r = samples(i + 1)
+        RiffProcessMasterPair l, r
+        samples(i) = l
+        samples(i + 1) = r
+    Next i
+End Sub
+
+'/**
+' * @function RiffProcessMasterInterleavedPcm16
+' * @brief Applies master processing to an interleaved 16-bit stereo buffer.
+' */
+Private Sub RiffProcessMasterInterleavedPcm16(ByRef samples() As Integer, ByVal sampleCount As Long)
+    Dim i As Long
+    Dim l As Single
+    Dim r As Single
+
+    For i = 0 To sampleCount - 2 Step RIFF_WAV_EXPORT_CHANNELS
+        l = CSng(samples(i)) * RIFF_PCM16_TO_FLOAT_SCALE
+        r = CSng(samples(i + 1)) * RIFF_PCM16_TO_FLOAT_SCALE
+        RiffProcessMasterPair l, r
+        samples(i) = RiffFloatToPcm16(l)
+        samples(i + 1) = RiffFloatToPcm16(r)
+    Next i
+End Sub
+
+
+'/**
 ' * @function RiffMakeNoiseSeed
 ' * @brief Builds a non-zero deterministic seed for a noise voice.
 ' */
@@ -4830,6 +6373,21 @@ Private Function RiffHasActiveVoices() As Boolean
     Next i
 End Function
 
+
+'/**
+' * @function RiffAdaptiveRaiseForVoiceBurst
+' * @brief Temporarily raises the adaptive queue when many voices are active during a burst.
+' */
+Private Sub RiffAdaptiveRaiseForVoiceBurst()
+    Dim activeCount As Long
+    activeCount = RiffActiveVoiceCount()
+    If activeCount >= (RIFF_VOICE_COUNT \ 2) Then
+        If rCtx.AdaptiveTargetQueueMs < RIFF_QUEUE_SAFE_MS Then
+            rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_SAFE_MS
+            rCtx.AdaptiveStableTicks = 0
+        End If
+    End If
+End Sub
 
 '/**
 ' * @function RiffAdaptiveNotifyUnderrun
@@ -5624,14 +7182,7 @@ NextVoice32:
         If currentMasterPeakL > rCtx.MasterPeakL Then rCtx.MasterPeakL = currentMasterPeakL
         If currentMasterPeakR > rCtx.MasterPeakR Then rCtx.MasterPeakR = currentMasterPeakR
         
-        For frame = 0 To sampleCount32 - 1
-            rMixArr32(frame) = RiffSanitizeSample(rMixArr32(frame))
-            If rMixArr32(frame) > 1! Then
-                rMixArr32(frame) = 1!
-            ElseIf rMixArr32(frame) < -1! Then
-                rMixArr32(frame) = -1!
-            End If
-        Next frame
+        RiffProcessMasterInterleavedSingles rMixArr32, sampleCount32
 
         If isMixFloat32 Then
             RtlMoveMemory ByVal pData, VarPtr(rMixArr32(0)), bytesToWrite
@@ -6383,7 +7934,10 @@ End Function
 
 '/**
 ' * @function FastVCall0
-' * @brief Invokes a COM v-table method without Variant marshaling when the hot path signature is compatible.
+' * @brief Invokes a zero-argument COM method directly through its v-table slot without ParamArray allocation.
+' * @param pUnk COM interface pointer.
+' * @param vTableIndex Zero-based v-table slot.
+' * @return {Long} HRESULT returned by the COM method.
 ' */
 #If VBA7 Then
 Private Function FastVCall0(ByVal pUnk As LongPtr, ByVal vTableIndex As Long) As Long
@@ -6395,26 +7949,130 @@ End Function
 
 '/**
 ' * @function FastVCall1
-' * @brief Invokes a COM v-table method with one explicit argument on the optimized x64 path.
+' * @brief Invokes a one-argument COM method directly through its v-table slot without ParamArray allocation.
+' * @param pUnk COM interface pointer.
+' * @param vTableIndex Zero-based v-table slot.
+' * @param arg0 First native argument or pointer-sized value.
+' * @return {Long} HRESULT returned by the COM method.
 ' */
 #If VBA7 Then
 Private Function FastVCall1(ByVal pUnk As LongPtr, ByVal vTableIndex As Long, ByVal arg0 As LongPtr) As Long
 #Else
 Private Function FastVCall1(ByVal pUnk As Long, ByVal vTableIndex As Long, ByVal arg0 As Long) As Long
 #End If
-    FastVCall1 = vCall(pUnk, vTableIndex, arg0)
+    Dim hrInvoke As Long
+    Dim offset As Long
+    Dim vRet As Variant
+    Dim vArg0 As Variant
+    Dim vTypes(0 To 0) As Integer
+    #If VBA7 Then
+        Dim pArgs(0 To 0) As LongPtr
+    #Else
+        Dim pArgs(0 To 0) As Long
+    #End If
+
+    offset = vTableIndex * LenB(pUnk)
+    vArg0 = arg0
+    vTypes(0) = VarType(vArg0)
+    pArgs(0) = VarPtr(vArg0)
+
+    hrInvoke = DispCallFunc(pUnk, offset, CC_STDCALL, vbLong, 1, vTypes(0), pArgs(0), vRet)
+
+    If hrInvoke = 0 Then
+        FastVCall1 = CLng(vRet)
+    Else
+        FastVCall1 = hrInvoke
+    End If
+End Function
+
+'/**
+' * @function FastVCall2
+' * @brief Invokes a two-argument COM method directly through its v-table slot without ParamArray allocation.
+' * @param pUnk COM interface pointer.
+' * @param vTableIndex Zero-based v-table slot.
+' * @param arg0 First native argument or pointer-sized value.
+' * @param arg1 Second native argument or pointer-sized value.
+' * @return {Long} HRESULT returned by the COM method.
+' */
+#If VBA7 Then
+Private Function FastVCall2(ByVal pUnk As LongPtr, ByVal vTableIndex As Long, ByVal arg0 As LongPtr, ByVal arg1 As LongPtr) As Long
+#Else
+Private Function FastVCall2(ByVal pUnk As Long, ByVal vTableIndex As Long, ByVal arg0 As Long, ByVal arg1 As Long) As Long
+#End If
+    Dim hrInvoke As Long
+    Dim offset As Long
+    Dim vRet As Variant
+    Dim vArgs(0 To 1) As Variant
+    Dim vTypes(0 To 1) As Integer
+    #If VBA7 Then
+        Dim pArgs(0 To 1) As LongPtr
+    #Else
+        Dim pArgs(0 To 1) As Long
+    #End If
+    Dim i As Long
+
+    offset = vTableIndex * LenB(pUnk)
+    vArgs(0) = arg0
+    vArgs(1) = arg1
+
+    For i = 0 To 1
+        vTypes(i) = VarType(vArgs(i))
+        pArgs(i) = VarPtr(vArgs(i))
+    Next i
+
+    hrInvoke = DispCallFunc(pUnk, offset, CC_STDCALL, vbLong, 2, vTypes(0), pArgs(0), vRet)
+
+    If hrInvoke = 0 Then
+        FastVCall2 = CLng(vRet)
+    Else
+        FastVCall2 = hrInvoke
+    End If
 End Function
 
 '/**
 ' * @function FastVCall3
-' * @brief Invokes a COM v-table method with three explicit arguments on the optimized x64 path.
+' * @brief Invokes a three-argument COM method directly through its v-table slot without ParamArray allocation.
+' * @param pUnk COM interface pointer.
+' * @param vTableIndex Zero-based v-table slot.
+' * @param arg0 First native argument or pointer-sized value.
+' * @param arg1 Second native argument or pointer-sized value.
+' * @param arg2 Third native argument or pointer-sized value.
+' * @return {Long} HRESULT returned by the COM method.
 ' */
 #If VBA7 Then
 Private Function FastVCall3(ByVal pUnk As LongPtr, ByVal vTableIndex As Long, ByVal arg0 As LongPtr, ByVal arg1 As LongPtr, ByVal arg2 As LongPtr) As Long
 #Else
 Private Function FastVCall3(ByVal pUnk As Long, ByVal vTableIndex As Long, ByVal arg0 As Long, ByVal arg1 As Long, ByVal arg2 As Long) As Long
 #End If
-    FastVCall3 = vCall(pUnk, vTableIndex, arg0, arg1, arg2)
+    Dim hrInvoke As Long
+    Dim offset As Long
+    Dim vRet As Variant
+    Dim vArgs(0 To 2) As Variant
+    Dim vTypes(0 To 2) As Integer
+    #If VBA7 Then
+        Dim pArgs(0 To 2) As LongPtr
+    #Else
+        Dim pArgs(0 To 2) As Long
+    #End If
+    Dim i As Long
+
+    offset = vTableIndex * LenB(pUnk)
+    vArgs(0) = arg0
+    vArgs(1) = arg1
+    vArgs(2) = arg2
+
+    For i = 0 To 2
+        vTypes(i) = VarType(vArgs(i))
+        pArgs(i) = VarPtr(vArgs(i))
+    Next i
+
+    hrInvoke = DispCallFunc(pUnk, offset, CC_STDCALL, vbLong, 3, vTypes(0), pArgs(0), vRet)
+
+    If hrInvoke = 0 Then
+        FastVCall3 = CLng(vRet)
+    Else
+        FastVCall3 = hrInvoke
+    End If
 End Function
 
 '/**
