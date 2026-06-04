@@ -19,8 +19,6 @@ RiffBusApplyPreset RiffBusMusic, RiffFxUnderwater, 0.55
 RiffMasterApplyPreset RiffMasterFxGlue, 0.7
 ```
 
----
-
 ## Quick Start
 
 ### Apply a Voice Preset
@@ -61,8 +59,6 @@ Public Sub ResetMasterMix()
     RiffMasterApplyPreset RiffMasterFxClean
 End Sub
 ```
-
----
 
 ## The Preset System
 
@@ -109,8 +105,6 @@ Or use the dry preset:
 RiffVoiceApplyPreset v, RiffFxDry
 ```
 
----
-
 ## Voice Preset Reference
 
 ### Utility Presets
@@ -149,8 +143,6 @@ RiffVoiceApplyPreset v, RiffFxDry
 | `RiffFxCinematicBoom` | Big low-heavy impact | Hits, booms, transitions |
 | `RiffFxSoftFocus` | Gentle smoothing and width | Emotional scenes, soft ambience |
 
----
-
 ## Master Preset Reference
 
 Master presets process the final mixed output. They are not replacements for voice effects. Use them for final polish, scene-level coloration, and mix safety.
@@ -170,8 +162,6 @@ RiffMasterApplyPreset RiffMasterFxGlue, 0.7
 | `RiffMasterFxCinematic` | Wide, compressed, fuller mix | Cutscenes, dramatic moments |
 | `RiffMasterFxNight` | Softer, lower-energy mix | Night levels, quiet states |
 | `RiffMasterFxSoftLimiter` | Safety limiting | Loud SFX-heavy scenes |
-
----
 
 ## Preset Recipes
 
@@ -298,8 +288,6 @@ Public Sub ApplySoftFocus(ByVal v As Long)
 End Sub
 ```
 
----
-
 ## Bus-Wide Scene Recipes
 
 Bus presets are the best way to apply a scene effect to all sounds of a category.
@@ -418,8 +406,6 @@ Public Sub ClearCurrentVoiceColorButKeepFutureRule()
 End Sub
 ```
 
----
-
 ## Master Processor Recipes
 
 Master processors affect the final output. They are ideal for scene-level polish and safety processing.
@@ -510,8 +496,6 @@ Public Sub ClearMasterProcessing()
     RiffMasterVolume = 1
 End Sub
 ```
-
----
 
 ## Manual Voice Recipes
 
@@ -638,8 +622,6 @@ Public Sub ApplyGhostVoice(ByVal v As Long)
 End Sub
 ```
 
----
-
 ## Synthesis Patterns
 
 Use oscillators and noise generators for procedural effects without audio files.
@@ -764,8 +746,6 @@ Public Sub PlayEarthquakeRumble()
     RiffFadeOut v, 2.5
 End Sub
 ```
-
----
 
 ## Complete Scene Examples
 
@@ -897,8 +877,6 @@ Public Sub PlayCinematicTransition(ByVal boomBuffer As Long)
 End Sub
 ```
 
----
-
 ## Mixing Tips
 
 ### Voice vs Bus vs Master
@@ -956,8 +934,6 @@ RiffMasterApplyPreset RiffMasterFxSoftLimiter, 0.7
 RiffMaxVoicesPerBuffer = 4
 RiffMaxVoicesPerBus = 16
 ```
-
----
 
 ## Pro Tips
 
