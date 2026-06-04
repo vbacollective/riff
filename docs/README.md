@@ -1,47 +1,43 @@
 # Documentation
 
-This directory contains the long-form technical documentation for Riff. Start here when you need exact API behavior, integration constraints, or implementation details beyond the quick examples in the root README.
+Welcome to the Riff technical documentation. This directory contains detailed guides on how to integrate, configure, and extend the engine.
 
-## Files
+## Resource Index
 
-| File | Audience | Contents |
-|---|---|---|
-| [API_REFERENCE.md](API_REFERENCE.md) | Users integrating Riff into a VBA project | Public functions, voice properties, DSP controls, export helpers, meters, buses, and practical patterns. |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Contributors and advanced users | Engine state, WASAPI initialization, Media Foundation decoding, timer thunk behavior, memory layout, DSP order, and shutdown. |
-| [EFFECT_COOKBOOK.md](EFFECT_COOKBOOK.md) | Users building polished audio behavior | Copy-ready effect recipes for UI sounds, radio voice, ambience, lo-fi, sci-fi, music beds, and alerts. |
-| [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Users diagnosing integration problems | No-sound checks, failed initialization, codec issues, voice exhaustion, shutdown safety, and path guidance. |
-| [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) | Maintainers | Package, runtime, host, DSP, documentation, Git, and release-note checks. |
+| File | Audience | Description |
+|:---|:---|:---|
+| [**API Reference**](API_REFERENCE.md) | Developers | Exhaustive guide to every public function, property, and enum. |
+| [**Architecture**](ARCHITECTURE.md) | Advanced | Internal implementation details: WASAPI, Thunks, and DSP logic. |
+| [**Effect Cookbook**](EFFECT_COOKBOOK.md) | Designers | Practical recipes for radio voices, spatial reverbs, and UI beeps. |
+| [**Troubleshooting**](TROUBLESHOOTING.md) | All | Solutions for common setup, playback, and stability issues. |
+| [**Release Checklist**](RELEASE_CHECKLIST.md) | Maintainers | Quality assurance steps required before every release. |
 
-## Recommended Reading Order
+## Quick Integration Pattern
 
-1. Read the root [README](../README.md) for installation and common usage examples.
-2. Read [API_REFERENCE.md](API_REFERENCE.md) when writing application code against Riff.
-3. Read [EFFECT_COOKBOOK.md](EFFECT_COOKBOOK.md) when tuning effects or building reusable presets.
-4. Read [TROUBLESHOOTING.md](TROUBLESHOOTING.md) if playback, loading, or shutdown behavior is not working as expected.
-5. Read [ARCHITECTURE.md](ARCHITECTURE.md) before changing internals or debugging low-level host behavior.
-
-## Quick API Pattern
-
-Most Riff code follows this lifecycle:
+Riff is designed for simple, synchronous usage in standard VBA modules.
 
 ```vb
-If Not RiffOpen() Then
-    MsgBox "Audio initialization failed."
-    Exit Sub
-End If
+' Basic Playback Procedure
+Public Sub RunSoundTest()
+    If Not RiffOpen() Then Exit Sub
 
-Dim bufferId As Long
-bufferId = RiffLoad("C:\Audio\clip.wav")
+    Dim buf As Long: buf = RiffLoad("C:\Assets\intro.mp3")
+    Dim v As Long:   v = RiffPlay(buf)
 
-If bufferId >= 0 Then
-    Dim voiceId As Long
-    voiceId = RiffPlay(bufferId)
-
-    If voiceId >= 0 Then
-        RiffVoiceVolume(voiceId) = 0.7
-        RiffVoiceReverbMix(voiceId) = 0.25
+    If v >= 0 Then
+        RiffVoiceVolume(v) = 0.75
+        RiffVoiceReverbMix(v) = 0.2
     End If
-End If
+End Sub
 ```
 
-Always call `RiffClose` during workbook, document, or host shutdown. The engine owns native timer and COM resources that should be released deliberately.
+## Lifecycle Management
+
+To ensure host stability (especially in Excel), the engine **must** be shut down before the workbook or host application closes. This releases native timers and COM interfaces that VBA cannot clean up automatically.
+
+```vb
+' Place in ThisWorkbook or equivalent host shutdown event
+Private Sub Workbook_BeforeClose(Cancel As Boolean)
+    RiffClose
+End Sub
+```

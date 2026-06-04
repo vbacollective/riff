@@ -1,89 +1,46 @@
 # Release Checklist
 
-Use this checklist before tagging or publishing a Riff release.
+Use this checklist to ensure every Riff release meets professional quality standards before publishing.
 
-## Package Integrity
+---
 
-- Confirm `package/Riff.bas` is the only production module.
-- Import `package/Riff.bas` into a blank VBA project.
-- Compile the VBA project.
-- Confirm no external **Tools > References** entries are required.
-- Confirm public API changes are documented in [API_REFERENCE.md](API_REFERENCE.md).
-- Confirm architecture changes are documented in [ARCHITECTURE.md](ARCHITECTURE.md).
+## 1. Package Integrity
+- [ ] `package/Riff.bas` is the only production module and has no external dependencies.
+- [ ] No `Tools > References` are required in a clean VBA project.
+- [ ] Code compiles without errors in both 32-bit and 64-bit Office hosts.
+- [ ] `Public` API names match the documentation in `API_REFERENCE.md`.
 
-## Runtime Smoke Tests
+## 2. Runtime Smoke Tests
+- [ ] `RiffOpen` successfully acquires the default WASAPI device.
+- [ ] `RiffPlayOscillator` produces a clean tone without artifacts.
+- [ ] `RiffLoad` successfully decodes WAV and MP3 assets.
+- [ ] `RiffClose` shuts down all resources and restores timer resolution.
 
-Run these on at least one Windows machine with a working output device:
+## 3. DSP & Pipeline Verification
+- [ ] **Modulation:** Verify Chorus, Flanger, and Tremolo sweep correctly.
+- [ ] **Spatial:** Confirm Reverb tail and Delay repetitions are audible.
+- [ ] **Dynamics:** Test Compressor gain reduction and Distortion clipping.
+- [ ] **Filters:** Test Low-Pass, High-Pass, and 3-Band EQ tonal changes.
+- [ ] **Presets:** Verify `RiffVoiceApplyPreset` correctly configures the DSP matrix.
 
-- `RiffOpen` returns `True`.
-- `RiffPlayOscillator(0, 440)` plays a sine tone.
-- `RiffFadeOut` fades the oscillator without clicks.
-- `RiffLoad` loads a WAV file.
-- `RiffPlay` plays the loaded buffer.
-- A looping voice can be stopped with `RiffStop` or `RiffStopAll`.
-- `RiffClose` shuts down cleanly.
+## 4. Host & Platform Coverage
+- [ ] Tested on **Excel** (32-bit & 64-bit).
+- [ ] Tested on **Windows 10** or **Windows 11**.
+- [ ] (Optional) Verified on Word, PowerPoint, or Access.
 
-## Host Coverage
+## 5. Documentation Review
+- [ ] `README.md` version number and roadmap are current.
+- [ ] All `docs/*.md` files are free of broken links and outdated snippets.
+- [ ] `EFFECT_COOKBOOK.md` recipes are tested and copy-ready.
 
-Recommended test matrix:
+## 6. Git & Asset Management
+- [ ] No temporary files (e.g., `.tmp`, `.log`) are staged for commit.
+- [ ] `resources/` folder contains only required, optimized assets.
+- [ ] Commit message follows project standards (professional and descriptive).
 
-| Host | 32-bit | 64-bit |
-|---|---:|---:|
-| Excel | Test when available | Test when available |
-| Word | Optional | Optional |
-| PowerPoint | Optional | Optional |
-| Access | Optional | Optional |
+---
 
-At minimum, test the release on the Office architecture most likely to be used by your target audience.
-
-## Audio Feature Checks
-
-- File decoding works with WAV.
-- File decoding works with at least one compressed format supported by the test machine, such as MP3.
-- `RiffLoadFromMemory` loads a valid encoded byte array.
-- `RiffExportBufferWav` writes a playable WAV file.
-- `RiffRenderOscillatorWav` writes a playable oscillator WAV file.
-- Master peak metering returns changing values during playback.
-- Bus volume affects only voices assigned to that bus.
-
-## DSP Spot Checks
-
-Use `examples/RiffShowcase.bas` or equivalent manual tests to confirm:
-
-- Reverb tail is audible.
-- Delay feedback repeats.
-- Chorus and flanger modulation are audible.
-- Low-pass and high-pass filters change tone.
-- EQ changes bass, mid, and treble balance.
-- Distortion and bitcrusher are audible.
-- Tremolo and auto-pan modulate over time.
-- Ring modulation creates metallic tones.
-- Pitch changes playback speed or oscillator pitch.
-
-## Documentation Checks
-
-- Root [README](../README.md) points to the current package path.
-- [docs/README.md](README.md) includes all major documentation files.
-- [examples/README.md](../examples/README.md) describes how to import and run examples.
-- Usage snippets use public API names that exist in `package/Riff.bas`.
-- Paths in examples are clearly placeholders or host-derived paths.
-- No copyrighted audio files are required for examples.
-
-## Git Checks
-
-- Review `git status --short`.
-- Review `git diff --stat`.
-- Confirm generated or local-only files are not included.
-- Confirm no accidental edits were made to unrelated files.
-
-## Release Notes
-
-Include:
-
-- Version number.
-- New features.
-- Bug fixes.
-- Public API additions or breaking changes.
-- Documentation changes.
-- Known limitations.
-- Tested Office and Windows versions.
+## 7. Version Tagging
+- [ ] Update version constant (if any) in `Riff.bas`.
+- [ ] Push tags to the repository.
+- [ ] Verify CI/CD pipeline successfully builds release assets.

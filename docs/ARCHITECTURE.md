@@ -92,10 +92,13 @@ Riff stores its entire state in three module-level structures and one dynamic ar
 | Device format | `SampleRate`, `AvgBytesPerSec`, `MixFormatPtr` |
 | WASAPI pointers | `DeviceEnumerator`, `Device`, `AudioClient`, `RenderClient`, `BufferSize` |
 | Timer | `ThunkTimerCB`, `TimerID` |
-| Buses | `Buses(0 To 7)` |
+| Buses | `Buses(0 To 15)` |
 | Buffer pool | `Buffers(0 To 63)` as `RiffBuffer` |
 
 The `MagicCookie` field is set to `&H52494646` ("RIFF" in ASCII) at initialization and cleared to `0` on shutdown. The timer callback checks this value as its very first operation and exits immediately if it does not match, making the callback safe against stale timer firings after `RiffClose`.
+
+### Auto-Suspend Logic
+To minimize CPU impact during silence, Riff includes an optional `AutoSuspendTimer` feature. When enabled, the engine monitors active voice counts. If no voices are processed for a pre-defined interval, the `SetTimer` callback is killed. The engine "wakes up" automatically via `RiffEnsureRenderTimer` whenever a new `RiffPlay` or `RiffPlayOscillator` call is issued.
 
 ### RiffBuffer Pool
 
@@ -360,7 +363,9 @@ For oscillator voices (`IsOscillator = True`), no buffer reading occurs. Instead
 | 0 | Sine | `Sin(OscPhase)` |
 | 1 | Square | `IIf(Phase < 0.5, 1.0, -1.0) + BLEP` |
 | 2 | Sawtooth | `(2.0 × Phase) - 1.0 - BLEP` |
-| 3 | Noise | `(Rnd() × 2.0) - 1.0` |
+| 3 | White Noise | `(Rnd() × 2.0) - 1.0` |
+| 4 | Pink Noise | `Filtered White (Voss-McCartney)` |
+| 5 | Brown Noise | `Accumulated White (Integrator)` |
 
 The phase advances by `oscStep = (PI2 × OscFreq) / SampleRate` per frame and wraps modulo `PI2`. The same value is written to both `fL` and `fR` before pan and width processing, producing a mono-center oscillator that can be spread with `RiffVoiceStereoWidth`.
 
@@ -663,9 +668,19 @@ During frame processing, if the current frame's absolute amplitude exceeds the d
 
 ## Audio Buses
 
-The eight buses in `rCtx.Buses(0 To 7)` are simple `Single` scalars initialized to `1.0`. Bus volume is applied in the final gain stage: `Volume × MasterVolume × BusVolume`. There is no bus mixing, routing, or effects processing at the bus level — buses are purely a gain multiplier group.
+Audio buses provide a mechanism for global gain control and logical signal routing. Riff implements 16 independent buses (`rCtx.Buses(0 To 15)`), each serving as a destination for one or more playback voices.
 
-Each voice's `busID` field is read from the voice struct on every timer callback. Changing a bus volume via `RiffBusVolume(busID) = value` takes effect on the next timer callback with no latency beyond the 10 ms tick.
+### Signal Flow Arithmetic
+The engine uses a non-destructive, multiplicative gain stage. The final amplitude of a sample processed through the mixer is calculated as:
+
+`Final Sample = Input × Voice Volume × Bus Volume × Master Volume`
+
+This hierarchy allows for granular control at the source (Voice), group control at the mixer (Bus), and hardware-level control (Master) without altering the state of unrelated audio paths.
+
+### Mixing and Routing
+The sixteen buses are simple `Single` scalars initialized to `1.0` (unity gain). There is no bus-level DSP processing or cross-bus routing; buses are optimized purely for fast gain multiplication within the inner render loop.
+
+Each voice's `busID` field is evaluated on every timer callback. Modifying a bus volume via `RiffBusVolume(busID) = value` or `RiffBusFadeTo` updates the corresponding scalar in `rCtx.Buses`, taking effect on the very next render tick with no additional latency.
 
 ## Loop and Seek
 

@@ -1,25 +1,20 @@
 # Resources
 
-This directory contains visual assets used by repository documentation. These files are not required at runtime after `package/Riff.bas` has been imported into a VBA project.
+This directory contains visual assets and metadata used for repository documentation and branding. These files are used by the READMEs and the interactive showcase but are not required for the engine's core operation.
 
-## Contents
+## Directory Structure
 
 | Path | Purpose |
-|---|---|
-| `logo.png` | Project logo used by the root README. |
-| [`svg/`](svg/) | Microsoft Office, Windows, status, and documentation icons. |
+|:---|:---|
+| [**logo.png**](logo.png) | The primary Riff project logo. |
+| [**svg/**](svg/) | Scalable icons representing supported Office hosts and Windows versions. |
 
 ## Usage Guidelines
 
-- Keep runtime VBA code out of this directory.
-- Prefer stable asset filenames because README files link to these paths directly.
-- Use PNG or SVG assets for documentation graphics.
-- Add attribution notes when an asset is derived from another project or public source.
+- **Documentation:** When referencing assets in Markdown, use relative paths (e.g., `resources/logo.png`).
+- **Showcase:** The `RiffShowcase.bas` example may refer to these assets for UI labels or branding when running in a host that supports image embedding (like Excel).
+- **Contribution:** When adding new assets, prefer lightweight formats (SVG for icons, compressed PNG for images). Avoid large binary files that bloat the repository history.
 
-## Example README Reference
+## Attribution
 
-```md
-![Riff logo](resources/logo.png)
-```
-
-For SVG icons under `resources/svg/`, use relative paths from the README that includes them.
+Unless otherwise noted, all assets in this directory are original works created for the Riff project and are released under the same [MIT License](../LICENSE) as the source code.

@@ -1,56 +1,40 @@
 # Package
 
-This directory contains the production module that users import into their VBA projects.
+This directory contains the production-ready Riff module. This is the only file you need to integrate Riff into your own VBA project.
+
+## Module Index
 
 | File | Purpose |
-|---|---|
-| `Riff.bas` | The complete Riff audio engine. |
+|:---|:---|
+| [**Riff.bas**](Riff.bas) | The complete, standalone audio engine. Includes WASAPI output, Media Foundation decoding, and the DSP pipeline. |
 
-## Importing Riff
+## Installation
 
-1. Open the target Office file.
-2. Open the VBA editor with `Alt+F11`.
-3. Choose **File > Import File...**.
-4. Select `package/Riff.bas`.
-5. Save the host file as a macro-enabled workbook, document, database, or presentation.
+Integrating Riff into a new or existing Office project takes only a few seconds:
 
-Riff does not require references under **Tools > References**. The module declares and calls the required Windows APIs itself.
+1. **Download:** Get the latest `Riff.bas` from the [releases](https://github.com/vbacollective/riff/releases) page.
+2. **Import:**
+   - Open your Excel, Word, or Access file.
+   - Press `Alt + F11` to open the VBA Editor.
+   - Go to **File > Import File...** (or press `Ctrl + M`).
+   - Select `Riff.bas`.
+3. **Save:** Save your document as a macro-enabled file (e.g., `.xlsm`, `.docm`, `.accdb`).
 
-## First Run
+## Configuration & Dependencies
 
-Use this pattern before loading or playing audio:
+- **No References:** Riff does not require any entries in **Tools > References**. It uses late-bound COM calls and direct API declarations.
+- **No DLLs:** All required APIs (`kernel32`, `ole32`, `mfplat`, etc.) are built into every modern Windows installation (Windows 7 and later).
+- **Architecture:** Riff automatically detects whether you are running 32-bit or 64-bit Office and adjusts its internal pointer logic and machine-code thunks accordingly.
 
-```vb
-Public Sub InitializeAudio()
-    If Not RiffOpen() Then
-        MsgBox "Riff could not start the audio engine.", vbCritical
-        Exit Sub
-    End If
+## Maintenance
 
-    RiffMasterVolume = 0.8
-End Sub
-```
+To update Riff in an existing project:
+1. Right-click `Riff` in the Project Explorer and select **Remove Riff...**.
+2. Select **No** when asked to export it.
+3. Import the new version of `Riff.bas`.
 
-Release native resources when the host closes:
+## Related Resources
 
-```vb
-Private Sub Workbook_BeforeClose(Cancel As Boolean)
-    RiffClose
-End Sub
-```
-
-For Word, PowerPoint, Access, or Outlook, place the same `RiffClose` call in the closest available shutdown or close event for that host.
-
-## Packaging Notes
-
-- Keep `Riff.bas` as a standard module.
-- Do not split the module into VBA classes unless the engine architecture is intentionally redesigned.
-- Do not add external DLL, ActiveX, typelib, or registry requirements.
-- Keep public API changes documented in [docs/API_REFERENCE.md](../docs/API_REFERENCE.md).
-- Keep low-level implementation changes documented in [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md).
-
-## Related Files
-
-- [Examples](../examples/README.md)
-- [API Reference](../docs/API_REFERENCE.md)
-- [Architecture](../docs/ARCHITECTURE.md)
+- [**API Reference**](../docs/API_REFERENCE.md)
+- [**Architecture Design**](../docs/ARCHITECTURE.md)
+- [**Interactive Examples**](../examples/README.md)

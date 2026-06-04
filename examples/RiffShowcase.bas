@@ -103,6 +103,7 @@ Public Sub Showcase()
     If LAsk("7. Tremolo + AutoPan", "A held tone pulses in volume, then sweeps left and right. Headphones help.") Then Demo_TremoloAutoPan
     If LAsk("8. Ring Mod Metallic", "A clean tone turns bell-like, robotic, then metallic/alien.") Then Demo_RingModMetallic
     If LAsk("9. Pitch + Fade", "A tone fades in, bends down/up in pitch, then fades out.") Then Demo_PitchFade
+    If LAsk("10. Presets & Noise", "Instantly apply professional character presets and listen to new organic noise types.") Then Demo_PresetsNoise
 
     LStopClean 0.2!
     RiffClose
@@ -385,4 +386,46 @@ Public Sub Demo_PitchFade()
     Next i
 
     LStopClean 0.2!
+End Sub
+
+Public Sub Demo_PresetsNoise()
+    If Not LStartEngine() Then Exit Sub
+
+    Dim v As Long
+    v = RiffPlayOscillator(RiffWaveSine, 220!)
+    LSetVoice v, 0.15!, 0!
+
+    LStatus "Presets 1/3 - Sine wave: Radio preset"
+    RiffVoiceApplyPreset v, RiffFxRadio
+    LWait 4
+
+    LStatus "Presets 2/3 - Sine wave: Underwater preset"
+    RiffVoiceApplyPreset v, RiffFxUnderwater
+    LWait 4
+
+    LStatus "Presets 3/3 - Sine wave: Robot preset"
+    RiffVoiceApplyPreset v, RiffFxRobot
+    LWait 4
+
+    RiffStop v
+    LWait 0.2!
+
+    LStatus "Noise 1/3 - White Noise: Classic static"
+    v = RiffPlayNoise(RiffWaveWhiteNoise)
+    LSetVoice v, 0.08!, 0!
+    LWait 3
+    RiffStop v
+
+    LStatus "Noise 2/3 - Pink Noise: Natural/Rain-like"
+    v = RiffPlayNoise(RiffWavePinkNoise)
+    LSetVoice v, 0.12!, 0!
+    LWait 3
+    RiffStop v
+
+    LStatus "Noise 3/3 - Brown Noise: Deep/Thunder-like"
+    v = RiffPlayNoise(RiffWaveBrownNoise)
+    LSetVoice v, 0.18!, 0!
+    LWait 4
+
+    LStopClean 0.5!
 End Sub

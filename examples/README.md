@@ -1,164 +1,54 @@
 # Examples
 
-This directory contains ready-to-import VBA examples for Riff.
+This directory contains ready-to-import VBA examples and interactive demos for the Riff audio engine.
+
+## Available Modules
 
 | File | Purpose |
-|---|---|
-| `RiffShowcase.bas` | Interactive demos that make the major DSP effects easy to hear. |
+|:---|:---|
+| [**RiffShowcase.bas**](RiffShowcase.bas) | An interactive "Studio" demo. Use this to hear all DSP effects, oscillators, and mixing capabilities in real-time. |
 
-## Importing the Showcase
+## How to Run Examples
 
-1. Import `package/Riff.bas` first.
-2. Import `examples/RiffShowcase.bas`.
-3. Run `Showcase` from the VBA editor or from a button in the host application.
+1. **Import the Engine:** Ensure `package/Riff.bas` is already imported into your VBA project.
+2. **Import the Example:** Press `Alt + F11`, then **File > Import File...** and select the `.bas` file from this directory.
+3. **Run a Procedure:** Open the imported module and press `F5` on any `Public Sub`.
 
-The showcase module starts Riff if needed, runs short demonstrations for reverb, delay, chorus, flanger, filters, EQ, distortion, bitcrusher, tremolo, auto-pan, ring modulation, pitch, and fades, then shuts the engine down at the end.
+## Common Implementation Pattern
 
-## Example: Excel Button Playback
-
-Use this when a worksheet button should play a short sound effect.
+When building your own features, use this standard pattern for safe startup and clean audio logic.
 
 ```vb
-Option Explicit
+Public Sub Example_LoopingAmbience()
+    ' 1. Initialize hardware (safe to call multiple times)
+    If Not RiffOpen() Then Exit Sub
 
-Private clickBuffer As Long
-Private clickAudioReady As Boolean
+    ' 2. Load the asset (returns a buffer handle)
+    Dim buf As Long
+    buf = RiffLoad("C:\YourProject\Sounds\forest_loop.mp3")
 
-Public Sub LoadButtonAudio()
-    If Not RiffOpen() Then
-        MsgBox "Audio could not be initialized.", vbCritical
+    If buf < 0 Then
+        Debug.Print "Failed to load audio asset."
         Exit Sub
     End If
 
-    clickAudioReady = False
-    clickBuffer = RiffLoad("C:\Audio\button-click.wav")
+    ' 3. Play the asset (returns a voice handle)
+    Dim v As Long
+    v = RiffPlay(buf)
 
-    If clickBuffer < 0 Then
-        MsgBox "Button audio could not be loaded.", vbExclamation
-    Else
-        clickAudioReady = True
-    End If
-End Sub
-
-Public Sub Button_ClickSound()
-    If Not clickAudioReady Then Exit Sub
-
-    Dim voiceId As Long
-    voiceId = RiffPlay(clickBuffer)
-
-    If voiceId >= 0 Then
-        RiffVoiceVolume(voiceId) = 0.65
-        RiffVoiceHighPass(voiceId) = 0.2
+    If v >= 0 Then
+        ' 4. Configure DSP and playback
+        RiffVoiceLoop(v) = True
+        RiffVoiceVolume(v) = 0.5
+        RiffVoiceLowPass(v) = 0.8
+        RiffVoiceReverbMix(v) = 0.2
+        
+        ' 5. Apply a smooth fade-in
+        RiffFadeIn v, 2.5
     End If
 End Sub
 ```
 
-## Example: Ambient Loop With Fade
+## Host Shutdown
 
-This pattern is useful for menus, background ambience, or presentation audio that should enter and leave smoothly.
-
-```vb
-Option Explicit
-
-Private ambientBuffer As Long
-Private ambientVoice As Long
-Private ambientPlaying As Boolean
-
-Public Sub StartAmbientLoop()
-    If Not RiffOpen() Then Exit Sub
-
-    ambientPlaying = False
-    ambientBuffer = RiffLoad("C:\Audio\ambient-loop.mp3")
-    If ambientBuffer < 0 Then Exit Sub
-
-    ambientVoice = RiffPlay(ambientBuffer)
-
-    If ambientVoice >= 0 Then
-        RiffVoiceLoop(ambientVoice) = True
-        RiffVoiceVolume(ambientVoice) = 0.4
-        RiffVoiceReverbMix(ambientVoice) = 0.35
-        RiffFadeIn ambientVoice, 1.5
-        ambientPlaying = True
-    End If
-End Sub
-
-Public Sub StopAmbientLoop()
-    If ambientPlaying Then
-        RiffFadeOut ambientVoice, 1!
-        ambientPlaying = False
-    End If
-End Sub
-```
-
-## Example: Loop Region
-
-Use loop regions when an audio file has a non-repeating intro followed by a seamless loop.
-
-```vb
-Public Sub PlayMusicWithIntro()
-    Dim bufferId As Long
-    bufferId = RiffLoad("C:\Audio\music-with-intro.wav")
-    If bufferId < 0 Then Exit Sub
-
-    Dim voiceId As Long
-    voiceId = RiffPlay(bufferId)
-    If voiceId < 0 Then Exit Sub
-
-    RiffVoiceLoop(voiceId) = True
-    RiffSetLoopRegionSec voiceId, 4.2, 38.7
-End Sub
-```
-
-## Example: VU Meter Polling
-
-Peak meters can be read from a form timer, worksheet timer, or host-specific update loop.
-
-```vb
-Private Sub Timer_Tick()
-    Dim peakLeft As Single
-    Dim peakRight As Single
-
-    RiffMasterGetPeak peakLeft, peakRight
-
-    Dim percent As Long
-    percent = CLng(((peakLeft + peakRight) * 0.5) * 100)
-
-    VUBar.Width = percent * 2
-
-    If percent > 80 Then
-        VUBar.BackColor = RGB(255, 50, 50)
-    ElseIf percent > 50 Then
-        VUBar.BackColor = RGB(255, 200, 0)
-    Else
-        VUBar.BackColor = RGB(50, 200, 50)
-    End If
-End Sub
-```
-
-## Example: Embedded Byte Array Loading
-
-`RiffLoadFromMemory` lets an application load encoded audio from a byte array. This is useful when you store small assets in a worksheet, custom document part, resource table, or generated array.
-
-```vb
-Public Sub PlayEmbeddedSound(ByRef encodedAudio() As Byte)
-    If Not RiffOpen() Then Exit Sub
-
-    Dim bufferId As Long
-    bufferId = RiffLoadFromMemory(encodedAudio)
-    If bufferId < 0 Then Exit Sub
-
-    RiffPlay bufferId
-End Sub
-```
-
-## Cleanup
-
-Always shut Riff down when the host file closes:
-
-```vb
-Private Sub Workbook_BeforeClose(Cancel As Boolean)
-    RiffClose
-End Sub
-```
-
-For non-Excel hosts, use the equivalent close or shutdown event.
+Always include a call to `RiffClose` in your host's shutdown event (e.g., `Workbook_BeforeClose` in Excel) to ensure all native resources are released.
