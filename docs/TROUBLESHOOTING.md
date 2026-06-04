@@ -2,8 +2,6 @@
 
 This document provides solutions for common integration, playback, and stability issues encountered when using Riff.
 
----
-
 ## Common Diagnostic Path
 
 If you are not hearing audio or encountering errors, follow these steps:
@@ -12,8 +10,6 @@ If you are not hearing audio or encountering errors, follow these steps:
 2. **Check Error Code:** Immediately after a failure, inspect `Debug.Print RiffLastError`.
 3. **Verify Paths:** Ensure file paths passed to `RiffLoad` are absolute and accessible.
 4. **Check Device:** Confirm the Windows default playback device is active and not muted by another application.
-
----
 
 ## Specific Issues
 
@@ -35,8 +31,6 @@ If you are not hearing audio or encountering errors, follow these steps:
 ### 4. Audio is Distorted or "Crackly"
 - **Clipping:** If many loud voices are played simultaneously, the master bus may clip. Lower `RiffMasterVolume` or use the `RiffVoiceCompressor` on individual voices.
 - **CPU Saturation:** While Riff is highly optimized, extremely complex DSP chains on all 32 voices simultaneously may stress older CPUs. Disable unused effects by setting their depth/mix to 0.
-
----
 
 ## Diagnostic Snippet
 

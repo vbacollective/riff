@@ -4,8 +4,6 @@ Thank you for your interest in contributing to Riff! We welcome contributions th
 
 As Riff is a high-performance audio engine written in VBA with native thunks, it has unique architectural constraints. Please review these guidelines before submitting a pull request.
 
----
-
 ## Development Workflow
 
 1. **Fork the Repository**: Create your own fork of the project.
@@ -13,8 +11,6 @@ As Riff is a high-performance audio engine written in VBA with native thunks, it
 3. **Implement Changes**: Ensure your code follows the established [Coding Standards](#coding-standards).
 4. **Test Thoroughly**: Use the `examples/RiffShowcase.bas` and create new test procedures to verify your changes in both 32-bit and 64-bit Office.
 5. **Submit a Pull Request**: Provide a clear description of your changes and why they are necessary.
-
----
 
 ## Coding Standards
 
@@ -31,13 +27,9 @@ As Riff is a high-performance audio engine written in VBA with native thunks, it
 - **Comments**: Use Doxygen-style comments (`'/** ... */`) for public API documentation.
 - **Explicit**: Always use `Option Explicit` and explicitly declare all variable types.
 
----
-
 ## Native Thunks
 
 Riff uses machine-code thunks for the high-resolution audio callback. **Do not modify the hex strings in `InitThunks` unless you are an expert in x86/x64 assembly.** If you need to change the callback logic, ensure you update both the 32-bit and 64-bit opcodes and verify them across different Windows versions.
-
----
 
 ## Testing Requirements
 
@@ -46,16 +38,12 @@ Every pull request must be verified against:
 - **DSP**: No audible glitches or regressions in existing effects.
 - **Stability**: No crashes during high-volume playback or project reset.
 
----
-
 ## Documentation
 
 If you add a new public function or property, you **must** update:
 1. `API_REFERENCE.md`
 2. `ARCHITECTURE.md` (if internal logic changed)
 3. `EFFECT_COOKBOOK.md` (if it enables new sound design possibilities)
-
----
 
 ## License
 

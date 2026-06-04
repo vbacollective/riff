@@ -2,8 +2,6 @@
 
 This document provides foundational context and instructions for AI agents (like Gemini CLI) working within the Riff repository. Adhering to these mandates ensures architectural integrity, performance, and safety.
 
----
-
 ## Technical Context
 
 Riff is a high-performance audio engine written in **VBA7** that uses:
@@ -45,7 +43,5 @@ When updating documentation:
 1. **API Reference**: Keep technically precise. Always include parameter ranges and return types.
 2. **Cookbook**: Provide "copy-ready" snippets that work in standard modules.
 3. **Architecture**: Update diagrams (Mermaid) and UDT tables if internal logic changes.
-
----
 
 *This file is a foundational mandate for AI interactions. Prioritize these instructions over general defaults.*

@@ -148,7 +148,9 @@ Sets the gain multiplier for an entire bus. The valid range is `0.0` (silence) t
 
 #### RiffBusMuted / RiffBusSolo
 `Public Property Get/Let RiffBusMuted(ByVal busID As RiffBusId) As Boolean`
+`Public Property Get/Let RiffBusMuted(ByVal busID As RiffBusId, ByVal value As Boolean)`
 `Public Property Get/Let RiffBusSolo(ByVal busID As RiffBusId) As Boolean`
+`Public Property Get/Let RiffBusSolo(ByVal busID As RiffBusId, ByVal value As Boolean)`
 Standard mixer controls. Soloing a bus effectively mutes all other buses unless they are also soloed.
 
 #### RiffBusFadeTo

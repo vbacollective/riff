@@ -2,8 +2,6 @@
 
 Use this checklist to ensure every Riff release meets professional quality standards before publishing.
 
----
-
 ## 1. Package Integrity
 - [ ] `package/Riff.bas` is the only production module and has no external dependencies.
 - [ ] No `Tools > References` are required in a clean VBA project.
@@ -37,8 +35,6 @@ Use this checklist to ensure every Riff release meets professional quality stand
 - [ ] No temporary files (e.g., `.tmp`, `.log`) are staged for commit.
 - [ ] `resources/` folder contains only required, optimized assets.
 - [ ] Commit message follows project standards (professional and descriptive).
-
----
 
 ## 7. Version Tagging
 - [ ] Update version constant (if any) in `Riff.bas`.
