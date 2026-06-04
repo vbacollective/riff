@@ -64,8 +64,6 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!)
 - [Troubleshooting](#troubleshooting)
 - [Complete Public API Index](#complete-public-api-index)
 
----
-
 ## Core Concepts
 
 ### Mental Model
@@ -339,8 +337,6 @@ RiffPlayNoiseBus
 
 They are compatibility wrappers and should generally not be used in new examples unless you are preserving old code style.
 
----
-
 ## Enums
 
 ### RiffWaveType
@@ -531,8 +527,6 @@ End Enum
 | `RiffErrorDecodeFailed` | Media Foundation could not produce usable PCM. |
 | `RiffErrorUnsupportedFormat` | Device/source format is unsupported by the renderer. |
 
----
-
 ## Initialization and Teardown
 
 ### RiffOpen
@@ -639,8 +633,6 @@ RiffAutoSuspendTimer = True
 ```
 
 Use `False` when you need the render loop to stay warm for rapid repeated playback, but prefer `True` for Office stability.
-
----
 
 ## Diagnostics
 
@@ -771,8 +763,6 @@ Public Sub PrintRiffDiagnostics()
 End Sub
 ```
 
----
-
 ## Global Settings
 
 ### RiffMasterVolume
@@ -809,8 +799,6 @@ Dim l As Single, r As Single
 RiffMasterGetPeak l, r
 Debug.Print "Master peak:", Format(l, "0.00"), Format(r, "0.00")
 ```
-
----
 
 ## Master Bus Processors
 
@@ -997,8 +985,6 @@ Public Sub SetNightMix()
     RiffBusFadeTo RiffBusSfx, 0.55!, 300
 End Sub
 ```
-
----
 
 ## Audio Buses API
 
@@ -1201,8 +1187,6 @@ Public Sub ApplyAudioSettings(ByVal masterPct As Single, ByVal musicPct As Singl
 End Sub
 ```
 
----
-
 ## Asset Loading and Memory
 
 ### RiffLoad
@@ -1287,8 +1271,6 @@ Public Function AudioLoadAll() As Boolean
 End Function
 ```
 
----
-
 ## Export and Offline Rendering
 
 ### RiffExportBufferWav
@@ -1321,8 +1303,6 @@ RiffRenderOscillatorWav RiffWavePinkNoise, 0!, 5!, "C:\Temp\rain_noise.wav"
 ```
 
 Offline rendering is dry. It does not apply per-voice DSP presets or bus settings.
-
----
 
 ## Playback
 
@@ -1441,8 +1421,6 @@ Public Function RiffPlayBusOnce(ByVal bufferHandle As Long, ByVal busID As RiffB
 Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
 Public Function RiffPlayNoiseBus(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
 ```
-
----
 
 ## Voice State and Transport
 
@@ -1620,8 +1598,6 @@ If Not RiffBufferIsPlaying(sndMusic, RiffBusMusic) Then
 End If
 ```
 
----
-
 ## Voice Properties
 
 ### RiffVoiceBus
@@ -1718,8 +1694,6 @@ Stereo pan. `-1` is left, `0` is center, `1` is right.
 ```vb
 RiffVoicePan(v) = -0.35!
 ```
-
----
 
 ## Effect Helpers and Presets
 
@@ -1827,8 +1801,6 @@ Public Sub PlayUnderwaterImpact(ByVal buf As Long)
 End Sub
 ```
 
----
-
 ## Musical Preset Packs
 
 v1.0.9 expands Riff's preset set beyond utility effects into more musical sound-design packs. These presets are still implemented as combinations of existing per-voice DSP controls, so they remain lightweight and compatible with the normal voice pipeline.
@@ -1918,8 +1890,6 @@ Public Sub ExitCave()
     RiffMasterApplyPreset RiffMasterFxClean
 End Sub
 ```
-
----
 
 ## DSP Parameters
 
@@ -2268,8 +2238,6 @@ RiffVoiceDelayFeedback(v) = 0.35!
 RiffVoiceDelayMix(v) = 0.45!
 ```
 
----
-
 ## Practical Recipes
 
 ### Full Startup and Shutdown Pattern
@@ -2495,8 +2463,6 @@ Public Sub PrintRiffDiagnostics()
 End Sub
 ```
 
----
-
 ## Best Practices
 
 ### Load During Initialization
@@ -2603,8 +2569,6 @@ RiffMasterApplyPreset RiffMasterFxGlue, 0.5!
 ```
 
 Avoid stacking heavy master coloration with many already-heavy voice presets unless that is the intended effect.
-
----
 
 ## Troubleshooting
 
@@ -2749,8 +2713,6 @@ Reset the master stage:
 RiffMasterClearProcessors
 RiffMasterApplyPreset RiffMasterFxClean
 ```
-
----
 
 ## Complete Public API Index
 
