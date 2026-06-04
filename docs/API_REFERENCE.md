@@ -1,265 +1,2425 @@
 # Riff API Reference
 
-This document provides a comprehensive and exhaustive guide to the public interface of **Riff.bas**, a high-performance, single-file WASAPI audio engine for VBA. It covers every public function, property, and enumeration required to integrate professional audio playback, synthesis, and real-time DSP into Microsoft Office applications.
+**Riff.bas** is a high-performance VBA audio engine for Windows Office hosts. It uses Media Foundation for decoding, WASAPI shared-mode output for playback, and a real-time DSP pipeline written directly in VBA with a small native timer thunk. It supports x86 and x64 VBA, static audio buffers, polyphonic voices, audio buses, synthetic oscillators, white/pink/brown noise, WAV export, peak meters, adaptive buffering, and a full per-voice effects chain.
+
+This reference documents the current public API from the adaptive-buffer architecture build. Older helper names are still documented when they remain available for compatibility, but the recommended API style is now the unified form:
+
+```vb
+voice = RiffPlay(bufferHandle, RiffBusSfx, False, 0.9, 0!)
+music = RiffPlayOnce(musicBuffer, RiffBusMusic, True, 0.45, 0!)
+noise = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.08, 0!)
+osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!)
+```
 
 ## Table of Contents
 
 - [Core Concepts](#core-concepts)
-- [Signal Hierarchy & Routing](#signal-hierarchy--routing)
-- [Initialization and Lifecycle](#initialization-and-lifecycle)
-- [Engine Configuration & State](#engine-configuration--state)
-- [Audio Mixer Buses](#audio-mixer-buses)
-- [Buffer Management](#buffer-management)
-- [Playback Entry Points](#playback-and-voice-spawning)
-- [Synthesis and Oscillators](#synthesis-and-oscillators)
-- [Voice Playback Control](#voice-playback-control)
-- [DSP Pipeline Matrix](#dsp-pipeline-matrix)
-- [Effect Presets](#effect-presets)
-- [Offline Rendering and Export](#offline-rendering-and-export)
-- [Enumerations](#enumerations)
+  - [Mental Model](#mental-model)
+  - [Engine Lifecycle](#engine-lifecycle)
+  - [Buffer Pool](#buffer-pool)
+  - [Voice Pool](#voice-pool)
+  - [Audio Buses](#audio-buses)
+  - [Adaptive Buffering](#adaptive-buffering)
+  - [Timer and Host Behavior](#timer-and-host-behavior)
+  - [DSP Pipeline](#dsp-pipeline)
+  - [Oscillators and Noise](#oscillators-and-noise)
+  - [WAV Export](#wav-export)
+  - [Compatibility Strategy](#compatibility-strategy)
+- [Enums](#enums)
+  - [RiffWaveType](#riffwavetype)
+  - [RiffBusId](#riffbusid)
+  - [RiffEffectPreset](#riffeffectpreset)
+  - [RiffErrorCode](#rifferrorcode)
+- [Initialization and Teardown](#initialization-and-teardown)
+- [Diagnostics](#diagnostics)
+- [Global Settings](#global-settings)
+- [Audio Buses](#audio-buses-api)
+- [Asset Loading and Memory](#asset-loading-and-memory)
+- [Export and Offline Rendering](#export-and-offline-rendering)
+- [Playback](#playback)
+- [Voice State and Transport](#voice-state-and-transport)
+- [Voice Properties](#voice-properties)
+- [Effect Helpers and Presets](#effect-helpers-and-presets)
+- [DSP Parameters](#dsp-parameters)
+  - [Bitcrusher](#bitcrusher)
+  - [Ring Modulator](#ring-modulator)
+  - [Auto-Pan](#auto-pan)
+  - [3-Band EQ](#3-band-eq)
+  - [Compressor](#compressor)
+  - [Flanger](#flanger)
+  - [Distortion](#distortion)
+  - [Low-Pass and High-Pass Filters](#low-pass-and-high-pass-filters)
+  - [Stereo Width](#stereo-width)
+  - [Tremolo](#tremolo)
+  - [Chorus](#chorus)
+  - [Reverb](#reverb)
+  - [Delay](#delay)
+- [Practical Recipes](#practical-recipes)
+- [Best Practices](#best-practices)
+- [Troubleshooting](#troubleshooting)
+- [Complete Public API Index](#complete-public-api-index)
+
+---
 
 ## Core Concepts
 
-### Numeric Handles
-Riff uses zero-based `Long` handles to represent resources. These handles are used as indices into optimized internal arrays to ensure high-performance, sample-accurate processing.
-- **Buffer Handles (0 to 63):** Represent decoded, uncompressed PCM data residing in system memory.
-- **Voice Handles (0 to 31):** Represent active playback channels. A voice is spawned when you call a playback function and is recycled once it finishes or is stopped.
-- **Bus IDs (0 to 15):** Represent logical mixing groups.
+### Mental Model
 
-### Resource Limits
-- **Voices:** 32 simultaneous polyphonic channels.
-- **Buffers:** 64 statically allocated audio slots.
-- **Buses:** 16 independent mixer buses.
+Riff has four main layers:
 
-## Signal Hierarchy & Routing
+1. **Engine**: `RiffOpen`, `RiffClose`, `RiffSuspend`, and `RiffWake` manage Media Foundation, WASAPI, the audio timer, and native memory.
+2. **Buffers**: `RiffLoad` and `RiffLoadFromMemory` decode audio into reusable static buffers.
+3. **Voices**: `RiffPlay`, `RiffPlayOnce`, `RiffPlayOscillator`, and `RiffPlayNoise` create active sound instances. A voice is the thing you control with volume, pan, pitch, loop, fade, and effects.
+4. **Buses**: `RiffBusMusic`, `RiffBusSfx`, `RiffBusUi`, and others group voices for global volume/mute/solo/fade control.
 
-Riff implements a multiplicative gain hierarchy that allows for granular control over the final output without altering individual asset states.
+The key distinction is:
 
-### The Signal Chain
-The final amplitude of any sample reaching the hardware is calculated as:
-**Output = Sample × Voice Volume × Bus Volume × Master Volume**
+```txt
+Buffer = loaded audio asset
+Voice  = one currently playing instance of a buffer, oscillator, or noise source
+Bus    = group routing layer for volume/mute/solo/fade/peak control
+```
 
-1. **Voice Volume:** Set per instance (e.g., an individual explosion).
-2. **Bus Volume:** Set per category (e.g., all Sound Effects).
-3. **Master Volume:** Set for the entire application.
+A single buffer can be played many times at once, producing many voices. Each voice can have different DSP settings.
 
-## Initialization and Lifecycle
+```vb
+Dim coin As Long
+Dim v1 As Long
+Dim v2 As Long
 
-### RiffOpen
-`Public Function RiffOpen() As Boolean`
-Initializes the Media Foundation decoding subsystem, acquires the default WASAPI render device, and starts the high-resolution (10ms) DSP timer thunk.
-- **Returns:** `True` if initialization succeeded. `False` if failed. Check `RiffLastError` for COM or hardware errors.
-- **Note:** Safe to call multiple times; subsequent calls return `True` immediately if already running.
+coin = RiffLoad("C:\Game\Audio\coin.wav")
 
-### RiffClose
-`Public Sub RiffClose()`
-Shuts down the engine completely. This stops the render timer, releases all WASAPI/COM interfaces, and frees all memory allocated via `VirtualAlloc`.
-- **CRITICAL:** You **must** call this in your host's shutdown event (e.g., `Workbook_BeforeClose`). Failure to close the engine leaves a native timer running in the background, which will likely crash the host on project reset.
+v1 = RiffPlay(coin, RiffBusSfx, False, 1!, -0.5!)
+v2 = RiffPlay(coin, RiffBusSfx, False, 0.7!, 0.5!)
+```
 
-### RiffSuspend
-`Public Sub RiffSuspend()`
-Pauses the native render timer to save CPU cycles. All buffers and voice states are preserved in memory. Useful when the application is minimized or inactive.
+### Engine Lifecycle
 
-### RiffWake
-`Public Function RiffWake() As Boolean`
-Restarts the render timer after suspension.
-- **Returns:** `True` if the timer is successfully running.
+A typical program opens Riff once, loads assets, plays sounds during interaction, then closes Riff when the workbook or presentation exits.
 
-## Engine Configuration & State
+```vb
+Private sndClick As Long
+Private sndMusic As Long
+Private musicVoice As Long
 
-### RiffIsInitialized
-`Public Property Get RiffIsInitialized() As Boolean`
-Indicates whether the engine has been successfully opened and is ready to process audio.
+Public Sub AudioInit()
+    If Not RiffOpen() Then
+        MsgBox "Riff failed to initialize. Error: " & CStr(RiffLastError)
+        Exit Sub
+    End If
 
-### RiffLastError
-`Public Property Get RiffLastError() As RiffErrorCode`
-Returns the code of the most recent failure. Successful API calls reset this to `RiffErrorNone`.
+    sndClick = RiffLoad(ActivePresentation.Path & "\audio\click.wav")
+    sndMusic = RiffLoad(ActivePresentation.Path & "\audio\music.mp3")
 
-### RiffAutoSuspendTimer
-`Public Property Get/Let RiffAutoSuspendTimer() As Boolean`
-When enabled (`True`), the engine automatically suspends its render timer after 50 consecutive idle ticks (approx. 750ms of silence). It automatically wakes up when a new playback command is issued.
+    RiffBusVolume(RiffBusMusic) = 0.45!
+    RiffBusVolume(RiffBusSfx) = 0.9!
 
-### RiffMasterVolume
-`Public Property Get/Let RiffMasterVolume() As Single`
-Sets the final gain multiplier for the entire engine.
-- **Range:** `0.0` (Mute) to `1.0` (Unity). Defaults to `1.0`.
+    musicVoice = -1
+End Sub
 
-### RiffMasterGetPeak
-`Public Sub RiffMasterGetPeak(ByRef peakLeft As Single, ByRef peakRight As Single)`
-Retrieves the instantaneous peak amplitude of the master output.
-- **Parameters:** `peakLeft` and `peakRight` are passed by reference and updated with values from `0.0` to `1.0+` (clipping).
+Public Sub AudioShutdown()
+    RiffClose
+End Sub
+```
 
-### Engine Constants
-- `RiffMaxVoices`: Returns `32`.
-- `RiffMaxBuffers`: Returns `64`.
-- `RiffMaxBuses`: Returns `16`.
+### Buffer Pool
 
-## Audio Mixer Buses
+Riff stores decoded audio in a fixed pool of **64 buffers**. A buffer handle is an integer from `0` to `63`. Loading returns `-1` on failure.
 
-Buses act as logical summing groups for routing and mixing.
+```vb
+Dim explosion As Long
+explosion = RiffLoad("C:\Game\explosion.wav")
 
-### RiffBusVolume
-`Public Property Get/Let RiffBusVolume(ByVal busID As RiffBusId) As Single`
-Sets the volume for an entire bus.
-- **Range:** `0.0` to `2.0` (+6dB boost). Defaults to `1.0`.
+If explosion = -1 Then
+    Debug.Print "Load failed:", RiffLastError
+End If
+```
 
-### RiffBusMuted
-`Public Property Get/Let RiffBusMuted(ByVal busID As RiffBusId) As Boolean`
-Silences a bus without altering its `RiffBusVolume` setting.
+Loading is synchronous. Decode files during setup, not during frame-by-frame gameplay or UI animation.
 
-### RiffBusSolo
-`Public Property Get/Let RiffBusSolo(ByVal busID As RiffBusId) As Boolean`
-When one or more buses are in Solo mode, only those buses (and any others also in Solo) will be audible. All other non-soloed buses are implicitly muted.
+### Voice Pool
 
-### RiffBusFadeTo
-`Public Sub RiffBusFadeTo(ByVal busID As RiffBusId, ByVal targetVolume As Single, Optional ByVal durationMs As Long = 250)`
-Smoothly transitions a bus volume. This is processed entirely in the native background thread and is non-blocking.
+Riff supports **32 active voices**. A voice handle is an integer from `0` to `31`. Playback functions return `-1` when no voice slot is available.
 
-### RiffBusGetPeak
-`Public Sub RiffBusGetPeak(ByVal busID As RiffBusId, ByRef peakLeft As Single, ByRef peakRight As Single)`
-Retrieves the post-fader output level for a specific bus.
+```vb
+Dim v As Long
+v = RiffPlay(explosion, RiffBusSfx)
 
-### RiffBusReset
-`Public Sub RiffBusReset(ByVal busID As RiffBusId)`
-Restores a bus to its default state (Volume 1.0, Unmuted, No Solo, No Fades).
+If v <> -1 Then
+    RiffVoiceVolume(v) = 0.8!
+    RiffVoicePan(v) = 0.2!
+End If
+```
 
-## Buffer Management
+Each voice has its own source position, loop state, volume, pitch, pan, peak meters, and DSP state.
 
-Buffers store decoded audio data in memory for instant playback.
+### Audio Buses
 
-### RiffLoad
-`Public Function RiffLoad(ByVal filePath As String) As Long`
-Decodes an audio file into a free buffer slot. Supports WAV, MP3, AAC, FLAC, and OGG (on Windows 10+).
-- **Returns:** Buffer handle (`0-63`) or `-1` on failure.
+Riff provides **16 buses**:
 
-### RiffLoadFromMemory
-`Public Function RiffLoadFromMemory(ByRef audioData() As Byte) As Long`
-Decodes audio from a raw binary array.
-- **Note:** The array must contain a valid file format (e.g., the contents of an MP3 file), not raw PCM samples.
+```txt
+Main, Sfx, Music, Voice, Ui, Aux1 ... Aux11
+```
 
-### RiffUnload
-`Public Sub RiffUnload(ByVal bufferHandle As Long)`
-Kills any voices using the buffer and frees the associated physical memory.
+Buses are used to group voices. For example, all music voices can be routed to `RiffBusMusic`, all effects to `RiffBusSfx`, and all interface sounds to `RiffBusUi`.
 
-### RiffBufferDurationSec
-`Public Property Get RiffBufferDurationSec(ByVal bufferHandle As Long) As Single`
-Returns the total length of the buffer in seconds.
+```vb
+RiffBusVolume(RiffBusMusic) = 0.35!
+RiffBusVolume(RiffBusSfx) = 0.9!
+RiffBusVolume(RiffBusUi) = 1!
+```
 
-## Playback and Voice Spawning
+The effective output gain is conceptually:
 
-These functions create a new **Voice** to play a loaded **Buffer**.
+```txt
+voice output × voice volume × bus volume × master volume
+```
 
-### RiffPlay
-`Public Function RiffPlay(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = 1.0, Optional ByVal pan As Single = 0.0) As Long`
-The primary playback function.
-- **Returns:** Voice handle (`0-31`) or `-1` if the pool is full.
+Buses also support mute, solo, fade, and peak metering.
 
-### RiffPlayOnce
-`Public Function RiffPlayOnce(ByVal bufferHandle As Long, ...)`
-Starts playback **only if** the same buffer is not already playing on the target bus. Useful for preventing "phasing" sounds or duplicate UI clicks.
+### Adaptive Buffering
 
-### RiffPlayBus
-`Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId, ...)`
-A compatibility wrapper for routing a buffer directly to a bus.
+The adaptive-buffer build tries to balance low latency and stability. Fixed low buffers respond quickly but can underrun when PowerPoint, Excel, the VBE, or the PC stalls. Fixed high buffers are stable but make stop/play feel delayed.
 
-## Synthesis and Oscillators
+Riff adapts dynamically:
 
-Oscillators generate sound mathematically and do not require a loaded buffer. They use the same DSP pipeline as buffers.
+```txt
+Normal state:      target queue ≈ 60 ms
+Recovery state:    target queue ≈ 160 ms
+Panic state:       target queue ≈ 200 ms
+Stable recovery:   gradually returns toward 60 ms
+```
 
-### RiffPlayOscillator
-`Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ...args) As Long`
-Spawns a periodic synth voice (Sine, Square, Saw).
+The device buffer is initialized large enough to support the safe queue target, while normal playback still aims for low latency. Use diagnostics to inspect current behavior:
 
-### RiffPlayNoise
-`Public Function RiffPlayNoise(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, ...args) As Long`
-Spawns a noise generator.
-- **Types:** White (random), Pink (1/f), or Brown (1/f²).
+```vb
+Debug.Print "Queue target:", RiffAdaptiveQueueMs
+Debug.Print "Underruns:", RiffUnderrunCount
+Debug.Print "Padding:", RiffLastPaddingFrames
+Debug.Print "Available:", RiffLastFramesAvailable
+Debug.Print "Written:", RiffLastFramesWritten
+```
 
-## Voice Playback Control
+Use `RiffResetAdaptiveStats` before a test run.
 
-Once a voice handle is obtained, you can manipulate its playback state in real-time.
+```vb
+RiffResetAdaptiveStats
+```
 
-### Status and Identification
-- **RiffVoiceIsPlaying:** Returns `True` if the voice is active and not paused.
-- **RiffVoiceIsPaused:** Returns `True` if the voice is held in a paused state.
-- **RiffFindPlayingVoice:** Finds an active voice handle for a given buffer.
+### Timer and Host Behavior
 
-### Transport Control
-- **RiffPause / RiffResume:** Suspends or continues playback.
-- **RiffStop:** Immediately kills the voice and clears its DSP state.
-- **RiffStopAll:** Kills all active voices across all buses.
+Riff uses a Windows timer and a small native thunk to call back into the VBA runtime. This allows real-time-ish playback inside Office without requiring an external DLL. The thunk checks the VBE state to reduce the risk of callbacks continuing after a VBA reset or break.
 
-### Envelopes and Regions
-- **RiffFadeIn / RiffFadeOut:** Applies a linear gain ramp over a specified duration in seconds.
-- **RiffSetLoopRegionSec:** Defines the start and end points for looping within a buffer.
+The adaptive build also supports timer suspension:
 
-### Real-time Parameters
-- **RiffVoiceVolume:** Per-voice gain (`0.0` to `2.0`).
-- **RiffVoicePitch:** Pitch and speed multiplier (`0.1` to `8.0`). `1.0` is normal.
-- **RiffVoicePan:** Stereo position from `-1.0` (Full Left) to `1.0` (Full Right).
-- **RiffVoicePositionSec:** Gets or sets the current playback cursor in seconds.
+- `RiffSuspend` stops the render timer without unloading buffers.
+- `RiffWake` restarts the engine/timer path when needed.
+- `RiffAutoSuspendTimer` can allow Riff to suspend the timer when idle.
 
-## DSP Pipeline Matrix
+Office is not a real-time audio host. If the UI freezes, Windows is under heavy load, or the VBE is in an unusual state, playback can still be affected. The adaptive queue reduces audible dropouts but cannot fully replace a native audio thread.
 
-Every voice passes through a fixed chain of DSP stages. Setting a "Mix" or "Depth" property to `0.0` bypasses that stage for performance.
+### DSP Pipeline
 
-### 1. Bitcrusher & Distortion
-- **RiffVoiceBitDepth:** Simulates lower bit depths (`2` to `32`).
-- **RiffVoiceSampleRateReduction:** Simple integer downsampling (`1` to `20`).
-- **RiffVoiceDistortion:** Multiplier-based hard clipping.
+Each active voice goes through a fixed per-sample DSP chain. The conceptual order is:
 
-### 2. Filters & EQ
-- **RiffVoiceLowPass / RiffVoiceHighPass:** Resonance-compensated Biquad filters.
-- **RiffVoiceSetFilter:** Sets both Low-Pass and High-Pass simultaneously.
-- **RiffVoiceEqBass / Mid / Treble:** Gain multipliers for a 3-band parametric EQ.
+1. Source read: buffer, oscillator, or noise generator.
+2. Pitch/source stepping.
+3. Bitcrusher sample-rate hold.
+4. Bit-depth reduction.
+5. Distortion/saturation.
+6. Low-pass and high-pass filters.
+7. 3-band EQ.
+8. Ring modulation.
+9. Tremolo.
+10. Stereo width.
+11. Flanger.
+12. Chorus.
+13. Delay.
+14. Reverb.
+15. Compressor.
+16. Auto-pan.
+17. Voice gain, bus gain, master gain.
+18. Fade gain.
+19. Peak metering and mix accumulation.
 
-### 3. Modulation Effects
-- **RiffVoiceRingModFreq / Mix:** Metallic, robotic ring modulation.
-- **RiffVoiceTremoloRate / Depth:** Periodic volume oscillation.
-- **RiffVoiceAutoPanRate / Depth:** Periodic stereo movement.
-- **RiffVoiceChorusRate / Depth:** Shimmering, thick ensemble effect.
-- **RiffVoiceFlangerRate / Depth / Feedback:** Resonant, sweeping "jet" effect.
+Most DSP stages are skipped when their parameters are at neutral defaults. For example, delay is skipped when `RiffVoiceDelayMix = 0`, and EQ is skipped when all EQ bands are `1.0`.
 
-### 4. Spatial Effects
-- **RiffVoiceReverbMix / Time:** High-quality Freeverb implementation.
-- **RiffVoiceDelayTime / Feedback / Mix:** Standard echo/delay. Max delay is ~1.9s.
-- **RiffVoiceStereoWidth:** Controls the side-channel gain. `0.0` is Mono, `1.0` is standard Stereo, `5.0` is ultra-wide.
+### Oscillators and Noise
 
-### 5. Dynamics
-- **RiffVoiceCompressorThreshold / Ratio:** Real-time gain reduction with automatic attack/release.
+Riff can synthesize audio without a file:
 
-## Effect Presets
+```vb
+Dim beep As Long
+beep = RiffPlayOscillator(RiffWaveSine, 880!, RiffBusUi, 0.25!)
+RiffFadeOut beep, 0.12!
+```
 
-### RiffVoiceApplyPreset
-`Public Sub RiffVoiceApplyPreset(ByVal voiceHandle As Long, ByVal preset As RiffEffectPreset, Optional ByVal amount As Single = 1.0)`
-A powerful high-level function that instantly configures multiple DSP stages to achieve a specific character.
-- **Presets:** `RiffFxRadio`, `RiffFxUnderwater`, `RiffFxCathedral`, `RiffFxLoFi`, `RiffFxRobot`, `RiffFxAmbient`, etc.
-- **Note:** This resets all other DSP properties to neutral before applying the preset.
+Noise is also supported:
 
-## Offline Rendering and Export
+```vb
+Dim rain As Long
+rain = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.08!)
+RiffVoiceLoop(rain) = True
+RiffVoiceLowPass(rain) = 0.5!
+```
 
-### RiffExportBufferWav
-`Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath As String) As Boolean`
-Writes the contents of a decoded buffer to a standard 16-bit stereo PCM WAV file.
+Supported source types:
 
-### RiffRenderOscillatorWav
-`Public Function RiffRenderOscillatorWav(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal durationSec As Single, ByVal filePath As String) As Boolean`
-Generates a synthesized audio asset directly to disk without requiring a real-time voice.
+- `RiffWaveSine`
+- `RiffWaveSquare`
+- `RiffWaveSawtooth`
+- `RiffWaveNoise` / `RiffWaveWhiteNoise`
+- `RiffWavePinkNoise`
+- `RiffWaveBrownNoise`
 
-## Enumerations
+### WAV Export
 
-### RiffBusId
-Defines the standard mixer slots.
-`RiffBusMain`, `RiffBusSfx`, `RiffBusMusic`, `RiffBusVoice`, `RiffBusUi`, `RiffBusAux1`...`RiffBusAux11`.
+Riff can export loaded buffers and generated oscillators to 16-bit stereo PCM WAV.
+
+```vb
+RiffExportBufferWav sndMusic, "C:\Temp\music_export.wav"
+RiffRenderOscillatorWav RiffWaveSawtooth, 110!, 1.5!, "C:\Temp\saw.wav"
+RiffRenderOscillatorWav RiffWavePinkNoise, 0!, 3!, "C:\Temp\pink_noise.wav"
+```
+
+### Compatibility Strategy
+
+The modern API is unified around optional bus, loop, volume, and pan arguments:
+
+```vb
+RiffPlay buffer, bus, looped, volume, pan
+RiffPlayOnce buffer, bus, looped, volume, pan
+RiffPlayOscillator wave, frequency, bus, volume, pan
+RiffPlayNoise noiseType, bus, volume, pan
+```
+
+Older helper names remain available:
+
+```vb
+RiffPlayBus
+RiffPlayBusOnce
+RiffPlayOscillatorBus
+RiffPlayNoiseBus
+```
+
+They are compatibility wrappers and should generally not be used in new examples unless you are preserving old code style.
+
+---
+
+## Enums
 
 ### RiffWaveType
-Defines oscillator and noise algorithms.
-`RiffWaveSine`, `RiffWaveSquare`, `RiffWaveSawtooth`, `RiffWaveWhiteNoise`, `RiffWavePinkNoise`, `RiffWaveBrownNoise`.
+
+```vb
+Public Enum RiffWaveType
+    RiffWaveSine = 0
+    RiffWaveSquare = 1
+    RiffWaveSawtooth = 2
+    RiffWaveNoise = 3
+    RiffWaveWhiteNoise = 3
+    RiffWavePinkNoise = 4
+    RiffWaveBrownNoise = 5
+End Enum
+```
+
+| Value | Description |
+|:---|:---|
+| `RiffWaveSine` | Pure sine tone. Best for clean beeps, test tones, bass fundamentals. |
+| `RiffWaveSquare` | Band-limited square wave. Good for retro UI sounds, chiptune, alarms. |
+| `RiffWaveSawtooth` | Band-limited saw wave. Bright, buzzy, useful for synth leads and sweeps. |
+| `RiffWaveNoise` | Compatibility alias for white noise. |
+| `RiffWaveWhiteNoise` | Equal random energy across frequencies. Static, glitches, impacts. |
+| `RiffWavePinkNoise` | More natural noise with reduced high-frequency harshness. Rain, wind, fire, ambience. |
+| `RiffWaveBrownNoise` | Dark, low-heavy noise. Thunder rumble, engines, earthquakes, distant impacts. |
+
+### RiffBusId
+
+```vb
+Public Enum RiffBusId
+    RiffBusMain = 0
+    RiffBusSfx = 1
+    RiffBusMusic = 2
+    RiffBusVoice = 3
+    RiffBusUi = 4
+    RiffBusAux1 = 5
+    RiffBusAux2 = 6
+    RiffBusAux3 = 7
+    RiffBusAux4 = 8
+    RiffBusAux5 = 9
+    RiffBusAux6 = 10
+    RiffBusAux7 = 11
+    RiffBusAux8 = 12
+    RiffBusAux9 = 13
+    RiffBusAux10 = 14
+    RiffBusAux11 = 15
+End Enum
+```
+
+Recommended routing:
+
+| Bus | Typical Use |
+|:---|:---|
+| `RiffBusMain` | Default/general output. |
+| `RiffBusSfx` | Gameplay sound effects. |
+| `RiffBusMusic` | Background music, ambience layers. |
+| `RiffBusVoice` | Dialogue, narration, character voices. |
+| `RiffBusUi` | Menu sounds, buttons, confirmation/cancel sounds. |
+| `RiffBusAux1` ... `RiffBusAux11` | Custom groups: ambience, enemies, weather, cinematic, debug, etc. |
 
 ### RiffEffectPreset
-Defines the built-in DSP configurations for `RiffVoiceApplyPreset`.
-`RiffFxDry`, `RiffFxSmallRoom`, `RiffFxHall`, `RiffFxCathedral`, `RiffFxSlapback`, `RiffFxEcho`, `RiffFxChorus`, `RiffFxFlanger`, `RiffFxLoFi`, `RiffFxRadio`, `RiffFxUnderwater`, `RiffFxWide`, `RiffFxRobot`, `RiffFxAmbient`.
+
+```vb
+Public Enum RiffEffectPreset
+    RiffFxDry = 0
+    RiffFxSmallRoom = 1
+    RiffFxHall = 2
+    RiffFxCathedral = 3
+    RiffFxSlapback = 4
+    RiffFxEcho = 5
+    RiffFxChorus = 6
+    RiffFxFlanger = 7
+    RiffFxLoFi = 8
+    RiffFxRadio = 9
+    RiffFxUnderwater = 10
+    RiffFxWide = 11
+    RiffFxRobot = 12
+    RiffFxAmbient = 13
+End Enum
+```
+
+Presets are convenience recipes applied to a voice. Use `RiffVoiceApplyPreset voice, preset, amount`. `amount` normally ranges from `0.0` to `1.0`. `0.0` should produce a dry/neutral result, while `1.0` applies the preset fully.
+
+| Preset | Description |
+|:---|:---|
+| `RiffFxDry` | Clears voice effects back to neutral. |
+| `RiffFxSmallRoom` | Short room reverb. |
+| `RiffFxHall` | Medium hall reverb. |
+| `RiffFxCathedral` | Long, spacious reverb. |
+| `RiffFxSlapback` | Short echo useful for retro/voice effects. |
+| `RiffFxEcho` | Longer delay with feedback. |
+| `RiffFxChorus` | Gentle widening/thickening modulation. |
+| `RiffFxFlanger` | Jet-like comb sweep. |
+| `RiffFxLoFi` | Musical degraded/tape/old-sampler character. |
+| `RiffFxRadio` | Band-limited voice/radio/phone tone. |
+| `RiffFxUnderwater` | Muffled low-pass-heavy sound. |
+| `RiffFxWide` | Stereo width enhancement. |
+| `RiffFxRobot` | Ring-modulated robotic timbre. |
+| `RiffFxAmbient` | Spacious reverb/chorus ambience. |
 
 ### RiffErrorCode
-Diagnostic values returned by `RiffLastError`.
-`RiffErrorNone`, `RiffErrorNotInitialized`, `RiffErrorNoFreeBuffer`, `RiffErrorNoFreeVoice`, `RiffErrorInvalidBuffer`, `RiffErrorInvalidVoice`, `RiffErrorInvalidBus`, `RiffErrorInvalidArgument`, `RiffErrorFileNotFound`, `RiffErrorComFailure`, `RiffErrorMemoryAllocation`, `RiffErrorDecodeFailed`, `RiffErrorUnsupportedFormat`.
+
+```vb
+Public Enum RiffErrorCode
+    RiffErrorNone = 0
+    RiffErrorNotInitialized = 1
+    RiffErrorNoFreeBuffer = 2
+    RiffErrorNoFreeVoice = 3
+    RiffErrorInvalidBuffer = 4
+    RiffErrorInvalidVoice = 5
+    RiffErrorInvalidBus = 6
+    RiffErrorInvalidArgument = 7
+    RiffErrorFileNotFound = 8
+    RiffErrorComFailure = 9
+    RiffErrorMemoryAllocation = 10
+    RiffErrorDecodeFailed = 11
+    RiffErrorUnsupportedFormat = 12
+End Enum
+```
+
+| Error | Meaning |
+|:---|:---|
+| `RiffErrorNone` | Last operation completed without a Riff-level error. |
+| `RiffErrorNotInitialized` | The engine is not open. Call `RiffOpen`. |
+| `RiffErrorNoFreeBuffer` | All 64 buffer slots are occupied. |
+| `RiffErrorNoFreeVoice` | All 32 voice slots are active. |
+| `RiffErrorInvalidBuffer` | Buffer handle is outside range or inactive. |
+| `RiffErrorInvalidVoice` | Voice handle is outside range or invalid for the operation. |
+| `RiffErrorInvalidBus` | Bus id is outside `0` to `15`. |
+| `RiffErrorInvalidArgument` | Argument is empty, invalid, or outside accepted range. |
+| `RiffErrorFileNotFound` | Source path does not exist. |
+| `RiffErrorComFailure` | Windows/COM/WASAPI/Media Foundation call failed. |
+| `RiffErrorMemoryAllocation` | Native memory allocation failed. |
+| `RiffErrorDecodeFailed` | Media Foundation could not produce usable PCM. |
+| `RiffErrorUnsupportedFormat` | Device/source format is unsupported by the renderer. |
+
+---
+
+## Initialization and Teardown
+
+### RiffOpen
+
+```vb
+Public Function RiffOpen() As Boolean
+```
+
+Initializes Media Foundation, WASAPI shared-mode rendering, native memory, timer resolution, internal voice/buffer/bus state, and the adaptive render loop.
+
+Returns `True` on success. Returns `False` on failure and sets `RiffLastError`.
+
+```vb
+Public Sub StartAudio()
+    If Not RiffOpen() Then
+        MsgBox "Audio failed. RiffLastError = " & CStr(RiffLastError), vbCritical
+        Exit Sub
+    End If
+End Sub
+```
+
+Calling `RiffOpen` when already initialized is safe and returns `True`.
+
+### RiffClose
+
+```vb
+Public Sub RiffClose()
+```
+
+Fully shuts down Riff. It stops voices, kills/suspends the render timer, releases loaded buffers, releases COM interfaces, shuts down Media Foundation, and restores the timer resolution.
+
+Call it when the workbook/presentation closes, when the slide show ends, or before resetting the VBA project.
+
+PowerPoint example:
+
+```vb
+Public Sub OnSlideShowTerminate(ByVal Pres As Presentation)
+    RiffClose
+End Sub
+```
+
+Excel example:
+
+```vb
+Private Sub Workbook_BeforeClose(Cancel As Boolean)
+    RiffClose
+End Sub
+```
+
+### RiffIsInitialized
+
+```vb
+Public Property Get RiffIsInitialized() As Boolean
+```
+
+Returns `True` when Riff is currently initialized.
+
+```vb
+If Not RiffIsInitialized Then
+    If Not RiffOpen() Then Exit Sub
+End If
+```
+
+### RiffSuspend
+
+```vb
+Public Sub RiffSuspend()
+```
+
+Suspends the render timer without unloading decoded buffers. This is useful when you want to temporarily stop the audio loop but keep assets in memory.
+
+```vb
+Public Sub PauseAudioSystem()
+    RiffStopAll
+    RiffSuspend
+End Sub
+```
+
+### RiffWake
+
+```vb
+Public Function RiffWake() As Boolean
+```
+
+Wakes/restarts the render path after `RiffSuspend`. If the engine is not initialized, it attempts to initialize it.
+
+```vb
+If RiffWake() Then
+    RiffPlay sndClick, RiffBusUi
+End If
+```
+
+### RiffAutoSuspendTimer
+
+```vb
+Public Property Get RiffAutoSuspendTimer() As Boolean
+Public Property Let RiffAutoSuspendTimer(ByVal value As Boolean)
+```
+
+Controls whether Riff may automatically stop/suspend its timer after a period of silence. This reduces the chance of a timer keeping the VBE in a running state after one-shot sounds finish.
+
+```vb
+RiffAutoSuspendTimer = True
+```
+
+Use `False` when you need the render loop to stay warm for rapid repeated playback, but prefer `True` for Office stability.
+
+---
+
+## Diagnostics
+
+### RiffLastError
+
+```vb
+Public Property Get RiffLastError() As RiffErrorCode
+```
+
+Returns the last Riff-level error code.
+
+```vb
+Dim b As Long
+b = RiffLoad("C:\missing.wav")
+
+If b = -1 Then
+    Debug.Print "Load failed:", RiffLastError
+End If
+```
+
+### RiffMaxVoices
+
+```vb
+Public Property Get RiffMaxVoices() As Long
+```
+
+Returns the fixed voice pool count: `32`.
+
+```vb
+Dim i As Long
+For i = 0 To RiffMaxVoices - 1
+    If RiffVoiceIsPlaying(i) Then Debug.Print "Voice playing:", i
+Next
+```
+
+### RiffMaxBuffers
+
+```vb
+Public Property Get RiffMaxBuffers() As Long
+```
+
+Returns the fixed buffer pool count: `64`.
+
+### RiffMaxBuses
+
+```vb
+Public Property Get RiffMaxBuses() As Long
+```
+
+Returns the bus count: `16`.
+
+### RiffAdaptiveQueueMs
+
+```vb
+Public Property Get RiffAdaptiveQueueMs() As Long
+```
+
+Returns the current adaptive queue target in milliseconds. Expected values are commonly around `60`, `160`, or `200`, with gradual recovery between states.
+
+```vb
+Debug.Print "Adaptive queue target:", RiffAdaptiveQueueMs & "ms"
+```
+
+### RiffUnderrunCount
+
+```vb
+Public Property Get RiffUnderrunCount() As Long
+```
+
+Returns the number of detected underrun-risk events. A rising value indicates that the host or system is failing to feed WASAPI quickly enough.
+
+```vb
+If RiffUnderrunCount > 0 Then
+    Debug.Print "Audio underruns detected:", RiffUnderrunCount
+End If
+```
+
+### RiffLastPaddingFrames
+
+```vb
+Public Property Get RiffLastPaddingFrames() As Long
+```
+
+Returns the last WASAPI padding value in frames. Padding is the amount of queued audio already waiting in the output buffer.
+
+### RiffLastFramesAvailable
+
+```vb
+Public Property Get RiffLastFramesAvailable() As Long
+```
+
+Returns the number of frames that were available to write on the last render tick.
+
+### RiffLastFramesWritten
+
+```vb
+Public Property Get RiffLastFramesWritten() As Long
+```
+
+Returns how many frames Riff wrote on the last render tick.
+
+### RiffResetAdaptiveStats
+
+```vb
+Public Sub RiffResetAdaptiveStats()
+```
+
+Clears adaptive-buffer diagnostics so you can run a clean test.
+
+```vb
+Public Sub TestAudioStability()
+    RiffResetAdaptiveStats
+    RiffPlay sndMusic, RiffBusMusic, True, 0.4!
+End Sub
+```
+
+### Diagnostic Snapshot Example
+
+```vb
+Public Sub PrintRiffDiagnostics()
+    Debug.Print "Initialized:", RiffIsInitialized
+    Debug.Print "Auto suspend:", RiffAutoSuspendTimer
+    Debug.Print "Adaptive queue ms:", RiffAdaptiveQueueMs
+    Debug.Print "Underruns:", RiffUnderrunCount
+    Debug.Print "Last padding frames:", RiffLastPaddingFrames
+    Debug.Print "Last available frames:", RiffLastFramesAvailable
+    Debug.Print "Last written frames:", RiffLastFramesWritten
+End Sub
+```
+
+---
+
+## Global Settings
+
+### RiffMasterVolume
+
+```vb
+Public Property Get RiffMasterVolume() As Single
+Public Property Let RiffMasterVolume(ByVal value As Single)
+```
+
+Global volume applied after voice and bus gain. Values are clamped internally.
+
+```vb
+RiffMasterVolume = 0.75!
+```
+
+Use this for the player's master audio setting.
+
+```vb
+Public Sub SetMasterFromSlider(ByVal sliderValue As Single)
+    RiffMasterVolume = sliderValue / 100!
+End Sub
+```
+
+### RiffMasterGetPeak
+
+```vb
+Public Sub RiffMasterGetPeak(ByRef peakLeft As Single, ByRef peakRight As Single)
+```
+
+Returns decaying master peak meters for left and right channels.
+
+```vb
+Dim l As Single, r As Single
+RiffMasterGetPeak l, r
+Debug.Print "Master peak:", Format(l, "0.00"), Format(r, "0.00")
+```
+
+---
+
+## Audio Buses API
+
+### RiffBusVolume
+
+```vb
+Public Property Get RiffBusVolume(ByVal busID As RiffBusId) As Single
+Public Property Let RiffBusVolume(ByVal busID As RiffBusId, ByVal value As Single)
+```
+
+Gets or sets a bus volume. Bus volume is a group gain multiplier. Values are clamped internally.
+
+```vb
+RiffBusVolume(RiffBusMusic) = 0.35!
+RiffBusVolume(RiffBusSfx) = 0.9!
+RiffBusVolume(RiffBusUi) = 1!
+```
+
+### RiffBusMuted
+
+```vb
+Public Property Get RiffBusMuted(ByVal busID As RiffBusId) As Boolean
+Public Property Let RiffBusMuted(ByVal busID As RiffBusId, ByVal value As Boolean)
+```
+
+Mutes or unmutes a bus without changing its stored volume.
+
+```vb
+RiffBusMuted(RiffBusMusic) = True
+RiffBusMuted(RiffBusMusic) = False
+```
+
+### RiffBusSolo
+
+```vb
+Public Property Get RiffBusSolo(ByVal busID As RiffBusId) As Boolean
+Public Property Let RiffBusSolo(ByVal busID As RiffBusId, ByVal value As Boolean)
+```
+
+Solo mode lets one or more buses pass while non-soloed buses are effectively muted. If no bus is soloed, all non-muted buses pass normally.
+
+```vb
+RiffBusSolo(RiffBusMusic) = True
+' Only soloed buses are heard.
+
+RiffBusSolo(RiffBusMusic) = False
+' Normal bus mix returns.
+```
+
+### RiffBusFadeTo
+
+```vb
+Public Sub RiffBusFadeTo(ByVal busID As RiffBusId, ByVal targetVolume As Single, Optional ByVal durationMs As Long = 250)
+```
+
+Smoothly fades a bus volume to a target value. Useful for music ducking, scene transitions, and pause menus.
+
+```vb
+' Duck music while dialogue plays.
+RiffBusFadeTo RiffBusMusic, 0.18!, 500
+RiffBusFadeTo RiffBusVoice, 1!, 200
+```
+
+```vb
+' Restore after dialogue.
+RiffBusFadeTo RiffBusMusic, 0.45!, 750
+```
+
+### RiffBusGetPeak
+
+```vb
+Public Sub RiffBusGetPeak(ByVal busID As RiffBusId, ByRef peakLeft As Single, ByRef peakRight As Single)
+```
+
+Gets decaying peak meters for a specific bus.
+
+```vb
+Dim l As Single, r As Single
+RiffBusGetPeak RiffBusMusic, l, r
+Debug.Print "Music bus peak:", l, r
+```
+
+### RiffBusReset
+
+```vb
+Public Sub RiffBusReset(ByVal busID As RiffBusId)
+```
+
+Resets a bus to default state: normal volume, no mute, no solo, no pending fade, cleared peak values.
+
+```vb
+RiffBusReset RiffBusSfx
+```
+
+### Bus Pattern: Settings Menu
+
+```vb
+Public Sub ApplyAudioSettings(ByVal masterPct As Single, ByVal musicPct As Single, ByVal sfxPct As Single, ByVal uiPct As Single)
+    RiffMasterVolume = masterPct / 100!
+    RiffBusVolume(RiffBusMusic) = musicPct / 100!
+    RiffBusVolume(RiffBusSfx) = sfxPct / 100!
+    RiffBusVolume(RiffBusUi) = uiPct / 100!
+End Sub
+```
+
+---
+
+## Asset Loading and Memory
+
+### RiffLoad
+
+```vb
+Public Function RiffLoad(ByVal filePath As String) As Long
+```
+
+Decodes an audio file from disk through Media Foundation into Riff's buffer pool. Returns a buffer handle or `-1`.
+
+Supported formats depend on Windows Media Foundation codecs installed on the system, commonly WAV, MP3, AAC/M4A, WMA, and some FLAC/other formats depending on Windows version and codecs.
+
+```vb
+Dim click As Long
+click = RiffLoad(ActivePresentation.Path & "\audio\click.wav")
+
+If click = -1 Then
+    MsgBox "Could not load click.wav. Error: " & CStr(RiffLastError)
+End If
+```
+
+### RiffLoadFromMemory
+
+```vb
+Public Function RiffLoadFromMemory(ByRef audioData() As Byte) As Long
+```
+
+Decodes audio from a byte array. This is useful when audio is embedded in a workbook/presentation or decoded from Base64.
+
+```vb
+Dim bytes() As Byte
+Dim buf As Long
+
+' Fill bytes() with the full file contents first.
+buf = RiffLoadFromMemory(bytes)
+```
+
+The byte array must contain a complete encoded audio file, not raw PCM samples.
+
+### RiffUnload
+
+```vb
+Public Sub RiffUnload(ByVal bufferHandle As Long)
+```
+
+Unloads a buffer and frees its native memory. Any active voices using this buffer are stopped.
+
+```vb
+RiffUnload sndExplosion
+sndExplosion = -1
+```
+
+### RiffBufferDurationSec
+
+```vb
+Public Property Get RiffBufferDurationSec(ByVal bufferHandle As Long) As Single
+```
+
+Returns a buffer's duration in seconds.
+
+```vb
+Debug.Print "Music duration:", RiffBufferDurationSec(sndMusic)
+```
+
+### Loading Pattern: Asset Table
+
+```vb
+Private sndClick As Long
+Private sndCancel As Long
+Private sndExplosion As Long
+Private sndMusic As Long
+
+Public Function AudioLoadAll() As Boolean
+    If Not RiffOpen() Then Exit Function
+
+    sndClick = RiffLoad(ActivePresentation.Path & "\audio\ui_click.wav")
+    sndCancel = RiffLoad(ActivePresentation.Path & "\audio\ui_cancel.wav")
+    sndExplosion = RiffLoad(ActivePresentation.Path & "\audio\explosion.wav")
+    sndMusic = RiffLoad(ActivePresentation.Path & "\audio\music.mp3")
+
+    AudioLoadAll = (sndClick >= 0 And sndCancel >= 0 And sndExplosion >= 0 And sndMusic >= 0)
+End Function
+```
+
+---
+
+## Export and Offline Rendering
+
+### RiffExportBufferWav
+
+```vb
+Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath As String) As Boolean
+```
+
+Exports a loaded buffer as 16-bit stereo PCM WAV.
+
+```vb
+Dim ok As Boolean
+ok = RiffExportBufferWav(sndMusic, ActivePresentation.Path & "\export\music.wav")
+
+If Not ok Then Debug.Print "Export failed:", RiffLastError
+```
+
+### RiffRenderOscillatorWav
+
+```vb
+Public Function RiffRenderOscillatorWav(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal durationSec As Single, ByVal filePath As String) As Boolean
+```
+
+Renders a generated waveform or noise source to a WAV file without creating a real-time voice.
+
+```vb
+RiffRenderOscillatorWav RiffWaveSine, 440!, 2!, "C:\Temp\a4.wav"
+RiffRenderOscillatorWav RiffWaveSquare, 220!, 1!, "C:\Temp\square.wav"
+RiffRenderOscillatorWav RiffWavePinkNoise, 0!, 5!, "C:\Temp\rain_noise.wav"
+```
+
+Offline rendering is dry. It does not apply per-voice DSP presets or bus settings.
+
+---
+
+## Playback
+
+### RiffPlay
+
+```vb
+Public Function RiffPlay( _
+    ByVal bufferHandle As Long, _
+    Optional ByVal busID As RiffBusId = RiffBusMain, _
+    Optional ByVal looped As Boolean = False, _
+    Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, _
+    Optional ByVal pan As Single = 0! _
+) As Long
+```
+
+The main playback function. Creates a voice from a loaded buffer. The bus, loop, volume, and pan are applied before the voice becomes active.
+
+```vb
+Dim v As Long
+v = RiffPlay(sndExplosion, RiffBusSfx, False, 0.9!, 0.1!)
+```
+
+Looping music:
+
+```vb
+musicVoice = RiffPlay(sndMusic, RiffBusMusic, True, 0.45!, 0!)
+```
+
+### RiffPlayOnce
+
+```vb
+Public Function RiffPlayOnce( _
+    ByVal bufferHandle As Long, _
+    Optional ByVal busID As RiffBusId = RiffBusMain, _
+    Optional ByVal looped As Boolean = False, _
+    Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, _
+    Optional ByVal pan As Single = 0! _
+) As Long
+```
+
+Plays a buffer only if the same buffer is not already active on the requested bus. If already playing, returns the existing voice handle instead of starting a duplicate.
+
+```vb
+Public Sub EnsureMusic()
+    musicVoice = RiffPlayOnce(sndMusic, RiffBusMusic, True, 0.45!)
+End Sub
+```
+
+This is the preferred function for background music and persistent ambiences.
+
+### RiffPlayOscillator
+
+```vb
+Public Function RiffPlayOscillator( _
+    ByVal waveType As RiffWaveType, _
+    ByVal frequencyHz As Single, _
+    Optional ByVal busID As RiffBusId = RiffBusMain, _
+    Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, _
+    Optional ByVal pan As Single = 0! _
+) As Long
+```
+
+Starts an infinite oscillator voice. Stop it with `RiffStop`, `RiffVoiceStop`, `RiffFadeOut`, or `RiffStopAll`.
+
+```vb
+Dim beep As Long
+beep = RiffPlayOscillator(RiffWaveSine, 880!, RiffBusUi, 0.25!)
+RiffFadeOut beep, 0.12!
+```
+
+Retro square beep:
+
+```vb
+Dim v As Long
+v = RiffPlayOscillator(RiffWaveSquare, 660!, RiffBusUi, 0.18!)
+RiffVoiceBitDepth(v) = 8!
+RiffFadeOut v, 0.08!
+```
+
+### RiffPlayNoise
+
+```vb
+Public Function RiffPlayNoise( _
+    Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, _
+    Optional ByVal busID As RiffBusId = RiffBusMain, _
+    Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, _
+    Optional ByVal pan As Single = 0! _
+) As Long
+```
+
+Starts an infinite noise voice. Use white, pink, or brown noise depending on the texture you need.
+
+```vb
+Dim wind As Long
+wind = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.06!)
+RiffVoiceLowPass(wind) = 0.4!
+RiffVoiceReverbMix(wind) = 0.2!
+```
+
+Explosion rumble layer:
+
+```vb
+Dim rumble As Long
+rumble = RiffPlayNoise(RiffWaveBrownNoise, RiffBusSfx, 0.12!)
+RiffVoiceLowPass(rumble) = 0.2!
+RiffFadeOut rumble, 0.8!
+```
+
+### Compatibility Playback Helpers
+
+These remain available for older code. New code should prefer `RiffPlay`, `RiffPlayOnce`, `RiffPlayOscillator`, and `RiffPlayNoise` with optional bus arguments.
+
+```vb
+Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayBusOnce(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayNoiseBus(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+```
+
+---
+
+## Voice State and Transport
+
+### RiffPause
+
+```vb
+Public Sub RiffPause(ByVal voiceHandle As Long)
+```
+
+Pauses a voice while keeping its slot, source position, and DSP state.
+
+```vb
+RiffPause musicVoice
+```
+
+### RiffResume
+
+```vb
+Public Sub RiffResume(ByVal voiceHandle As Long)
+```
+
+Resumes a paused voice.
+
+```vb
+RiffResume musicVoice
+```
+
+### RiffStop
+
+```vb
+Public Sub RiffStop(ByVal voiceHandle As Long)
+```
+
+Immediately stops and frees a voice.
+
+```vb
+RiffStop musicVoice
+musicVoice = -1
+```
+
+### RiffVoiceStop
+
+```vb
+Public Sub RiffVoiceStop(ByVal voiceHandle As Long)
+```
+
+Alias for `RiffStop` with a more consistent voice-oriented name.
+
+```vb
+RiffVoiceStop v
+```
+
+### RiffStopAll
+
+```vb
+Public Sub RiffStopAll()
+```
+
+Stops all active voices.
+
+```vb
+RiffStopAll
+```
+
+### RiffFadeIn
+
+```vb
+Public Sub RiffFadeIn(ByVal voiceHandle As Long, ByVal durationSec As Single)
+```
+
+Applies a linear fade-in multiplier. It does not change `RiffVoiceVolume`; it applies an additional fade envelope.
+
+```vb
+ambienceVoice = RiffPlay(sndForest, RiffBusMusic, True, 0.35!)
+RiffFadeIn ambienceVoice, 3!
+```
+
+### RiffFadeOut
+
+```vb
+Public Sub RiffFadeOut(ByVal voiceHandle As Long, ByVal durationSec As Single)
+```
+
+Fades a voice out and then stops it automatically.
+
+```vb
+RiffFadeOut musicVoice, 2!
+musicVoice = -1
+```
+
+### RiffSetLoopRegionSec
+
+```vb
+Public Sub RiffSetLoopRegionSec(ByVal voiceHandle As Long, ByVal startSec As Single, ByVal endSec As Single)
+```
+
+Sets a loop region in seconds for a buffer-backed voice.
+
+```vb
+Dim v As Long
+v = RiffPlay(sndAmbience, RiffBusMusic, True, 0.4!)
+RiffSetLoopRegionSec v, 1.2!, 12.8!
+```
+
+### RiffVoiceIsPlaying
+
+```vb
+Public Property Get RiffVoiceIsPlaying(ByVal voiceHandle As Long) As Boolean
+```
+
+Returns `True` when a voice is active and currently playing.
+
+```vb
+If RiffVoiceIsPlaying(musicVoice) Then Exit Sub
+```
+
+### RiffVoicePlaying
+
+```vb
+Public Function RiffVoicePlaying(ByVal voiceHandle As Long) As Boolean
+```
+
+Function-style equivalent for checking whether a voice is playing. Useful when you prefer function naming over property naming.
+
+### RiffVoiceActive
+
+```vb
+Public Function RiffVoiceActive(ByVal voiceHandle As Long) As Boolean
+```
+
+Returns `True` if the voice slot is active, even if the voice is paused.
+
+```vb
+If RiffVoiceActive(musicVoice) Then
+    Debug.Print "Music slot still allocated"
+End If
+```
+
+### RiffVoiceIsPaused
+
+```vb
+Public Property Get RiffVoiceIsPaused(ByVal voiceHandle As Long) As Boolean
+```
+
+Returns `True` if the voice is active and paused.
+
+### RiffFindPlayingVoice
+
+```vb
+Public Function RiffFindPlayingVoice(ByVal bufferHandle As Long, Optional ByVal busID As Long = -1) As Long
+```
+
+Finds the first currently playing voice that uses `bufferHandle`. If `busID` is `-1`, all buses are searched. If a valid bus id is provided, only that bus is searched.
+
+```vb
+Dim existing As Long
+existing = RiffFindPlayingVoice(sndMusic, RiffBusMusic)
+
+If existing <> -1 Then
+    musicVoice = existing
+End If
+```
+
+### RiffBufferIsPlaying
+
+```vb
+Public Function RiffBufferIsPlaying(ByVal bufferHandle As Long, Optional ByVal busID As Long = -1) As Boolean
+```
+
+Returns `True` if a buffer is currently playing. If `busID` is provided, restricts the search to that bus.
+
+```vb
+If Not RiffBufferIsPlaying(sndMusic, RiffBusMusic) Then
+    musicVoice = RiffPlay(sndMusic, RiffBusMusic, True, 0.45!)
+End If
+```
+
+---
+
+## Voice Properties
+
+### RiffVoiceBus
+
+```vb
+Public Property Get RiffVoiceBus(ByVal voiceHandle As Long) As RiffBusId
+Public Property Let RiffVoiceBus(ByVal voiceHandle As Long, ByVal value As RiffBusId)
+```
+
+Gets or sets the bus route for a voice. New code should pass the bus directly to `RiffPlay`, but this property is useful for dynamic rerouting.
+
+```vb
+RiffVoiceBus(v) = RiffBusVoice
+```
+
+### RiffVoiceGetPeak
+
+```vb
+Public Sub RiffVoiceGetPeak(ByVal voiceHandle As Long, ByRef peakLeft As Single, ByRef peakRight As Single)
+```
+
+Gets decaying per-voice peak values.
+
+```vb
+Dim l As Single, r As Single
+RiffVoiceGetPeak v, l, r
+```
+
+### RiffVoiceLoop
+
+```vb
+Public Property Get RiffVoiceLoop(ByVal voiceHandle As Long) As Boolean
+Public Property Let RiffVoiceLoop(ByVal voiceHandle As Long, ByVal value As Boolean)
+```
+
+Gets or sets loop mode. Prefer passing `looped:=True` directly to `RiffPlay` for new playback.
+
+```vb
+RiffVoiceLoop(musicVoice) = True
+```
+
+### RiffVoicePositionSec
+
+```vb
+Public Property Get RiffVoicePositionSec(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoicePositionSec(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Gets or seeks a buffer-backed voice position in seconds.
+
+```vb
+RiffVoicePositionSec(musicVoice) = 30!
+Debug.Print RiffVoicePositionSec(musicVoice)
+```
+
+Has no meaningful effect for oscillator/noise voices.
+
+### RiffVoiceVolume
+
+```vb
+Public Property Get RiffVoiceVolume(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceVolume(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Voice gain multiplier. Use volume at play time when possible.
+
+```vb
+v = RiffPlay(sndClick, RiffBusUi, False, 0.7!)
+RiffVoiceVolume(v) = 0.5!
+```
+
+### RiffVoicePitch
+
+```vb
+Public Property Get RiffVoicePitch(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoicePitch(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Playback pitch/speed multiplier. `1.0` is normal. `2.0` is one octave up and twice as fast. `0.5` is one octave down and half speed.
+
+```vb
+RiffVoicePitch(v) = 1.25!
+```
+
+### RiffVoicePan
+
+```vb
+Public Property Get RiffVoicePan(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoicePan(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Stereo pan. `-1` is left, `0` is center, `1` is right.
+
+```vb
+RiffVoicePan(v) = -0.35!
+```
+
+---
+
+## Effect Helpers and Presets
+
+### RiffVoiceClearEffects
+
+```vb
+Public Sub RiffVoiceClearEffects(ByVal voiceHandle As Long)
+```
+
+Resets the voice DSP parameters to neutral/dry state.
+
+```vb
+RiffVoiceClearEffects v
+```
+
+### RiffVoiceSetReverb
+
+```vb
+Public Sub RiffVoiceSetReverb(ByVal voiceHandle As Long, ByVal mix As Single, ByVal roomTime As Single)
+```
+
+Sets reverb mix and decay together.
+
+```vb
+RiffVoiceSetReverb v, 0.35!, 0.7!
+```
+
+### RiffVoiceSetDelay
+
+```vb
+Public Sub RiffVoiceSetDelay(ByVal voiceHandle As Long, ByVal delayTime As Single, ByVal feedback As Single, ByVal mix As Single)
+```
+
+Sets delay time, feedback, and wet mix together.
+
+```vb
+RiffVoiceSetDelay v, 0.28!, 0.45!, 0.5!
+```
+
+### RiffVoiceSetChorus
+
+```vb
+Public Sub RiffVoiceSetChorus(ByVal voiceHandle As Long, ByVal depth As Single, ByVal rate As Single)
+```
+
+Sets chorus depth and rate.
+
+```vb
+RiffVoiceSetChorus v, 0.4!, 1.2!
+```
+
+### RiffVoiceSetFlanger
+
+```vb
+Public Sub RiffVoiceSetFlanger(ByVal voiceHandle As Long, ByVal depth As Single, ByVal rate As Single, ByVal feedback As Single)
+```
+
+Sets flanger depth, rate, and feedback.
+
+```vb
+RiffVoiceSetFlanger v, 0.55!, 0.35!, 0.45!
+```
+
+### RiffVoiceSetFilter
+
+```vb
+Public Sub RiffVoiceSetFilter(ByVal voiceHandle As Long, ByVal lowPass As Single, ByVal highPass As Single)
+```
+
+Sets low-pass and high-pass controls together.
+
+```vb
+RiffVoiceSetFilter v, 0.35!, 0.05!
+```
+
+### RiffVoiceApplyPreset
+
+```vb
+Public Sub RiffVoiceApplyPreset(ByVal voiceHandle As Long, ByVal preset As RiffEffectPreset, Optional ByVal amount As Single = 1!)
+```
+
+Applies a named effect preset. `amount` controls intensity and is typically clamped between `0` and `1`.
+
+```vb
+RiffVoiceApplyPreset v, RiffFxSmallRoom, 0.7!
+RiffVoiceApplyPreset v, RiffFxLoFi, 0.45!
+RiffVoiceApplyPreset v, RiffFxDry
+```
+
+Preset examples:
+
+```vb
+Public Sub PlayRadioVoice(ByVal buf As Long)
+    Dim v As Long
+    v = RiffPlay(buf, RiffBusVoice, False, 0.85!)
+    If v <> -1 Then RiffVoiceApplyPreset v, RiffFxRadio, 0.7!
+End Sub
+```
+
+```vb
+Public Sub PlayUnderwaterImpact(ByVal buf As Long)
+    Dim v As Long
+    v = RiffPlay(buf, RiffBusSfx, False, 0.9!)
+    If v <> -1 Then RiffVoiceApplyPreset v, RiffFxUnderwater, 1!
+End Sub
+```
+
+---
+
+## DSP Parameters
+
+### Bitcrusher
+
+#### RiffVoiceBitDepth
+
+```vb
+Public Property Get RiffVoiceBitDepth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceBitDepth(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Controls quantization depth. `32` is effectively full quality. Lower values sound more digital/stepped.
+
+```vb
+RiffVoiceBitDepth(v) = 8!
+```
+
+#### RiffVoiceSampleRateReduction
+
+```vb
+Public Property Get RiffVoiceSampleRateReduction(ByVal voiceHandle As Long) As Long
+Public Property Let RiffVoiceSampleRateReduction(ByVal voiceHandle As Long, ByVal value As Long)
+```
+
+Holds samples for multiple frames to simulate a lower sample rate. `1` disables the effect.
+
+```vb
+RiffVoiceSampleRateReduction(v) = 4
+```
+
+### Ring Modulator
+
+#### RiffVoiceRingModFreq
+
+```vb
+Public Property Get RiffVoiceRingModFreq(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceRingModFreq(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Carrier frequency for ring modulation. `0` disables.
+
+```vb
+RiffVoiceRingModFreq(v) = 120!
+```
+
+#### RiffVoiceRingModMix
+
+```vb
+Public Property Get RiffVoiceRingModMix(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceRingModMix(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Wet/dry blend for ring modulation.
+
+```vb
+RiffVoiceRingModMix(v) = 0.5!
+```
+
+### Auto-Pan
+
+#### RiffVoiceAutoPanRate
+
+```vb
+Public Property Get RiffVoiceAutoPanRate(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceAutoPanRate(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Auto-pan LFO speed in Hz.
+
+#### RiffVoiceAutoPanDepth
+
+```vb
+Public Property Get RiffVoiceAutoPanDepth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceAutoPanDepth(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Auto-pan intensity.
+
+```vb
+RiffVoiceAutoPanRate(v) = 0.5!
+RiffVoiceAutoPanDepth(v) = 0.9!
+```
+
+### 3-Band EQ
+
+#### RiffVoiceEqBass
+
+```vb
+Public Property Get RiffVoiceEqBass(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceEqBass(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Low band gain. `1.0` is neutral.
+
+#### RiffVoiceEqMid
+
+```vb
+Public Property Get RiffVoiceEqMid(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceEqMid(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Mid band gain. `1.0` is neutral.
+
+#### RiffVoiceEqTreble
+
+```vb
+Public Property Get RiffVoiceEqTreble(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceEqTreble(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+High band gain. `1.0` is neutral.
+
+```vb
+' Warm/dark voice.
+RiffVoiceEqBass(v) = 1.2!
+RiffVoiceEqMid(v) = 0.9!
+RiffVoiceEqTreble(v) = 0.65!
+```
+
+### Compressor
+
+#### RiffVoiceCompressorThreshold
+
+```vb
+Public Property Get RiffVoiceCompressorThreshold(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceCompressorThreshold(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Amplitude threshold above which compression starts.
+
+#### RiffVoiceCompressorRatio
+
+```vb
+Public Property Get RiffVoiceCompressorRatio(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceCompressorRatio(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Compression ratio.
+
+```vb
+RiffVoiceCompressorThreshold(v) = 0.65!
+RiffVoiceCompressorRatio(v) = 3!
+```
+
+### Flanger
+
+#### RiffVoiceFlangerDepth
+
+```vb
+Public Property Get RiffVoiceFlangerDepth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceFlangerDepth(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Flanger wet depth.
+
+#### RiffVoiceFlangerRate
+
+```vb
+Public Property Get RiffVoiceFlangerRate(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceFlangerRate(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Flanger LFO rate.
+
+#### RiffVoiceFlangerFeedback
+
+```vb
+Public Property Get RiffVoiceFlangerFeedback(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceFlangerFeedback(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Flanger feedback amount.
+
+```vb
+RiffVoiceFlangerDepth(v) = 0.65!
+RiffVoiceFlangerRate(v) = 0.25!
+RiffVoiceFlangerFeedback(v) = 0.5!
+```
+
+### Distortion
+
+#### RiffVoiceDistortion
+
+```vb
+Public Property Get RiffVoiceDistortion(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceDistortion(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Input gain before clipping/saturation. `1.0` is neutral.
+
+```vb
+RiffVoiceDistortion(v) = 2.5!
+```
+
+### Low-Pass and High-Pass Filters
+
+#### RiffVoiceLowPass
+
+```vb
+Public Property Get RiffVoiceLowPass(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceLowPass(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Normalized low-pass control. `1.0` is open/neutral. Lower values are more muffled.
+
+```vb
+RiffVoiceLowPass(v) = 0.35!
+```
+
+#### RiffVoiceHighPass
+
+```vb
+Public Property Get RiffVoiceHighPass(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceHighPass(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Normalized high-pass control. `0.0` is neutral. Higher values remove more low end.
+
+```vb
+RiffVoiceHighPass(v) = 0.45!
+```
+
+### Stereo Width
+
+#### RiffVoiceStereoWidth
+
+```vb
+Public Property Get RiffVoiceStereoWidth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceStereoWidth(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Mid/side stereo width. `1.0` is neutral, `0.0` is mono, values above `1.0` widen.
+
+```vb
+RiffVoiceStereoWidth(v) = 1.6!
+```
+
+### Tremolo
+
+#### RiffVoiceTremoloRate
+
+```vb
+Public Property Get RiffVoiceTremoloRate(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceTremoloRate(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Tremolo LFO rate in Hz.
+
+#### RiffVoiceTremoloDepth
+
+```vb
+Public Property Get RiffVoiceTremoloDepth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceTremoloDepth(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Tremolo depth.
+
+```vb
+RiffVoiceTremoloRate(v) = 5!
+RiffVoiceTremoloDepth(v) = 0.5!
+```
+
+### Chorus
+
+#### RiffVoiceChorusDepth
+
+```vb
+Public Property Get RiffVoiceChorusDepth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceChorusDepth(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Chorus wet depth.
+
+#### RiffVoiceChorusRate
+
+```vb
+Public Property Get RiffVoiceChorusRate(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceChorusRate(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Chorus modulation rate.
+
+```vb
+RiffVoiceChorusDepth(v) = 0.35!
+RiffVoiceChorusRate(v) = 1.2!
+```
+
+### Reverb
+
+#### RiffVoiceReverbMix
+
+```vb
+Public Property Get RiffVoiceReverbMix(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceReverbMix(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Reverb wet mix.
+
+#### RiffVoiceReverbTime
+
+```vb
+Public Property Get RiffVoiceReverbTime(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceReverbTime(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Reverb decay/time control.
+
+```vb
+RiffVoiceReverbMix(v) = 0.35!
+RiffVoiceReverbTime(v) = 0.75!
+```
+
+### Delay
+
+#### RiffVoiceDelayTime
+
+```vb
+Public Property Get RiffVoiceDelayTime(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceDelayTime(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Delay time in seconds.
+
+#### RiffVoiceDelayFeedback
+
+```vb
+Public Property Get RiffVoiceDelayFeedback(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceDelayFeedback(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Delay feedback amount.
+
+#### RiffVoiceDelayMix
+
+```vb
+Public Property Get RiffVoiceDelayMix(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceDelayMix(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+Delay wet mix.
+
+```vb
+RiffVoiceDelayTime(v) = 0.25!
+RiffVoiceDelayFeedback(v) = 0.35!
+RiffVoiceDelayMix(v) = 0.45!
+```
+
+---
+
+## Practical Recipes
+
+### Full Startup and Shutdown Pattern
+
+```vb
+Private sndClick As Long
+Private sndExplosion As Long
+Private sndMusic As Long
+Private musicVoice As Long
+
+Public Sub GameAudioStart()
+    If Not RiffOpen() Then
+        MsgBox "Failed to start Riff. Error: " & CStr(RiffLastError), vbCritical
+        Exit Sub
+    End If
+
+    RiffAutoSuspendTimer = True
+    RiffMasterVolume = 1!
+    RiffBusVolume(RiffBusMusic) = 0.4!
+    RiffBusVolume(RiffBusSfx) = 0.9!
+    RiffBusVolume(RiffBusUi) = 1!
+
+    sndClick = RiffLoad(ActivePresentation.Path & "\audio\click.wav")
+    sndExplosion = RiffLoad(ActivePresentation.Path & "\audio\explosion.wav")
+    sndMusic = RiffLoad(ActivePresentation.Path & "\audio\music.mp3")
+
+    musicVoice = -1
+End Sub
+
+Public Sub GameAudioStop()
+    RiffClose
+End Sub
+```
+
+### Button Click Sound
+
+```vb
+Public Sub PlayClick()
+    RiffPlay sndClick, RiffBusUi, False, 0.65!
+End Sub
+```
+
+### Explosion With Random Pan and Rumble
+
+```vb
+Public Sub PlayExplosion()
+    Dim v As Long
+    Dim rumble As Long
+    Dim pan As Single
+
+    pan = (Rnd() * 2!) - 1!
+
+    v = RiffPlay(sndExplosion, RiffBusSfx, False, 0.95!, pan)
+    If v <> -1 Then
+        RiffVoiceApplyPreset v, RiffFxSmallRoom, 0.35!
+        RiffVoiceDistortion(v) = 1.4!
+    End If
+
+    rumble = RiffPlayNoise(RiffWaveBrownNoise, RiffBusSfx, 0.08!, pan)
+    If rumble <> -1 Then
+        RiffVoiceLowPass(rumble) = 0.2!
+        RiffFadeOut rumble, 0.45!
+    End If
+End Sub
+```
+
+### Music That Never Duplicates
+
+```vb
+Public Sub EnsureMusicPlaying()
+    musicVoice = RiffPlayOnce(sndMusic, RiffBusMusic, True, 0.42!)
+End Sub
+```
+
+### Music Fade Out
+
+```vb
+Public Sub StopMusicSmooth()
+    If musicVoice <> -1 Then
+        RiffFadeOut musicVoice, 1.2!
+        musicVoice = -1
+    End If
+End Sub
+```
+
+### Pause Menu Ducking
+
+```vb
+Public Sub EnterPauseMenu()
+    RiffBusFadeTo RiffBusMusic, 0.18!, 300
+    RiffBusFadeTo RiffBusSfx, 0.55!, 200
+End Sub
+
+Public Sub LeavePauseMenu()
+    RiffBusFadeTo RiffBusMusic, 0.42!, 500
+    RiffBusFadeTo RiffBusSfx, 0.9!, 200
+End Sub
+```
+
+### Dialogue Ducking
+
+```vb
+Public Sub StartDialogue()
+    RiffBusFadeTo RiffBusMusic, 0.2!, 450
+    RiffBusFadeTo RiffBusSfx, 0.55!, 250
+    RiffBusVolume(RiffBusVoice) = 1!
+End Sub
+
+Public Sub EndDialogue()
+    RiffBusFadeTo RiffBusMusic, 0.45!, 700
+    RiffBusFadeTo RiffBusSfx, 0.9!, 300
+End Sub
+```
+
+### Rain Ambience With Pink Noise
+
+```vb
+Private rainVoice As Long
+
+Public Sub StartRain()
+    If rainVoice <> -1 Then
+        If RiffVoiceActive(rainVoice) Then Exit Sub
+    End If
+
+    rainVoice = RiffPlayNoise(RiffWavePinkNoise, RiffBusMusic, 0.055!)
+    If rainVoice <> -1 Then
+        RiffVoiceLoop(rainVoice) = True
+        RiffVoiceLowPass(rainVoice) = 0.55!
+        RiffVoiceHighPass(rainVoice) = 0.05!
+        RiffVoiceStereoWidth(rainVoice) = 1.4!
+        RiffVoiceApplyPreset rainVoice, RiffFxAmbient, 0.35!
+        RiffFadeIn rainVoice, 2!
+    End If
+End Sub
+
+Public Sub StopRain()
+    If rainVoice <> -1 Then
+        RiffFadeOut rainVoice, 2!
+        rainVoice = -1
+    End If
+End Sub
+```
+
+### Retro UI Beep
+
+```vb
+Public Sub PlayRetroBeep()
+    Dim v As Long
+    v = RiffPlayOscillator(RiffWaveSquare, 880!, RiffBusUi, 0.18!)
+
+    If v <> -1 Then
+        RiffVoiceBitDepth(v) = 8!
+        RiffVoiceSampleRateReduction(v) = 2
+        RiffFadeOut v, 0.09!
+    End If
+End Sub
+```
+
+### Radio Voice
+
+```vb
+Public Sub PlayRadioLine(ByVal voiceBuffer As Long)
+    Dim v As Long
+    v = RiffPlay(voiceBuffer, RiffBusVoice, False, 0.85!)
+
+    If v <> -1 Then
+        RiffVoiceApplyPreset v, RiffFxRadio, 0.65!
+        RiffVoiceCompressorThreshold(v) = 0.55!
+        RiffVoiceCompressorRatio(v) = 4!
+    End If
+End Sub
+```
+
+### Underwater Scene
+
+```vb
+Public Sub EnterUnderwater()
+    RiffBusFadeTo RiffBusMusic, 0.3!, 600
+    RiffBusFadeTo RiffBusSfx, 0.6!, 300
+End Sub
+
+Public Sub PlayUnderwaterSfx(ByVal buf As Long)
+    Dim v As Long
+    v = RiffPlay(buf, RiffBusSfx, False, 0.8!)
+
+    If v <> -1 Then
+        RiffVoiceApplyPreset v, RiffFxUnderwater, 0.8!
+    End If
+End Sub
+```
+
+### Simple VU Meter
+
+```vb
+Public Sub UpdateMeters()
+    Dim mL As Single, mR As Single
+    Dim sL As Single, sR As Single
+
+    RiffMasterGetPeak mL, mR
+    RiffBusGetPeak RiffBusSfx, sL, sR
+
+    Debug.Print "Master:", Format(mL, "0.00"), Format(mR, "0.00")
+    Debug.Print "SFX:", Format(sL, "0.00"), Format(sR, "0.00")
+End Sub
+```
+
+### Stability Test
+
+```vb
+Public Sub AudioStressDiagnostics()
+    RiffResetAdaptiveStats
+    RiffPlayOnce sndMusic, RiffBusMusic, True, 0.4!
+
+    Debug.Print "Switch tabs or stress the host for a few seconds, then run PrintRiffDiagnostics."
+End Sub
+
+Public Sub PrintRiffDiagnostics()
+    Debug.Print "Adaptive queue:", RiffAdaptiveQueueMs
+    Debug.Print "Underruns:", RiffUnderrunCount
+    Debug.Print "Padding:", RiffLastPaddingFrames
+    Debug.Print "Available:", RiffLastFramesAvailable
+    Debug.Print "Written:", RiffLastFramesWritten
+End Sub
+```
+
+---
+
+## Best Practices
+
+### Load During Initialization
+
+Avoid calling `RiffLoad` during gameplay, animation ticks, or button spam.
+
+Good:
+
+```vb
+Public Sub Init()
+    sndClick = RiffLoad(pathClick)
+End Sub
+
+Public Sub ButtonClick()
+    RiffPlay sndClick, RiffBusUi
+End Sub
+```
+
+Bad:
+
+```vb
+Public Sub ButtonClick()
+    Dim snd As Long
+    snd = RiffLoad(pathClick)
+    RiffPlay snd, RiffBusUi
+End Sub
+```
+
+### Prefer Unified Playback
+
+Use:
+
+```vb
+RiffPlay snd, RiffBusSfx, False, 0.8!, 0!
+```
+
+Instead of:
+
+```vb
+v = RiffPlay(snd)
+RiffVoiceBus(v) = RiffBusSfx
+RiffVoiceVolume(v) = 0.8!
+```
+
+The unified call applies routing and volume before the voice becomes active.
+
+### Use RiffPlayOnce for Music
+
+Do not start background music repeatedly from slide events or button callbacks.
+
+```vb
+musicVoice = RiffPlayOnce(sndMusic, RiffBusMusic, True, 0.45!)
+```
+
+### Use Buses for User Settings
+
+Do not manually loop through all voices to change all music/SFX volumes. Use buses.
+
+```vb
+RiffBusVolume(RiffBusMusic) = musicVolume
+RiffBusVolume(RiffBusSfx) = sfxVolume
+```
+
+### Avoid Busy-Wait Loops
+
+Avoid loops like this while audio is playing:
+
+```vb
+Do While Timer < t + seconds
+    DoEvents
+Loop
+```
+
+They can starve the Office host and worsen audio timing. If you need waits in demos, use a lightweight wait that yields more gently, or design demos around scheduled callbacks.
+
+### Always Close on Exit
+
+Riff is more stable when it is explicitly closed before the Office host closes or the VBA project resets.
+
+```vb
+RiffClose
+```
+
+### Keep DSP Reasonable
+
+Every active voice has its own DSP chain. Thirty-two voices with reverb, chorus, flanger, delay, compressor, ring mod, and filters all active can become expensive in VBA. Use presets and effects selectively.
+
+---
+
+## Troubleshooting
+
+### `RiffOpen` returns `False`
+
+Check:
+
+- Audio device connected and enabled.
+- Windows audio service is running.
+- Host is Windows Office, not Mac Office.
+- `RiffLastError` for specific failure.
+
+```vb
+If Not RiffOpen() Then
+    Debug.Print "RiffOpen failed:", RiffLastError
+End If
+```
+
+### Sound plays twice or music overlaps
+
+Use `RiffPlayOnce` for long-running music/ambience:
+
+```vb
+musicVoice = RiffPlayOnce(sndMusic, RiffBusMusic, True, 0.45!)
+```
+
+Or check manually:
+
+```vb
+If RiffBufferIsPlaying(sndMusic, RiffBusMusic) Then Exit Sub
+```
+
+### Audio clicks when stopping
+
+Use fade-out for musical stops:
+
+```vb
+RiffFadeOut musicVoice, 0.5!
+```
+
+Use immediate `RiffStop` only for hard cuts.
+
+### Audio stutters when switching tabs
+
+This can happen because Office/VBA is not a real-time host. The adaptive buffer should reduce this. Inspect:
+
+```vb
+Debug.Print RiffAdaptiveQueueMs
+Debug.Print RiffUnderrunCount
+```
+
+If underruns increase, reduce expensive UI work, avoid busy-wait loops, preload assets, and keep DSP counts reasonable.
+
+### VBE autocomplete stops or VBE looks like it is still running
+
+This usually means some timer/callback is still active. Call:
+
+```vb
+RiffStopAll
+RiffSuspend
+```
+
+For full cleanup:
+
+```vb
+RiffClose
+```
+
+Use `RiffAutoSuspendTimer = True` for normal Office workflows.
+
+### No sound from a bus
+
+Check mute/solo state:
+
+```vb
+Debug.Print RiffBusVolume(RiffBusMusic)
+Debug.Print RiffBusMuted(RiffBusMusic)
+Debug.Print RiffBusSolo(RiffBusMusic)
+```
+
+If any bus is soloed, non-solo buses may be silent.
+
+### `RiffPlay` returns `-1`
+
+Check:
+
+- Buffer handle is valid.
+- Engine is initialized.
+- Voice pool is not full.
+- `RiffLastError`.
+
+```vb
+Dim v As Long
+v = RiffPlay(sndClick, RiffBusUi)
+If v = -1 Then Debug.Print RiffLastError
+```
+
+### `RiffLoad` returns `-1`
+
+Check:
+
+- File path exists.
+- Media Foundation supports the file.
+- Buffer pool is not full.
+- There is enough memory.
+
+```vb
+If Dir$(path) = vbNullString Then Debug.Print "Missing file"
+```
+
+---
+
+## Complete Public API Index
+
+### Enums
+
+```vb
+Public Enum RiffWaveType
+Public Enum RiffBusId
+Public Enum RiffEffectPreset
+Public Enum RiffErrorCode
+```
+
+### Engine
+
+```vb
+Public Function RiffOpen() As Boolean
+Public Sub RiffClose()
+Public Property Get RiffIsInitialized() As Boolean
+Public Property Get RiffAutoSuspendTimer() As Boolean
+Public Property Let RiffAutoSuspendTimer(ByVal value As Boolean)
+Public Sub RiffSuspend()
+Public Function RiffWake() As Boolean
+```
+
+### Diagnostics
+
+```vb
+Public Property Get RiffLastError() As RiffErrorCode
+Public Property Get RiffMaxVoices() As Long
+Public Property Get RiffMaxBuffers() As Long
+Public Property Get RiffMaxBuses() As Long
+Public Property Get RiffAdaptiveQueueMs() As Long
+Public Property Get RiffUnderrunCount() As Long
+Public Property Get RiffLastPaddingFrames() As Long
+Public Property Get RiffLastFramesAvailable() As Long
+Public Property Get RiffLastFramesWritten() As Long
+Public Sub RiffResetAdaptiveStats()
+```
+
+### Master and Buses
+
+```vb
+Public Property Get RiffMasterVolume() As Single
+Public Property Let RiffMasterVolume(ByVal value As Single)
+Public Sub RiffMasterGetPeak(ByRef peakLeft As Single, ByRef peakRight As Single)
+
+Public Property Get RiffBusVolume(ByVal busID As RiffBusId) As Single
+Public Property Let RiffBusVolume(ByVal busID As RiffBusId, ByVal value As Single)
+Public Property Get RiffBusMuted(ByVal busID As RiffBusId) As Boolean
+Public Property Let RiffBusMuted(ByVal busID As RiffBusId, ByVal value As Boolean)
+Public Property Get RiffBusSolo(ByVal busID As RiffBusId) As Boolean
+Public Property Let RiffBusSolo(ByVal busID As RiffBusId, ByVal value As Boolean)
+Public Sub RiffBusFadeTo(ByVal busID As RiffBusId, ByVal targetVolume As Single, Optional ByVal durationMs As Long = 250)
+Public Sub RiffBusGetPeak(ByVal busID As RiffBusId, ByRef peakLeft As Single, ByRef peakRight As Single)
+Public Sub RiffBusReset(ByVal busID As RiffBusId)
+```
+
+### Assets and Export
+
+```vb
+Public Function RiffLoad(ByVal filePath As String) As Long
+Public Function RiffLoadFromMemory(ByRef audioData() As Byte) As Long
+Public Sub RiffUnload(ByVal bufferHandle As Long)
+Public Property Get RiffBufferDurationSec(ByVal bufferHandle As Long) As Single
+Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath As String) As Boolean
+Public Function RiffRenderOscillatorWav(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal durationSec As Single, ByVal filePath As String) As Boolean
+```
+
+### Playback
+
+```vb
+Public Function RiffPlay(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayOnce(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayNoise(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+```
+
+### Compatibility Playback Wrappers
+
+```vb
+Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayBusOnce(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayNoiseBus(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+```
+
+### Voice Transport and State
+
+```vb
+Public Sub RiffPause(ByVal voiceHandle As Long)
+Public Sub RiffResume(ByVal voiceHandle As Long)
+Public Sub RiffStop(ByVal voiceHandle As Long)
+Public Sub RiffVoiceStop(ByVal voiceHandle As Long)
+Public Sub RiffStopAll()
+Public Sub RiffFadeIn(ByVal voiceHandle As Long, ByVal durationSec As Single)
+Public Sub RiffFadeOut(ByVal voiceHandle As Long, ByVal durationSec As Single)
+Public Sub RiffSetLoopRegionSec(ByVal voiceHandle As Long, ByVal startSec As Single, ByVal endSec As Single)
+Public Property Get RiffVoiceIsPlaying(ByVal voiceHandle As Long) As Boolean
+Public Function RiffVoicePlaying(ByVal voiceHandle As Long) As Boolean
+Public Function RiffVoiceActive(ByVal voiceHandle As Long) As Boolean
+Public Property Get RiffVoiceIsPaused(ByVal voiceHandle As Long) As Boolean
+Public Function RiffFindPlayingVoice(ByVal bufferHandle As Long, Optional ByVal busID As Long = -1) As Long
+Public Function RiffBufferIsPlaying(ByVal bufferHandle As Long, Optional ByVal busID As Long = -1) As Boolean
+```
+
+### Voice Routing, Metering, and Basic Properties
+
+```vb
+Public Property Get RiffVoiceBus(ByVal voiceHandle As Long) As RiffBusId
+Public Property Let RiffVoiceBus(ByVal voiceHandle As Long, ByVal value As RiffBusId)
+Public Sub RiffVoiceGetPeak(ByVal voiceHandle As Long, ByRef peakLeft As Single, ByRef peakRight As Single)
+Public Property Get RiffVoiceLoop(ByVal voiceHandle As Long) As Boolean
+Public Property Let RiffVoiceLoop(ByVal voiceHandle As Long, ByVal value As Boolean)
+Public Property Get RiffVoicePositionSec(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoicePositionSec(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceVolume(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceVolume(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoicePitch(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoicePitch(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoicePan(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoicePan(ByVal voiceHandle As Long, ByVal value As Single)
+```
+
+### Effect Helpers and Presets
+
+```vb
+Public Sub RiffVoiceClearEffects(ByVal voiceHandle As Long)
+Public Sub RiffVoiceSetReverb(ByVal voiceHandle As Long, ByVal mix As Single, ByVal roomTime As Single)
+Public Sub RiffVoiceSetDelay(ByVal voiceHandle As Long, ByVal delayTime As Single, ByVal feedback As Single, ByVal mix As Single)
+Public Sub RiffVoiceSetChorus(ByVal voiceHandle As Long, ByVal depth As Single, ByVal rate As Single)
+Public Sub RiffVoiceSetFlanger(ByVal voiceHandle As Long, ByVal depth As Single, ByVal rate As Single, ByVal feedback As Single)
+Public Sub RiffVoiceSetFilter(ByVal voiceHandle As Long, ByVal lowPass As Single, ByVal highPass As Single)
+Public Sub RiffVoiceApplyPreset(ByVal voiceHandle As Long, ByVal preset As RiffEffectPreset, Optional ByVal amount As Single = 1!)
+```
+
+### DSP Properties
+
+```vb
+Public Property Get RiffVoiceBitDepth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceBitDepth(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceSampleRateReduction(ByVal voiceHandle As Long) As Long
+Public Property Let RiffVoiceSampleRateReduction(ByVal voiceHandle As Long, ByVal value As Long)
+Public Property Get RiffVoiceRingModFreq(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceRingModFreq(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceRingModMix(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceRingModMix(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceAutoPanRate(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceAutoPanRate(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceAutoPanDepth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceAutoPanDepth(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceEqBass(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceEqBass(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceEqMid(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceEqMid(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceEqTreble(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceEqTreble(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceCompressorThreshold(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceCompressorThreshold(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceCompressorRatio(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceCompressorRatio(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceFlangerDepth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceFlangerDepth(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceFlangerRate(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceFlangerRate(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceFlangerFeedback(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceFlangerFeedback(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceDistortion(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceDistortion(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceLowPass(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceLowPass(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceHighPass(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceHighPass(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceStereoWidth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceStereoWidth(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceTremoloRate(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceTremoloRate(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceTremoloDepth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceTremoloDepth(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceChorusDepth(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceChorusDepth(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceChorusRate(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceChorusRate(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceReverbMix(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceReverbMix(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceReverbTime(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceReverbTime(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceDelayTime(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceDelayTime(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceDelayFeedback(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceDelayFeedback(ByVal voiceHandle As Long, ByVal value As Single)
+Public Property Get RiffVoiceDelayMix(ByVal voiceHandle As Long) As Single
+Public Property Let RiffVoiceDelayMix(ByVal voiceHandle As Long, ByVal value As Single)
+```
