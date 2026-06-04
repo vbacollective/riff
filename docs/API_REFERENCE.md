@@ -1,220 +1,265 @@
 # Riff API Reference
 
-This document describes the complete public interface of **Riff.bas**, a high-performance, COM-based WASAPI audio engine for VBA. Riff provides real-time audio playback, Media Foundation decoding, a sample-accurate Studio DSP Pipeline, BLEP-corrected synthesis, and flexible audio routing.
+This document provides a comprehensive and exhaustive guide to the public interface of **Riff.bas**, a high-performance, single-file WASAPI audio engine for VBA. It covers every public function, property, and enumeration required to integrate professional audio playback, synthesis, and real-time DSP into Microsoft Office applications.
 
 ## Table of Contents
 
 - [Core Concepts](#core-concepts)
+- [Signal Hierarchy & Routing](#signal-hierarchy--routing)
 - [Initialization and Lifecycle](#initialization-and-lifecycle)
-- [Diagnostics and Engine State](#diagnostics-and-engine-state)
+- [Engine Configuration & State](#engine-configuration--state)
+- [Audio Mixer Buses](#audio-mixer-buses)
 - [Buffer Management](#buffer-management)
-- [Playback and Voice Control](#playback-and-voice-control)
-- [Audio Buses and Mixing](#audio-buses-and-mixing)
-- [Voice Properties](#voice-properties)
-- [DSP Pipeline and Effects](#dsp-pipeline-and-effects)
-- [High-Level Effect Presets](#high-level-effect-presets)
+- [Playback Entry Points](#playback-and-voice-spawning)
+- [Synthesis and Oscillators](#synthesis-and-oscillators)
+- [Voice Playback Control](#voice-playback-control)
+- [DSP Pipeline Matrix](#dsp-pipeline-matrix)
+- [Effect Presets](#effect-presets)
 - [Offline Rendering and Export](#offline-rendering-and-export)
 - [Enumerations](#enumerations)
 
 ## Core Concepts
 
-### Handles and IDs
-- **Buffer Handles (`0` to `63`):** Represent decoded PCM data stored in physical memory. A buffer must be loaded before it can be played.
-- **Voice Handles (`0` to `31`):** Represent active playback channels. A voice handle is returned by playback functions and remains valid until the voice stops or is stopped manually.
-- **Bus IDs (`0` to `15`):** Represent logical mixing groups. Every voice is routed to a bus (default: `RiffBusMain`). Bus volume is applied after voice volume and before master volume.
+### Numeric Handles
+Riff uses zero-based `Long` handles to represent resources. These handles are used as indices into optimized internal arrays to ensure high-performance, sample-accurate processing.
+- **Buffer Handles (0 to 63):** Represent decoded, uncompressed PCM data residing in system memory.
+- **Voice Handles (0 to 31):** Represent active playback channels. A voice is spawned when you call a playback function and is recycled once it finishes or is stopped.
+- **Bus IDs (0 to 15):** Represent logical mixing groups.
 
-### Memory Safety
-Riff operates at a low level using `VirtualAlloc` and native thunks. 
+### Resource Limits
+- **Voices:** 32 simultaneous polyphonic channels.
+- **Buffers:** 64 statically allocated audio slots.
+- **Buses:** 16 independent mixer buses.
 
-> [!WARNING]
-> Always call `RiffClose` before host shutdown or project reset. Failing to do so can leave native timers active, leading to crashes or "Out of memory" errors when the project is re-run.
+## Signal Hierarchy & Routing
+
+Riff implements a multiplicative gain hierarchy that allows for granular control over the final output without altering individual asset states.
+
+### The Signal Chain
+The final amplitude of any sample reaching the hardware is calculated as:
+**Output = Sample × Voice Volume × Bus Volume × Master Volume**
+
+1. **Voice Volume:** Set per instance (e.g., an individual explosion).
+2. **Bus Volume:** Set per category (e.g., all Sound Effects).
+3. **Master Volume:** Set for the entire application.
 
 ## Initialization and Lifecycle
 
 ### RiffOpen
 `Public Function RiffOpen() As Boolean`
-
-Initializes the engine, including Media Foundation, WASAPI device acquisition, and the DSP render timer. 
-- **Returns:** `True` if initialization succeeded. `False` if failed (check `RiffLastError`).
-- **Note:** It is safe to call `RiffOpen` multiple times; subsequent calls return `True` immediately if already running.
+Initializes the Media Foundation decoding subsystem, acquires the default WASAPI render device, and starts the high-resolution (10ms) DSP timer thunk.
+- **Returns:** `True` if initialization succeeded. `False` if failed. Check `RiffLastError` for COM or hardware errors.
+- **Note:** Safe to call multiple times; subsequent calls return `True` immediately if already running.
 
 ### RiffClose
 `Public Sub RiffClose()`
-
-Shuts down the engine completely. Stops all active voices, unloads all buffers, and releases hardware interfaces. 
-- **Lifecycle:** Essential to call this in `Workbook_BeforeClose` or equivalent events.
+Shuts down the engine completely. This stops the render timer, releases all WASAPI/COM interfaces, and frees all memory allocated via `VirtualAlloc`.
+- **CRITICAL:** You **must** call this in your host's shutdown event (e.g., `Workbook_BeforeClose`). Failure to close the engine leaves a native timer running in the background, which will likely crash the host on project reset.
 
 ### RiffSuspend
 `Public Sub RiffSuspend()`
-
-Manually stops the render timer to save CPU while keeping all buffers and voice state in memory. 
+Pauses the native render timer to save CPU cycles. All buffers and voice states are preserved in memory. Useful when the application is minimized or inactive.
 
 ### RiffWake
 `Public Function RiffWake() As Boolean`
+Restarts the render timer after suspension.
+- **Returns:** `True` if the timer is successfully running.
 
-Restarts the render timer after suspension. Returns `True` if the timer is running.
-
-## Diagnostics and Engine State
+## Engine Configuration & State
 
 ### RiffIsInitialized
 `Public Property Get RiffIsInitialized() As Boolean`
-Checks if the engine is currently active.
+Indicates whether the engine has been successfully opened and is ready to process audio.
 
 ### RiffLastError
 `Public Property Get RiffLastError() As RiffErrorCode`
-Returns the most recent error code. Successful API calls clear this value.
+Returns the code of the most recent failure. Successful API calls reset this to `RiffErrorNone`.
 
 ### RiffAutoSuspendTimer
 `Public Property Get/Let RiffAutoSuspendTimer() As Boolean`
-If `True`, the engine will automatically call `RiffSuspend` after 50 consecutive idle ticks (approx. 750ms of silence) to save CPU and VBE stability.
+When enabled (`True`), the engine automatically suspends its render timer after 50 consecutive idle ticks (approx. 750ms of silence). It automatically wakes up when a new playback command is issued.
 
 ### RiffMasterVolume
 `Public Property Get/Let RiffMasterVolume() As Single`
-Sets the global master gain multiplier. Valid range: `0.0` to `1.0`.
+Sets the final gain multiplier for the entire engine.
+- **Range:** `0.0` (Mute) to `1.0` (Unity). Defaults to `1.0`.
 
 ### RiffMasterGetPeak
 `Public Sub RiffMasterGetPeak(ByRef peakLeft As Single, ByRef peakRight As Single)`
-Retrieves the instantaneous peak amplitude (0.0 to 1.0+) of the final master mix. Values decay over time.
+Retrieves the instantaneous peak amplitude of the master output.
+- **Parameters:** `peakLeft` and `peakRight` are passed by reference and updated with values from `0.0` to `1.0+` (clipping).
+
+### Engine Constants
+- `RiffMaxVoices`: Returns `32`.
+- `RiffMaxBuffers`: Returns `64`.
+- `RiffMaxBuses`: Returns `16`.
+
+## Audio Mixer Buses
+
+Buses act as logical summing groups for routing and mixing.
+
+### RiffBusVolume
+`Public Property Get/Let RiffBusVolume(ByVal busID As RiffBusId) As Single`
+Sets the volume for an entire bus.
+- **Range:** `0.0` to `2.0` (+6dB boost). Defaults to `1.0`.
+
+### RiffBusMuted
+`Public Property Get/Let RiffBusMuted(ByVal busID As RiffBusId) As Boolean`
+Silences a bus without altering its `RiffBusVolume` setting.
+
+### RiffBusSolo
+`Public Property Get/Let RiffBusSolo(ByVal busID As RiffBusId) As Boolean`
+When one or more buses are in Solo mode, only those buses (and any others also in Solo) will be audible. All other non-soloed buses are implicitly muted.
+
+### RiffBusFadeTo
+`Public Sub RiffBusFadeTo(ByVal busID As RiffBusId, ByVal targetVolume As Single, Optional ByVal durationMs As Long = 250)`
+Smoothly transitions a bus volume. This is processed entirely in the native background thread and is non-blocking.
+
+### RiffBusGetPeak
+`Public Sub RiffBusGetPeak(ByVal busID As RiffBusId, ByRef peakLeft As Single, ByRef peakRight As Single)`
+Retrieves the post-fader output level for a specific bus.
+
+### RiffBusReset
+`Public Sub RiffBusReset(ByVal busID As RiffBusId)`
+Restores a bus to its default state (Volume 1.0, Unmuted, No Solo, No Fades).
 
 ## Buffer Management
 
+Buffers store decoded audio data in memory for instant playback.
+
 ### RiffLoad
 `Public Function RiffLoad(ByVal filePath As String) As Long`
-Decodes an audio file into memory. Supports standard formats (WAV, MP3, AAC, FLAC, etc.).
-- **Returns:** Buffer handle (`0` to `63`) or `-1` on failure.
+Decodes an audio file into a free buffer slot. Supports WAV, MP3, AAC, FLAC, and OGG (on Windows 10+).
+- **Returns:** Buffer handle (`0-63`) or `-1` on failure.
 
 ### RiffLoadFromMemory
 `Public Function RiffLoadFromMemory(ByRef audioData() As Byte) As Long`
-Decodes audio from a `Byte` array. Useful for assets stored in cells, custom properties, or embedded resources.
+Decodes audio from a raw binary array.
+- **Note:** The array must contain a valid file format (e.g., the contents of an MP3 file), not raw PCM samples.
 
 ### RiffUnload
 `Public Sub RiffUnload(ByVal bufferHandle As Long)`
-Frees the physical memory used by the buffer and stops any voices playing from it.
+Kills any voices using the buffer and frees the associated physical memory.
 
 ### RiffBufferDurationSec
 `Public Property Get RiffBufferDurationSec(ByVal bufferHandle As Long) As Single`
-Returns the length of the loaded buffer in seconds.
+Returns the total length of the buffer in seconds.
 
-## Playback and Voice Control
+## Playback and Voice Spawning
+
+These functions create a new **Voice** to play a loaded **Buffer**.
 
 ### RiffPlay
 `Public Function RiffPlay(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = 1.0, Optional ByVal pan As Single = 0.0) As Long`
-Spawns a new voice for the specified buffer.
-- **Parameters:**
-    - `busID`: Routes the voice to a specific mixer bus.
-    - `looped`: If `True`, the voice wraps back to start (or loop region) on completion.
-- **Returns:** Voice handle (`0` to `31`) or `-1` if the pool is full.
+The primary playback function.
+- **Returns:** Voice handle (`0-31`) or `-1` if the pool is full.
 
 ### RiffPlayOnce
-`Public Function RiffPlayOnce(ByVal bufferHandle As Long, ...args) As Long`
-Starts playback only if the same buffer is not already active on the target bus.
+`Public Function RiffPlayOnce(ByVal bufferHandle As Long, ...)`
+Starts playback **only if** the same buffer is not already playing on the target bus. Useful for preventing "phasing" sounds or duplicate UI clicks.
+
+### RiffPlayBus
+`Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId, ...)`
+A compatibility wrapper for routing a buffer directly to a bus.
+
+## Synthesis and Oscillators
+
+Oscillators generate sound mathematically and do not require a loaded buffer. They use the same DSP pipeline as buffers.
 
 ### RiffPlayOscillator
 `Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ...args) As Long`
-Spawns a synth voice using the engine's internal oscillators.
+Spawns a periodic synth voice (Sine, Square, Saw).
 
 ### RiffPlayNoise
 `Public Function RiffPlayNoise(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, ...args) As Long`
-Spawns a noise generator (White, Pink, or Brown noise).
+Spawns a noise generator.
+- **Types:** White (random), Pink (1/f), or Brown (1/f²).
 
-### RiffPause / RiffResume / RiffStop
-Voice-level playback control. `RiffStop` immediately frees the voice slot.
+## Voice Playback Control
 
-### RiffFadeIn / RiffFadeOut
-`Public Sub RiffFadeIn(ByVal voiceHandle As Long, ByVal durationSec As Single)`
-`Public Sub RiffFadeOut(ByVal voiceHandle As Long, ByVal durationSec As Single)`
-Transitions volume smoothly. `RiffFadeOut` stops the voice automatically when finished.
+Once a voice handle is obtained, you can manipulate its playback state in real-time.
 
-### RiffSetLoopRegionSec
-`Public Sub RiffSetLoopRegionSec(ByVal voiceHandle As Long, ByVal startSec As Single, ByVal endSec As Single)`
-Defines a sub-region for looping. Boundaries are sample-aligned.
+### Status and Identification
+- **RiffVoiceIsPlaying:** Returns `True` if the voice is active and not paused.
+- **RiffVoiceIsPaused:** Returns `True` if the voice is held in a paused state.
+- **RiffFindPlayingVoice:** Finds an active voice handle for a given buffer.
 
-## Audio Buses and Mixing
+### Transport Control
+- **RiffPause / RiffResume:** Suspends or continues playback.
+- **RiffStop:** Immediately kills the voice and clears its DSP state.
+- **RiffStopAll:** Kills all active voices across all buses.
 
-Audio buses act as logical summing groups or "sub-mixes." Instead of managing the volume of dozens of individual voices, you can route them to functional buses (e.g., `RiffBusMusic`, `RiffBusSfx`, `RiffBusUi`) and control the group's gain, mute state, or solo status in a single call.
+### Envelopes and Regions
+- **RiffFadeIn / RiffFadeOut:** Applies a linear gain ramp over a specified duration in seconds.
+- **RiffSetLoopRegionSec:** Defines the start and end points for looping within a buffer.
 
-### The Signal Chain
-Riff uses a multiplicative volume hierarchy. If the Master volume is 50%, the Bus volume is 50%, and the Voice volume is 100%, the resulting sound will play at 25% of full scale.
+### Real-time Parameters
+- **RiffVoiceVolume:** Per-voice gain (`0.0` to `2.0`).
+- **RiffVoicePitch:** Pitch and speed multiplier (`0.1` to `8.0`). `1.0` is normal.
+- **RiffVoicePan:** Stereo position from `-1.0` (Full Left) to `1.0` (Full Right).
+- **RiffVoicePositionSec:** Gets or sets the current playback cursor in seconds.
 
-1. **Voice Volume:** Set via `RiffVoiceVolume`.
-2. **Bus Volume:** Set via `RiffBusVolume`.
-3. **Master Volume:** Set via `RiffMasterVolume`.
+## DSP Pipeline Matrix
 
-### Bus Management Functions
+Every voice passes through a fixed chain of DSP stages. Setting a "Mix" or "Depth" property to `0.0` bypasses that stage for performance.
 
-#### RiffBusVolume
-`Public Property Get/Let RiffBusVolume(ByVal busID As RiffBusId) As Single`
-Sets the gain multiplier for an entire bus. The valid range is `0.0` (silence) to `2.0` (+6dB boost).
+### 1. Bitcrusher & Distortion
+- **RiffVoiceBitDepth:** Simulates lower bit depths (`2` to `32`).
+- **RiffVoiceSampleRateReduction:** Simple integer downsampling (`1` to `20`).
+- **RiffVoiceDistortion:** Multiplier-based hard clipping.
 
-#### RiffBusMuted / RiffBusSolo
-`Public Property Get/Let RiffBusMuted(ByVal busID As RiffBusId) As Boolean`
-`Public Property Get/Let RiffBusMuted(ByVal busID As RiffBusId, ByVal value As Boolean)`
-`Public Property Get/Let RiffBusSolo(ByVal busID As RiffBusId) As Boolean`
-`Public Property Get/Let RiffBusSolo(ByVal busID As RiffBusId, ByVal value As Boolean)`
-Standard mixer controls. Soloing a bus effectively mutes all other buses unless they are also soloed.
+### 2. Filters & EQ
+- **RiffVoiceLowPass / RiffVoiceHighPass:** Resonance-compensated Biquad filters.
+- **RiffVoiceSetFilter:** Sets both Low-Pass and High-Pass simultaneously.
+- **RiffVoiceEqBass / Mid / Treble:** Gain multipliers for a 3-band parametric EQ.
 
-#### RiffBusFadeTo
-`Public Sub RiffBusFadeTo(ByVal busID As RiffBusId, ByVal targetVolume As Single, Optional ByVal durationMs As Long = 250)`
-Transitions a bus volume over time. This is processed entirely within the native audio callback and does not block the VBA thread.
+### 3. Modulation Effects
+- **RiffVoiceRingModFreq / Mix:** Metallic, robotic ring modulation.
+- **RiffVoiceTremoloRate / Depth:** Periodic volume oscillation.
+- **RiffVoiceAutoPanRate / Depth:** Periodic stereo movement.
+- **RiffVoiceChorusRate / Depth:** Shimmering, thick ensemble effect.
+- **RiffVoiceFlangerRate / Depth / Feedback:** Resonant, sweeping "jet" effect.
 
-#### RiffBusGetPeak
-`Public Sub RiffBusGetPeak(ByVal busID As RiffBusId, ByRef peakLeft As Single, ByRef peakRight As Single)`
-Retrieves the post-fader output level for a specific bus, ideal for driving UI meters.
+### 4. Spatial Effects
+- **RiffVoiceReverbMix / Time:** High-quality Freeverb implementation.
+- **RiffVoiceDelayTime / Feedback / Mix:** Standard echo/delay. Max delay is ~1.9s.
+- **RiffVoiceStereoWidth:** Controls the side-channel gain. `0.0` is Mono, `1.0` is standard Stereo, `5.0` is ultra-wide.
 
-## Voice Properties
+### 5. Dynamics
+- **RiffVoiceCompressorThreshold / Ratio:** Real-time gain reduction with automatic attack/release.
 
-- **Volume (`Single`):** Per-voice gain (0.0 to 2.0).
-- **Pitch (`Double`):** Speed and frequency multiplier (0.1 to 8.0).
-- **Pan (`Single`):** Stereo position (-1.0 Left, 1.0 Right).
-- **PositionSec (`Single`):** Current playback position. Writing seeks to a new time.
-
-## DSP Pipeline and Effects
-
-Every voice passes through a fixed Studio DSP chain. Controls with a mix or depth of `0.0` are bypassed for performance.
-
-### Filters & EQ
-- **RiffVoiceSetFilter:** Sets Low-Pass (0.01-1.0) and High-Pass (0.0-0.99) cutoffs.
-- **EQ Bands:** `RiffVoiceEqBass`, `RiffVoiceEqMid`, `RiffVoiceEqTreble` (0.05 to 5.0 gain).
-
-### Spatial & Modulation
-- **Reverb:** `RiffVoiceSetReverb(mix, roomTime)`. Uses Freeverb logic.
-- **Delay:** `RiffVoiceSetDelay(time, feedback, mix)`.
-- **Chorus / Flanger:** `RiffVoiceSetChorus`, `RiffVoiceSetFlanger`.
-- **Stereo Width:** `RiffVoiceStereoWidth` (0.0 Mono to 5.0 Extra-Wide).
-
-### Dynamics & Texture
-- **Compressor:** `RiffVoiceCompressorThreshold`, `RiffVoiceCompressorRatio`.
-- **Distortion:** `RiffVoiceDistortion` (multiplier-based hard clip).
-- **Bitcrusher:** `RiffVoiceBitDepth` (2 to 32), `RiffVoiceSampleRateReduction` (1 to 20).
-- **Ring Modulator:** `RiffVoiceRingModFreq`, `RiffVoiceRingModMix`.
-
-## High-Level Effect Presets
+## Effect Presets
 
 ### RiffVoiceApplyPreset
 `Public Sub RiffVoiceApplyPreset(ByVal voiceHandle As Long, ByVal preset As RiffEffectPreset, Optional ByVal amount As Single = 1.0)`
-Instantly configures the entire DSP matrix for a specific character. 
-- **Example:** `RiffVoiceApplyPreset v, RiffFxUnderwater, 0.7` sets filter cutoffs, EQ, and chorus to simulate being submerged.
+A powerful high-level function that instantly configures multiple DSP stages to achieve a specific character.
+- **Presets:** `RiffFxRadio`, `RiffFxUnderwater`, `RiffFxCathedral`, `RiffFxLoFi`, `RiffFxRobot`, `RiffFxAmbient`, etc.
+- **Note:** This resets all other DSP properties to neutral before applying the preset.
 
 ## Offline Rendering and Export
 
 ### RiffExportBufferWav
 `Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath As String) As Boolean`
-Saves a decoded buffer to a high-quality 16-bit stereo PCM WAV file.
+Writes the contents of a decoded buffer to a standard 16-bit stereo PCM WAV file.
 
 ### RiffRenderOscillatorWav
 `Public Function RiffRenderOscillatorWav(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal durationSec As Single, ByVal filePath As String) As Boolean`
-Generates a synth file without using real-time playback voices.
+Generates a synthesized audio asset directly to disk without requiring a real-time voice.
 
 ## Enumerations
 
-### RiffWaveType
-Selects the oscillator or noise algorithm.
-- `RiffWaveSine`, `RiffWaveSquare`, `RiffWaveSawtooth`, `RiffWaveWhiteNoise`, `RiffWavePinkNoise`, `RiffWaveBrownNoise`.
-
 ### RiffBusId
-Mixing bus slots.
-- `RiffBusMain`, `RiffBusSfx`, `RiffBusMusic`, `RiffBusVoice`, `RiffBusUi`, `RiffBusAux1` to `RiffBusAux11`.
+Defines the standard mixer slots.
+`RiffBusMain`, `RiffBusSfx`, `RiffBusMusic`, `RiffBusVoice`, `RiffBusUi`, `RiffBusAux1`...`RiffBusAux11`.
+
+### RiffWaveType
+Defines oscillator and noise algorithms.
+`RiffWaveSine`, `RiffWaveSquare`, `RiffWaveSawtooth`, `RiffWaveWhiteNoise`, `RiffWavePinkNoise`, `RiffWaveBrownNoise`.
 
 ### RiffEffectPreset
-Character-based presets for `RiffVoiceApplyPreset`.
-- `RiffFxDry`, `RiffFxSmallRoom`, `RiffFxHall`, `RiffFxCathedral`, `RiffFxSlapback`, `RiffFxEcho`, `RiffFxChorus`, `RiffFxFlanger`, `RiffFxLoFi`, `RiffFxRadio`, `RiffFxUnderwater`, `RiffFxWide`, `RiffFxRobot`, `RiffFxAmbient`.
+Defines the built-in DSP configurations for `RiffVoiceApplyPreset`.
+`RiffFxDry`, `RiffFxSmallRoom`, `RiffFxHall`, `RiffFxCathedral`, `RiffFxSlapback`, `RiffFxEcho`, `RiffFxChorus`, `RiffFxFlanger`, `RiffFxLoFi`, `RiffFxRadio`, `RiffFxUnderwater`, `RiffFxWide`, `RiffFxRobot`, `RiffFxAmbient`.
+
+### RiffErrorCode
+Diagnostic values returned by `RiffLastError`.
+`RiffErrorNone`, `RiffErrorNotInitialized`, `RiffErrorNoFreeBuffer`, `RiffErrorNoFreeVoice`, `RiffErrorInvalidBuffer`, `RiffErrorInvalidVoice`, `RiffErrorInvalidBus`, `RiffErrorInvalidArgument`, `RiffErrorFileNotFound`, `RiffErrorComFailure`, `RiffErrorMemoryAllocation`, `RiffErrorDecodeFailed`, `RiffErrorUnsupportedFormat`.
