@@ -37,7 +37,7 @@ Private Const RIFF_MAX_BUS_INDEX As Long = RIFF_BUS_COUNT - 1
 ' * @brief Mixer bus state used for grouped volume, fades, mute, solo, and peak metering.
 ' */
 Private Type RiffBus
-    Volume As Single
+    volume As Single
     targetVolume As Single
     FadeStartVolume As Single
     FadeFramesCurrent As Long
@@ -168,6 +168,14 @@ End Type
         TimerID As LongPtr
         RenderPeriodMs As Long
         MaxWriteFrames As Long
+        AdaptiveTargetQueueMs As Long
+        AdaptiveStableTicks As Long
+        AdaptiveLastUnderruns As Long
+        UnderrunCount As Long
+        RenderTickCount As Long
+        LastPaddingFrames As Long
+        LastFramesAvailable As Long
+        LastFramesWritten As Long
         TimerResolutionActive As Boolean
         TimerCallbackActive As Boolean
         IdleTimerTicks As Long
@@ -296,6 +304,14 @@ End Type
         TimerID As Long
         RenderPeriodMs As Long
         MaxWriteFrames As Long
+        AdaptiveTargetQueueMs As Long
+        AdaptiveStableTicks As Long
+        AdaptiveLastUnderruns As Long
+        UnderrunCount As Long
+        RenderTickCount As Long
+        LastPaddingFrames As Long
+        LastFramesAvailable As Long
+        LastFramesWritten As Long
         TimerResolutionActive As Boolean
         TimerCallbackActive As Boolean
         IdleTimerTicks As Long
@@ -315,6 +331,9 @@ Public Enum RiffWaveType
     RiffWaveSquare = 1
     RiffWaveSawtooth = 2
     RiffWaveNoise = 3
+    RiffWaveWhiteNoise = 3
+    RiffWavePinkNoise = 4
+    RiffWaveBrownNoise = 5
 End Enum
 
 '/**
@@ -338,6 +357,27 @@ Public Enum RiffBusId
     RiffBusAux9 = 13
     RiffBusAux10 = 14
     RiffBusAux11 = 15
+End Enum
+
+'/**
+' * @enum RiffEffectPreset
+' * @brief Named, high-level effect presets for quickly shaping a voice without touching every DSP property.
+' */
+Public Enum RiffEffectPreset
+    RiffFxDry = 0
+    RiffFxSmallRoom = 1
+    RiffFxHall = 2
+    RiffFxCathedral = 3
+    RiffFxSlapback = 4
+    RiffFxEcho = 5
+    RiffFxChorus = 6
+    RiffFxFlanger = 7
+    RiffFxLoFi = 8
+    RiffFxRadio = 9
+    RiffFxUnderwater = 10
+    RiffFxWide = 11
+    RiffFxRobot = 12
+    RiffFxAmbient = 13
 End Enum
 
 '/**
@@ -376,13 +416,23 @@ Private Type RiffVoice
     OscFreq As Single
     OscPhase As Double
     
+    noiseSeed As Long
+    NoisePinkB0 As Single
+    NoisePinkB1 As Single
+    NoisePinkB2 As Single
+    NoisePinkB3 As Single
+    NoisePinkB4 As Single
+    NoisePinkB5 As Single
+    NoisePinkB6 As Single
+    NoiseBrown As Single
+    
     PeakL As Single
     PeakR As Single
     
     Position As Double
-    Volume As Single
+    volume As Single
     Pitch As Double
-    Pan As Single
+    pan As Single
     
     AutoPanRate As Single
     AutoPanDepth As Single
@@ -466,7 +516,7 @@ Private Type RiffVoice
     EqTrebleZ1R As Single
     EqTrebleZ2R As Single
     
-    DelayTime As Single
+    delayTime As Single
     DelayFeedback As Single
     DelayMix As Single
     
@@ -619,17 +669,36 @@ Private Const RIFF_SAFEARRAY_OFFSET_COUNT_32 As Long = 16
 '/** @description 64-bit SAFEARRAY.rgsabound[0].cElements descriptor offset. */
 Private Const RIFF_SAFEARRAY_OFFSET_COUNT_64 As Long = 24
 
-'/** @description Low-latency render tick interval in milliseconds. */
-Private Const RIFF_RENDER_PERIOD_MS As Long = 20
+'/** @description Adaptive low-latency render tick interval in milliseconds. */
+Private Const RIFF_RENDER_PERIOD_MS As Long = 10
 
 '/** @description Number of idle timer ticks before the render timer suspends itself to release the VBE. */
 Private Const RIFF_IDLE_TIMER_STOP_TICKS As Long = 50
 
-'/** @description Maximum audio chunk written per timer tick in milliseconds. Keeps enough headroom to avoid chopped playback. */
-Private Const RIFF_MAX_WRITE_MS As Long = 100
+'/** @description Maximum audio chunk written per timer tick in milliseconds. Allows recovery after delayed Office/VBE ticks. */
+Private Const RIFF_MAX_WRITE_MS As Long = 180
 
-'/** @description Requested WASAPI shared buffer duration in milliseconds. Avoids underruns while still preventing a long silent queue. */
-Private Const RIFF_DEVICE_BUFFER_MS As Long = 150
+'/** @description Requested WASAPI shared buffer duration in milliseconds. Must be large enough for adaptive recovery without forcing constant latency. */
+Private Const RIFF_DEVICE_BUFFER_MS As Long = 220
+
+'/** @description Normal adaptive playback queue target in milliseconds for responsive controls. */
+Private Const RIFF_QUEUE_MIN_MS As Long = 60
+
+'/** @description Temporary safe adaptive playback queue target after a detected underrun or delayed render tick. */
+Private Const RIFF_QUEUE_SAFE_MS As Long = 160
+
+'/** @description Emergency adaptive playback queue target when the output queue becomes almost empty. */
+Private Const RIFF_QUEUE_PANIC_MS As Long = 200
+
+'/** @description Milliseconds removed from the adaptive queue target at each stable recovery step. */
+Private Const RIFF_QUEUE_RECOVER_STEP_MS As Long = 10
+
+'/** @description Render ticks without underruns before the adaptive queue begins returning to low latency. */
+Private Const RIFF_QUEUE_RECOVER_DELAY_TICKS As Long = 220
+
+'/** @description Padding threshold considered dangerously close to an underrun. */
+Private Const RIFF_UNDERRUN_PADDING_MS As Long = 3
+
 
 '/** @description WASAPI REFERENCE_TIME units per millisecond. */
 Private Const RIFF_HNS_PER_MS As Long = 10000
@@ -857,6 +926,7 @@ Private Const RIFF_FLANGER_BASE_DELAY_SEC As Single = 0.002!
 Private Const RIFF_FLANGER_MOD_DELAY_SEC As Single = 0.005!
 Private Const RIFF_CHORUS_BASE_DELAY_SEC As Single = 0.02!
 Private Const RIFF_CHORUS_MOD_DELAY_SEC As Single = 0.005!
+Private Const RIFF_MAX_DELAY_SEC As Single = 1.9!
 
 '/** @description Built-in oscillator defaults. */
 Private Const RIFF_DEFAULT_OSCILLATOR_HZ As Single = 440!
@@ -864,6 +934,18 @@ Private Const RIFF_OSCILLATOR_EXPORT_GAIN As Single = 0.75!
 Private Const RIFF_OSCILLATOR_FALLBACK_HZ As Double = 440#
 Private Const RIFF_OSCILLATOR_MAX_DT As Double = 0.5
 Private Const RIFF_OSCILLATOR_BLEP_LEVEL As Single = 0.65!
+
+'/** @description Noise generator constants for deterministic white, pink, and brown oscillator modes. */
+Private Const RIFF_NOISE_SEED_MOD As Double = 2147483647#
+Private Const RIFF_NOISE_SEED_MULT As Double = 16807#
+Private Const RIFF_NOISE_SEED_SCALE As Double = 1073741823.5
+Private Const RIFF_PINK_GAIN As Single = 0.11!
+Private Const RIFF_BROWN_INPUT_GAIN As Single = 0.02!
+Private Const RIFF_BROWN_LEAK As Single = 1.02!
+Private Const RIFF_BROWN_OUTPUT_GAIN As Single = 3.5!
+
+'/** @description Internal DSP safety clamp for feedback buffers and generated samples. */
+Private Const RIFF_DSP_SAMPLE_LIMIT As Single = 4!
 
 '/** @description Default voice effect values. */
 Private Const RIFF_DEFAULT_VOICE_VOLUME As Single = 1!
@@ -877,7 +959,9 @@ Private Const RIFF_DEFAULT_REVERB_TIME As Single = 0.5!
 
 '/** @description Public control clamp limits. */
 Private Const RIFF_MAX_BUS_VOLUME As Single = 2!
+Private Const RIFF_MAX_VOICE_VOLUME As Single = 2!
 Private Const RIFF_MIN_VOICE_PITCH As Single = 0.1!
+Private Const RIFF_MAX_VOICE_PITCH As Single = 8!
 Private Const RIFF_MAX_EQ_GAIN As Single = 5!
 Private Const RIFF_MIN_MOD_RATE_HZ As Single = 0.1!
 Private Const RIFF_MAX_MOD_RATE_HZ As Single = 10!
@@ -1056,7 +1140,7 @@ Private Sub RiffResetBusState(ByVal busID As Long)
         Exit Sub
     End If
 
-    rCtx.Buses(busID).Volume = RIFF_UNITY_GAIN
+    rCtx.Buses(busID).volume = RIFF_UNITY_GAIN
     rCtx.Buses(busID).targetVolume = RIFF_UNITY_GAIN
     rCtx.Buses(busID).FadeStartVolume = RIFF_UNITY_GAIN
     rCtx.Buses(busID).FadeFramesCurrent = 0
@@ -1100,13 +1184,13 @@ Private Sub RiffTickBusFades(ByVal renderedFrames As Long)
         If rCtx.Buses(i).FadeFramesTotal > 0 Then
             rCtx.Buses(i).FadeFramesCurrent = rCtx.Buses(i).FadeFramesCurrent + renderedFrames
             If rCtx.Buses(i).FadeFramesCurrent >= rCtx.Buses(i).FadeFramesTotal Then
-                rCtx.Buses(i).Volume = rCtx.Buses(i).targetVolume
+                rCtx.Buses(i).volume = rCtx.Buses(i).targetVolume
                 rCtx.Buses(i).FadeFramesCurrent = 0
                 rCtx.Buses(i).FadeFramesTotal = 0
-                rCtx.Buses(i).FadeStartVolume = rCtx.Buses(i).Volume
+                rCtx.Buses(i).FadeStartVolume = rCtx.Buses(i).volume
             Else
                 t = CSng(rCtx.Buses(i).FadeFramesCurrent) / CSng(rCtx.Buses(i).FadeFramesTotal)
-                rCtx.Buses(i).Volume = rCtx.Buses(i).FadeStartVolume + ((rCtx.Buses(i).targetVolume - rCtx.Buses(i).FadeStartVolume) * t)
+                rCtx.Buses(i).volume = rCtx.Buses(i).FadeStartVolume + ((rCtx.Buses(i).targetVolume - rCtx.Buses(i).FadeStartVolume) * t)
             End If
         End If
 
@@ -1132,7 +1216,7 @@ Private Function RiffBusMixVolume(ByVal busID As RiffBusId) As Single
     ElseIf rCtx.HasSoloBus And Not rCtx.Buses(busID).Solo Then
         RiffBusMixVolume = 0!
     Else
-        RiffBusMixVolume = rCtx.Buses(busID).Volume
+        RiffBusMixVolume = rCtx.Buses(busID).volume
     End If
 End Function
 
@@ -1160,11 +1244,67 @@ Private Function RiffClampWaveType(ByVal waveType As RiffWaveType) As RiffWaveTy
     If waveType < RiffWaveSine Then
         RiffSetLastError RiffErrorInvalidArgument
         RiffClampWaveType = RiffWaveSine
-    ElseIf waveType > RiffWaveNoise Then
+    ElseIf waveType > RiffWaveBrownNoise Then
         RiffSetLastError RiffErrorInvalidArgument
-        RiffClampWaveType = RiffWaveNoise
+        RiffClampWaveType = RiffWaveWhiteNoise
     Else
         RiffClampWaveType = waveType
+    End If
+End Function
+
+'/**
+' * @function RiffClampUnit
+' * @brief Clamps a normalized control value to the 0..1 range.
+' */
+Private Function RiffClampUnit(ByVal value As Single) As Single
+    If value < 0! Then
+        RiffClampUnit = 0!
+    ElseIf value > 1! Then
+        RiffClampUnit = 1!
+    Else
+        RiffClampUnit = value
+    End If
+End Function
+
+'/**
+' * @function RiffClampVoiceVolume
+' * @brief Clamps a voice volume multiplier to the safe public voice range.
+' */
+Private Function RiffClampVoiceVolume(ByVal value As Single) As Single
+    If value < 0! Then
+        RiffClampVoiceVolume = 0!
+    ElseIf value > RIFF_MAX_VOICE_VOLUME Then
+        RiffClampVoiceVolume = RIFF_MAX_VOICE_VOLUME
+    Else
+        RiffClampVoiceVolume = value
+    End If
+End Function
+
+'/**
+' * @function RiffClampVoicePan
+' * @brief Clamps a voice pan value to the -1..1 range.
+' */
+Private Function RiffClampVoicePan(ByVal value As Single) As Single
+    If value < -1! Then
+        RiffClampVoicePan = -1!
+    ElseIf value > 1! Then
+        RiffClampVoicePan = 1!
+    Else
+        RiffClampVoicePan = value
+    End If
+End Function
+
+'/**
+' * @function RiffClampVoicePitch
+' * @brief Clamps a voice pitch multiplier to a safe positive range.
+' */
+Private Function RiffClampVoicePitch(ByVal value As Double) As Double
+    If value < RIFF_MIN_VOICE_PITCH Then
+        RiffClampVoicePitch = RIFF_MIN_VOICE_PITCH
+    ElseIf value > RIFF_MAX_VOICE_PITCH Then
+        RiffClampVoicePitch = RIFF_MAX_VOICE_PITCH
+    Else
+        RiffClampVoicePitch = value
     End If
 End Function
 
@@ -1265,6 +1405,14 @@ Public Function RiffOpen() As Boolean
     rCtx.MasterPeakR = 0!
     rCtx.RenderPeriodMs = RIFF_RENDER_PERIOD_MS
     rCtx.MaxWriteFrames = 0
+    rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_MIN_MS
+    rCtx.AdaptiveStableTicks = 0
+    rCtx.AdaptiveLastUnderruns = 0
+    rCtx.UnderrunCount = 0
+    rCtx.RenderTickCount = 0
+    rCtx.LastPaddingFrames = 0
+    rCtx.LastFramesAvailable = 0
+    rCtx.LastFramesWritten = 0
 
     Dim i As Long
     For i = 0 To RIFF_MAX_BUS_INDEX
@@ -1448,7 +1596,7 @@ Public Property Get RiffBusVolume(ByVal busID As RiffBusId) As Single
     End If
 
     busID = RiffClampBusId(busID)
-    RiffBusVolume = rCtx.Buses(busID).Volume
+    RiffBusVolume = rCtx.Buses(busID).volume
 End Property
 
 '/**
@@ -1465,7 +1613,7 @@ Public Property Let RiffBusVolume(ByVal busID As RiffBusId, ByVal value As Singl
     busID = RiffClampBusId(busID)
     value = RiffClampBusVolume(value)
     
-    rCtx.Buses(busID).Volume = value
+    rCtx.Buses(busID).volume = value
     rCtx.Buses(busID).targetVolume = value
     rCtx.Buses(busID).FadeStartVolume = value
     rCtx.Buses(busID).FadeFramesCurrent = 0
@@ -1547,7 +1695,7 @@ Public Sub RiffBusFadeTo(ByVal busID As RiffBusId, ByVal targetVolume As Single,
     targetVolume = RiffClampBusVolume(targetVolume)
 
     If durationMs <= 0 Or rCtx.sampleRate <= 0 Then
-        rCtx.Buses(busID).Volume = targetVolume
+        rCtx.Buses(busID).volume = targetVolume
         rCtx.Buses(busID).targetVolume = targetVolume
         rCtx.Buses(busID).FadeStartVolume = targetVolume
         rCtx.Buses(busID).FadeFramesCurrent = 0
@@ -1555,7 +1703,7 @@ Public Sub RiffBusFadeTo(ByVal busID As RiffBusId, ByVal targetVolume As Single,
         Exit Sub
     End If
 
-    rCtx.Buses(busID).FadeStartVolume = rCtx.Buses(busID).Volume
+    rCtx.Buses(busID).FadeStartVolume = rCtx.Buses(busID).volume
     rCtx.Buses(busID).targetVolume = targetVolume
     rCtx.Buses(busID).FadeFramesCurrent = 0
     rCtx.Buses(busID).FadeFramesTotal = CLng((CDbl(durationMs) * CDbl(rCtx.sampleRate)) / CDbl(RIFF_MS_PER_SEC))
@@ -2146,6 +2294,17 @@ Public Function RiffRenderOscillatorWav(ByVal waveType As RiffWaveType, ByVal fr
     Dim dt As Double
     Dim sample As Single
     Dim pcm As Integer
+    Dim noiseSeed As Long
+    Dim pink0 As Single
+    Dim pink1 As Single
+    Dim pink2 As Single
+    Dim pink3 As Single
+    Dim pink4 As Single
+    Dim pink5 As Single
+    Dim pink6 As Single
+    Dim brown As Single
+
+    noiseSeed = RiffMakeNoiseSeed(0)
 
     frames = CLng(durationSec * rCtx.sampleRate)
     If frames <= 0 Then
@@ -2157,7 +2316,12 @@ Public Function RiffRenderOscillatorWav(ByVal waveType As RiffWaveType, ByVal fr
     dt = CDbl(frequencyHz) / CDbl(rCtx.sampleRate)
 
     For frame = 0 To frames - 1
-        sample = RiffOscillatorSampleAtPhase(waveType, phase, dt)
+        If waveType >= RiffWaveNoise Then
+            sample = RiffNextNoiseSample(waveType, noiseSeed, pink0, pink1, pink2, pink3, pink4, pink5, pink6, brown)
+        Else
+            sample = RiffOscillatorSampleAtPhase(waveType, phase, dt)
+        End If
+
         pcm = RiffFloatToPcm16(sample * RIFF_OSCILLATOR_EXPORT_GAIN)
         outIndex = frame * RIFF_WAV_EXPORT_FRAME_BYTES
         RtlMoveMemory VarPtr(outBytes(outIndex)), VarPtr(pcm), LenB(pcm)
@@ -2318,7 +2482,7 @@ Private Function RiffOscillatorSampleAtPhase(ByVal waveType As RiffWaveType, ByV
             sample = (RIFF_BIPOLAR_DOUBLE_SCALE * phase) - RIFF_PHASE_FULL
             sample = sample - RiffPolyBLEP(phase, dt)
         Case Else
-            sample = (Rnd() * RIFF_BIPOLAR_SINGLE_SCALE) - RIFF_UNITY_GAIN
+            sample = 0!
     End Select
 
     RiffOscillatorSampleAtPhase = CSng(sample)
@@ -2327,23 +2491,61 @@ End Function
 
 '/**
 ' * @function RiffPlay
-' * @brief Plays a pre-loaded static audio buffer on an available polyphonic voice channel.
+' * @brief Plays a pre-loaded static audio buffer using the unified playback API.
 ' * @param bufferHandle The target buffer.
+' * @param busID Optional mixer bus that receives the voice.
+' * @param looped Optional loop flag applied before activation.
+' * @param volume Optional voice volume multiplier.
+' * @param pan Optional stereo pan from -1 left to 1 right.
 ' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
 ' */
-Public Function RiffPlay(ByVal bufferHandle As Long) As Long
-    RiffPlay = RiffPlayBus(bufferHandle, RiffBusMain)
+Public Function RiffPlay(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    RiffPlay = InternalPlayBuffer(bufferHandle, busID, looped, volume, pan)
 End Function
 
 '/**
 ' * @function RiffPlayBus
-' * @brief Plays a pre-loaded static audio buffer on an available voice and routes it to a bus before activation.
+' * @brief Compatibility wrapper that plays a static buffer directly on a bus.
 ' * @param bufferHandle The target buffer.
-' * @param busID Mixer bus that will receive the voice.
+' * @param busID Mixer bus that receives the voice.
+' * @param volume Optional voice volume multiplier.
+' * @param pan Optional stereo pan from -1 left to 1 right.
 ' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
 ' */
-Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId) As Long
-    RiffPlayBus = -1
+Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    RiffPlayBus = InternalPlayBuffer(bufferHandle, busID, False, volume, pan)
+End Function
+
+'/**
+' * @function RiffPlayOnce
+' * @brief Plays a static buffer only if the same buffer is not already active on the selected bus.
+' * @param bufferHandle The target buffer.
+' * @param busID Optional bus filter and target route.
+' * @param looped Optional loop flag for a newly-created voice.
+' * @param volume Optional voice volume multiplier for a newly-created voice.
+' * @param pan Optional stereo pan for a newly-created voice.
+' * @return {Long} Existing or newly-created voice handle, or -1 on failure.
+' */
+Public Function RiffPlayOnce(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    Dim existingVoice As Long
+
+    busID = RiffClampBusId(busID)
+    existingVoice = RiffFindPlayingVoice(bufferHandle, CLng(busID))
+
+    If existingVoice <> -1 Then
+        RiffPlayOnce = existingVoice
+        Exit Function
+    End If
+
+    RiffPlayOnce = InternalPlayBuffer(bufferHandle, busID, looped, volume, pan)
+End Function
+
+'/**
+' * @function InternalPlayBuffer
+' * @brief Shared implementation for all static buffer playback entry points.
+' */
+Private Function InternalPlayBuffer(ByVal bufferHandle As Long, ByVal busID As RiffBusId, ByVal looped As Boolean, ByVal volume As Single, ByVal pan As Single) As Long
+    InternalPlayBuffer = -1
     RiffSetLastError RiffErrorNone
 
     If Not RiffRequireBufferHandle(bufferHandle) Then
@@ -2353,100 +2555,111 @@ Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId
         RiffSetLastError RiffErrorInvalidBuffer
         Exit Function
     End If
-    
+
     busID = RiffClampBusId(busID)
-    
+    volume = RiffClampVoiceVolume(volume)
+    pan = RiffClampVoicePan(pan)
+
     Dim voiceSlot As Long
     voiceSlot = InternalGetFreeVoice()
-    
+
     If voiceSlot = -1 Then
         RiffSetLastError RiffErrorNoFreeVoice
         Exit Function
     End If
-    
+
     InternalResetVoiceDSP voiceSlot
-    
+
     rVoices(voiceSlot).IsOscillator = False
     rVoices(voiceSlot).BufferIndex = bufferHandle
     rVoices(voiceSlot).Position = 0#
+    rVoices(voiceSlot).loopStart = 0#
     rVoices(voiceSlot).loopEnd = CDbl(rCtx.Buffers(bufferHandle).BufferLen)
+    rVoices(voiceSlot).Looping = looped
     rVoices(voiceSlot).busID = busID
+    rVoices(voiceSlot).volume = volume
+    rVoices(voiceSlot).pan = pan
 
     If Not RiffEnsureRenderTimer() Then
         rVoices(voiceSlot).Playing = False
         rVoices(voiceSlot).Active = False
-        RiffPlayBus = -1
+        InternalPlayBuffer = -1
         Exit Function
     End If
 
     rVoices(voiceSlot).Playing = True
     rVoices(voiceSlot).Active = True
     rCtx.IdleTimerTicks = 0
-    
-    RiffPlayBus = voiceSlot
+
+    InternalPlayBuffer = voiceSlot
 End Function
 
 '/**
 ' * @function RiffPlayOscillator
-' * @brief Generates and plays a synthesized waveform instantly via math.
+' * @brief Generates and plays a synthesized waveform using the unified playback API.
 ' * @param waveType Oscillator waveform enum.
 ' * @param frequencyHz Pitch frequency in Hz.
+' * @param busID Optional mixer bus that receives the voice.
+' * @param volume Optional voice volume multiplier.
+' * @param pan Optional stereo pan from -1 left to 1 right.
 ' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
 ' */
-Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single) As Long
-    RiffPlayOscillator = -1
-    RiffSetLastError RiffErrorNone
-
-    If Not RiffRequireInitialized() Then
-        Exit Function
-    End If
-    
-    Dim voiceSlot As Long
-    voiceSlot = InternalGetFreeVoice()
-    
-    If voiceSlot = -1 Then
-        RiffSetLastError RiffErrorNoFreeVoice
-        Exit Function
-    End If
-    
-    InternalResetVoiceDSP voiceSlot
-    
-    waveType = RiffClampWaveType(waveType)
-    
-    If frequencyHz < 1! Then
-        frequencyHz = RIFF_DEFAULT_OSCILLATOR_HZ
-    End If
-    
-    rVoices(voiceSlot).IsOscillator = True
-    rVoices(voiceSlot).OscType = waveType
-    rVoices(voiceSlot).OscFreq = frequencyHz
-    rVoices(voiceSlot).OscPhase = 0#
-    rVoices(voiceSlot).BufferIndex = -1
-
-    If Not RiffEnsureRenderTimer() Then
-        rVoices(voiceSlot).Playing = False
-        rVoices(voiceSlot).Active = False
-        RiffPlayOscillator = -1
-        Exit Function
-    End If
-    
-    rVoices(voiceSlot).Playing = True
-    rVoices(voiceSlot).Active = True
-    rCtx.IdleTimerTicks = 0
-    
-    RiffPlayOscillator = voiceSlot
+Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    RiffPlayOscillator = InternalPlayOscillator(waveType, frequencyHz, busID, volume, pan)
 End Function
 
 '/**
 ' * @function RiffPlayOscillatorBus
-' * @brief Generates and plays a synthesized waveform routed to a bus before activation.
+' * @brief Compatibility wrapper that generates and plays a synthesized waveform routed to a bus.
 ' * @param waveType Oscillator waveform enum.
 ' * @param frequencyHz Pitch frequency in Hz.
-' * @param busID Mixer bus that will receive the voice.
+' * @param busID Mixer bus that receives the voice.
+' * @param volume Optional voice volume multiplier.
+' * @param pan Optional stereo pan from -1 left to 1 right.
 ' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
 ' */
-Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId) As Long
-    RiffPlayOscillatorBus = -1
+Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    RiffPlayOscillatorBus = InternalPlayOscillator(waveType, frequencyHz, busID, volume, pan)
+End Function
+
+'/**
+' * @function RiffPlayNoise
+' * @brief Plays a continuous noise oscillator using the unified playback API.
+' * @param noiseType Noise waveform type: RiffWaveWhiteNoise, RiffWavePinkNoise, or RiffWaveBrownNoise.
+' * @param busID Optional mixer bus that receives the voice.
+' * @param volume Optional voice volume multiplier.
+' * @param pan Optional stereo pan from -1 left to 1 right.
+' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
+' */
+Public Function RiffPlayNoise(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    Select Case noiseType
+        Case RiffWavePinkNoise, RiffWaveBrownNoise
+        Case Else
+            noiseType = RiffWaveWhiteNoise
+    End Select
+
+    RiffPlayNoise = InternalPlayOscillator(noiseType, RIFF_DEFAULT_OSCILLATOR_HZ, busID, volume, pan)
+End Function
+
+'/**
+' * @function RiffPlayNoiseBus
+' * @brief Compatibility wrapper that plays a continuous noise oscillator routed to a specific bus.
+' * @param noiseType Noise waveform type: RiffWaveWhiteNoise, RiffWavePinkNoise, or RiffWaveBrownNoise.
+' * @param busID Mixer bus that receives the voice.
+' * @param volume Optional voice volume multiplier.
+' * @param pan Optional stereo pan from -1 left to 1 right.
+' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
+' */
+Public Function RiffPlayNoiseBus(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    RiffPlayNoiseBus = RiffPlayNoise(noiseType, busID, volume, pan)
+End Function
+
+'/**
+' * @function InternalPlayOscillator
+' * @brief Shared implementation for oscillator and noise playback entry points.
+' */
+Private Function InternalPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, ByVal volume As Single, ByVal pan As Single) As Long
+    InternalPlayOscillator = -1
     RiffSetLastError RiffErrorNone
 
     If Not RiffRequireInitialized() Then
@@ -2455,40 +2668,45 @@ Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal freq
 
     busID = RiffClampBusId(busID)
     waveType = RiffClampWaveType(waveType)
+    volume = RiffClampVoiceVolume(volume)
+    pan = RiffClampVoicePan(pan)
 
     If frequencyHz < 1! Then
         frequencyHz = RIFF_DEFAULT_OSCILLATOR_HZ
     End If
-    
+
     Dim voiceSlot As Long
     voiceSlot = InternalGetFreeVoice()
-    
+
     If voiceSlot = -1 Then
         RiffSetLastError RiffErrorNoFreeVoice
         Exit Function
     End If
-    
+
     InternalResetVoiceDSP voiceSlot
-    
+
     rVoices(voiceSlot).IsOscillator = True
     rVoices(voiceSlot).OscType = waveType
     rVoices(voiceSlot).OscFreq = frequencyHz
     rVoices(voiceSlot).OscPhase = 0#
+    rVoices(voiceSlot).noiseSeed = RiffMakeNoiseSeed(voiceSlot)
     rVoices(voiceSlot).BufferIndex = -1
     rVoices(voiceSlot).busID = busID
+    rVoices(voiceSlot).volume = volume
+    rVoices(voiceSlot).pan = pan
 
     If Not RiffEnsureRenderTimer() Then
         rVoices(voiceSlot).Playing = False
         rVoices(voiceSlot).Active = False
-        RiffPlayOscillatorBus = -1
+        InternalPlayOscillator = -1
         Exit Function
     End If
 
     rVoices(voiceSlot).Playing = True
     rVoices(voiceSlot).Active = True
     rCtx.IdleTimerTicks = 0
-    
-    RiffPlayOscillatorBus = voiceSlot
+
+    InternalPlayOscillator = voiceSlot
 End Function
 
 '/**
@@ -2514,11 +2732,20 @@ End Function
 ' * @param slot The target voice index.
 ' */
 Private Sub InternalResetVoiceDSP(ByVal slot As Long)
-    rVoices(slot).Volume = RIFF_DEFAULT_VOICE_VOLUME
+    rVoices(slot).volume = RIFF_DEFAULT_VOICE_VOLUME
     rVoices(slot).Pitch = RIFF_DEFAULT_VOICE_PITCH
-    rVoices(slot).Pan = 0!
+    rVoices(slot).pan = 0!
     rVoices(slot).Paused = False
     rVoices(slot).busID = RiffBusMain
+    rVoices(slot).noiseSeed = RiffMakeNoiseSeed(slot)
+    rVoices(slot).NoisePinkB0 = 0!
+    rVoices(slot).NoisePinkB1 = 0!
+    rVoices(slot).NoisePinkB2 = 0!
+    rVoices(slot).NoisePinkB3 = 0!
+    rVoices(slot).NoisePinkB4 = 0!
+    rVoices(slot).NoisePinkB5 = 0!
+    rVoices(slot).NoisePinkB6 = 0!
+    rVoices(slot).NoiseBrown = 0!
     rVoices(slot).PeakL = 0!
     rVoices(slot).PeakR = 0!
 
@@ -2606,7 +2833,7 @@ Private Sub InternalResetVoiceDSP(ByVal slot As Long)
     rVoices(slot).EqTrebleZ1R = 0!
     rVoices(slot).EqTrebleZ2R = 0!
 
-    rVoices(slot).DelayTime = 0!
+    rVoices(slot).delayTime = 0!
     rVoices(slot).DelayFeedback = 0!
     rVoices(slot).DelayMix = 0!
     rVoices(slot).RingWritePos = 0
@@ -2660,9 +2887,22 @@ Public Sub RiffStop(ByVal voiceHandle As Long)
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Sub
     End If
-    
+
     rVoices(voiceHandle).Playing = False
     rVoices(voiceHandle).Active = False
+
+    If Not RiffHasActiveVoices() Then
+        RiffStopRenderTimer
+    End If
+End Sub
+
+'/**
+' * @function RiffVoiceStop
+' * @brief Voice-oriented alias for RiffStop that fits the grouped voice API.
+' * @param voiceHandle The active voice.
+' */
+Public Sub RiffVoiceStop(ByVal voiceHandle As Long)
+    RiffStop voiceHandle
 End Sub
 
 '/**
@@ -2833,7 +3073,10 @@ Public Function RiffFindPlayingVoice(ByVal bufferHandle As Long, Optional ByVal 
         Exit Function
     End If
 
-    If busID > RIFF_MAX_BUS_INDEX Then
+    If busID < -1 Then
+        RiffSetLastError RiffErrorInvalidBus
+        Exit Function
+    ElseIf busID > RIFF_MAX_BUS_INDEX Then
         busID = CLng(RiffClampBusId(busID))
     End If
 
@@ -2870,24 +3113,12 @@ End Function
 ' * @param bufferHandle The target buffer.
 ' * @param busID Mixer bus that will receive the voice.
 ' * @param looped Whether the voice should loop after creation.
+' * @param volume Optional voice volume multiplier for a newly-created voice.
+' * @param pan Optional stereo pan for a newly-created voice.
 ' * @return {Long} Existing or newly-created voice handle, or -1 on failure.
 ' */
-Public Function RiffPlayBusOnce(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal looped As Boolean = False) As Long
-    Dim existingVoice As Long
-
-    busID = RiffClampBusId(busID)
-    existingVoice = RiffFindPlayingVoice(bufferHandle, CLng(busID))
-
-    If existingVoice <> -1 Then
-        RiffPlayBusOnce = existingVoice
-        Exit Function
-    End If
-
-    RiffPlayBusOnce = RiffPlayBus(bufferHandle, busID)
-
-    If RiffPlayBusOnce <> -1 Then
-        rVoices(RiffPlayBusOnce).Looping = looped
-    End If
+Public Function RiffPlayBusOnce(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    RiffPlayBusOnce = RiffPlayOnce(bufferHandle, busID, looped, volume, pan)
 End Function
 
 '/**
@@ -2936,6 +3167,294 @@ Public Sub RiffVoiceGetPeak(ByVal voiceHandle As Long, ByRef peakLeft As Single,
     
     peakLeft = rVoices(voiceHandle).PeakL
     peakRight = rVoices(voiceHandle).PeakR
+End Sub
+
+
+'/**
+' * @function RiffVoiceClearEffects
+' * @brief Clears all non-essential voice DSP effects while preserving source, route, position, volume, pan, pitch, and loop state.
+' * @param voiceHandle The active voice.
+' */
+Public Sub RiffVoiceClearEffects(ByVal voiceHandle As Long)
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        Exit Sub
+    End If
+
+    InternalClearVoiceEffects voiceHandle
+End Sub
+
+'/**
+' * @function RiffVoiceSetReverb
+' * @brief Configures the voice reverb block with one call.
+' * @param voiceHandle The active voice.
+' * @param mix Wet/dry mix from 0 to 1.
+' * @param roomTime Decay/room amount from 0 to 1.
+' */
+Public Sub RiffVoiceSetReverb(ByVal voiceHandle As Long, ByVal mix As Single, ByVal roomTime As Single)
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        Exit Sub
+    End If
+
+    rVoices(voiceHandle).ReverbMix = RiffClampUnit(mix)
+    rVoices(voiceHandle).ReverbTime = RiffClampUnit(roomTime)
+End Sub
+
+'/**
+' * @function RiffVoiceSetDelay
+' * @brief Configures the voice delay block with one call.
+' * @param voiceHandle The active voice.
+' * @param delayTime Delay time in seconds.
+' * @param feedback Feedback amount from 0 to 0.95.
+' * @param mix Wet/dry mix from 0 to 1.
+' */
+Public Sub RiffVoiceSetDelay(ByVal voiceHandle As Long, ByVal delayTime As Single, ByVal feedback As Single, ByVal mix As Single)
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        Exit Sub
+    End If
+
+    If delayTime < 0! Then delayTime = 0!
+    If delayTime > RIFF_MAX_DELAY_SEC Then delayTime = RIFF_MAX_DELAY_SEC
+    If feedback < 0! Then feedback = 0!
+    If feedback > 0.95! Then feedback = 0.95!
+
+    rVoices(voiceHandle).delayTime = delayTime
+    rVoices(voiceHandle).DelayFeedback = feedback
+    rVoices(voiceHandle).DelayMix = RiffClampUnit(mix)
+End Sub
+
+'/**
+' * @function RiffVoiceSetChorus
+' * @brief Configures the voice chorus block with one call.
+' * @param voiceHandle The active voice.
+' * @param depth Chorus amount from 0 to 1.
+' * @param rate Modulation rate in Hz.
+' */
+Public Sub RiffVoiceSetChorus(ByVal voiceHandle As Long, ByVal depth As Single, ByVal rate As Single)
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        Exit Sub
+    End If
+
+    If rate < RIFF_MIN_MOD_RATE_HZ Then rate = RIFF_MIN_MOD_RATE_HZ
+    If rate > RIFF_MAX_LFO_RATE_HZ Then rate = RIFF_MAX_LFO_RATE_HZ
+
+    rVoices(voiceHandle).ChorusDepth = RiffClampUnit(depth)
+    rVoices(voiceHandle).ChorusRate = rate
+End Sub
+
+'/**
+' * @function RiffVoiceSetFlanger
+' * @brief Configures the voice flanger block with one call.
+' * @param voiceHandle The active voice.
+' * @param depth Flanger amount from 0 to 1.
+' * @param rate Modulation rate in Hz.
+' * @param feedback Feedback amount from 0 to 0.95.
+' */
+Public Sub RiffVoiceSetFlanger(ByVal voiceHandle As Long, ByVal depth As Single, ByVal rate As Single, ByVal feedback As Single)
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        Exit Sub
+    End If
+
+    If rate < RIFF_MIN_MOD_RATE_HZ Then rate = RIFF_MIN_MOD_RATE_HZ
+    If rate > RIFF_MAX_LFO_RATE_HZ Then rate = RIFF_MAX_LFO_RATE_HZ
+    If feedback < 0! Then feedback = 0!
+    If feedback > 0.95! Then feedback = 0.95!
+
+    rVoices(voiceHandle).FlangerDepth = RiffClampUnit(depth)
+    rVoices(voiceHandle).FlangerRate = rate
+    rVoices(voiceHandle).FlangerFeedback = feedback
+End Sub
+
+'/**
+' * @function RiffVoiceSetFilter
+' * @brief Configures simple low-pass and high-pass controls with one call.
+' * @param voiceHandle The active voice.
+' * @param lowPass Low-pass openness from 0.01 to 1.
+' * @param highPass High-pass amount from 0 to 1.
+' */
+Public Sub RiffVoiceSetFilter(ByVal voiceHandle As Long, ByVal lowPass As Single, ByVal highPass As Single)
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        Exit Sub
+    End If
+
+    If lowPass < RIFF_MIN_LOWPASS_CONTROL Then lowPass = RIFF_MIN_LOWPASS_CONTROL
+    If lowPass > 1! Then lowPass = 1!
+
+    rVoices(voiceHandle).lowPass = lowPass
+    rVoices(voiceHandle).highPass = RiffClampUnit(highPass)
+End Sub
+
+'/**
+' * @function RiffVoiceApplyPreset
+' * @brief Applies a named high-level DSP preset to a voice while preserving playback state.
+' * @param voiceHandle The active voice.
+' * @param preset Built-in RiffEffectPreset value.
+' * @param amount Preset strength from 0 to 1.
+' */
+Public Sub RiffVoiceApplyPreset(ByVal voiceHandle As Long, ByVal preset As RiffEffectPreset, Optional ByVal amount As Single = 1!)
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        Exit Sub
+    End If
+
+    amount = RiffClampUnit(amount)
+    InternalClearVoiceEffects voiceHandle
+
+    If amount <= 0! Or preset = RiffFxDry Then
+        Exit Sub
+    End If
+
+    Select Case preset
+        Case RiffFxSmallRoom
+            RiffVoiceSetReverb voiceHandle, 0.18! * amount, 0.25! + (0.15! * amount)
+        Case RiffFxHall
+            RiffVoiceSetReverb voiceHandle, 0.38! * amount, 0.55! + (0.25! * amount)
+        Case RiffFxCathedral
+            RiffVoiceSetReverb voiceHandle, 0.7! * amount, 0.85! + (0.15! * amount)
+        Case RiffFxSlapback
+            RiffVoiceSetDelay voiceHandle, 0.09!, 0.22! * amount, 0.38! * amount
+        Case RiffFxEcho
+            RiffVoiceSetDelay voiceHandle, 0.32!, 0.55! * amount, 0.5! * amount
+        Case RiffFxChorus
+            RiffVoiceSetChorus voiceHandle, 0.55! * amount, 0.9! + (0.35! * amount)
+            rVoices(voiceHandle).StereoWidth = 1! + (0.9! * amount)
+        Case RiffFxFlanger
+            RiffVoiceSetFlanger voiceHandle, 0.65! * amount, 0.25! + (0.15! * amount), 0.38! * amount
+        Case RiffFxLoFi
+            rVoices(voiceHandle).BitcrushSteps = 2 ^ (15! - (5.5! * amount))
+            rVoices(voiceHandle).BitcrushDownsample = 1 + CLng(2.5! * amount)
+            If rVoices(voiceHandle).BitcrushDownsample < 1 Then rVoices(voiceHandle).BitcrushDownsample = 1
+            If rVoices(voiceHandle).BitcrushDownsample > 4 Then rVoices(voiceHandle).BitcrushDownsample = 4
+            rVoices(voiceHandle).lowPass = 1! - (0.32! * amount)
+            If rVoices(voiceHandle).lowPass < 0.68! Then rVoices(voiceHandle).lowPass = 0.68!
+            rVoices(voiceHandle).highPass = 0.04! * amount
+            rVoices(voiceHandle).EqBass = 1! - (0.06! * amount)
+            rVoices(voiceHandle).EqMid = 1! + (0.08! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.16! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.82! - (0.22! * amount)
+            rVoices(voiceHandle).CompRatio = 1.15! + (0.95! * amount)
+            RiffVoiceSetChorus voiceHandle, 0.035! * amount, 0.3! + (0.15! * amount)
+        Case RiffFxRadio
+            rVoices(voiceHandle).lowPass = 1! - (0.55! * amount)
+            If rVoices(voiceHandle).lowPass < 0.45! Then rVoices(voiceHandle).lowPass = 0.45!
+            rVoices(voiceHandle).highPass = 0.18! * amount
+            rVoices(voiceHandle).EqBass = 1! - (0.5! * amount)
+            rVoices(voiceHandle).EqMid = 1! + (0.45! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.25! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.65! - (0.25! * amount)
+            rVoices(voiceHandle).CompRatio = 1.5! + (3.5! * amount)
+        Case RiffFxUnderwater
+            rVoices(voiceHandle).lowPass = 1! - (0.78! * amount)
+            If rVoices(voiceHandle).lowPass < 0.22! Then rVoices(voiceHandle).lowPass = 0.22!
+            rVoices(voiceHandle).highPass = 0.025! * amount
+            rVoices(voiceHandle).EqTreble = 1! - (0.5! * amount)
+            RiffVoiceSetChorus voiceHandle, 0.2! * amount, 0.35! + (0.15! * amount)
+            RiffVoiceSetReverb voiceHandle, 0.2! * amount, 0.45! + (0.25! * amount)
+        Case RiffFxWide
+            rVoices(voiceHandle).StereoWidth = 1! + (2! * amount)
+            RiffVoiceSetChorus voiceHandle, 0.2! * amount, 0.75! + (0.25! * amount)
+        Case RiffFxRobot
+            rVoices(voiceHandle).RingModFreq = 55! + (170! * amount)
+            rVoices(voiceHandle).RingModMix = 0.18! + (0.55! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.55! - (0.12! * amount)
+            rVoices(voiceHandle).CompRatio = 2.5! + (2! * amount)
+        Case RiffFxAmbient
+            RiffVoiceSetReverb voiceHandle, 0.4! * amount, 0.65! + (0.2! * amount)
+            RiffVoiceSetDelay voiceHandle, 0.42!, 0.28! * amount, 0.22! * amount
+            rVoices(voiceHandle).StereoWidth = 1! + (0.8! * amount)
+        Case Else
+            RiffSetLastError RiffErrorInvalidArgument
+    End Select
+End Sub
+
+'/**
+' * @function InternalClearVoiceEffects
+' * @brief Resets only effect parameters and DSP history for a voice.
+' */
+Private Sub InternalClearVoiceEffects(ByVal voiceHandle As Long)
+    rVoices(voiceHandle).Distortion = RIFF_DEFAULT_DISTORTION
+    rVoices(voiceHandle).lowPass = RIFF_DEFAULT_FILTER_CONTROL
+    rVoices(voiceHandle).highPass = 0!
+    rVoices(voiceHandle).FilterStateL = 0!
+    rVoices(voiceHandle).FilterStateR = 0!
+    rVoices(voiceHandle).FilterStateHP_L = 0!
+    rVoices(voiceHandle).FilterStateHP_R = 0!
+    rVoices(voiceHandle).StereoWidth = RIFF_DEFAULT_FILTER_CONTROL
+
+    rVoices(voiceHandle).EqBass = RIFF_UNITY_GAIN
+    rVoices(voiceHandle).EqMid = RIFF_UNITY_GAIN
+    rVoices(voiceHandle).EqTreble = RIFF_UNITY_GAIN
+    rVoices(voiceHandle).EqStateLowL = 0!
+    rVoices(voiceHandle).EqStateLowR = 0!
+    rVoices(voiceHandle).EqStateHighL = 0!
+    rVoices(voiceHandle).EqStateHighR = 0!
+
+    rVoices(voiceHandle).CompThreshold = RIFF_UNITY_GAIN
+    rVoices(voiceHandle).CompRatio = RIFF_MIN_COMPRESSOR_RATIO
+    rVoices(voiceHandle).CompEnv = RIFF_COMP_ENV_FLOOR
+
+    rVoices(voiceHandle).BitcrushSteps = 0!
+    rVoices(voiceHandle).BitcrushDownsample = RIFF_DEFAULT_BITCRUSH_DOWNSAMPLE
+    rVoices(voiceHandle).BitcrushDsCount = 0
+    rVoices(voiceHandle).BitcrushLastL = 0!
+    rVoices(voiceHandle).BitcrushLastR = 0!
+
+    rVoices(voiceHandle).RingModFreq = 0!
+    rVoices(voiceHandle).RingModMix = 0!
+    rVoices(voiceHandle).RingModPhase = 0#
+
+    rVoices(voiceHandle).TremoloRate = 0!
+    rVoices(voiceHandle).TremoloDepth = 0!
+    rVoices(voiceHandle).TremoloPhase = 0#
+
+    rVoices(voiceHandle).AutoPanRate = 0!
+    rVoices(voiceHandle).AutoPanDepth = 0!
+    rVoices(voiceHandle).AutoPanPhase = 0#
+
+    rVoices(voiceHandle).ChorusDepth = 0!
+    rVoices(voiceHandle).ChorusRate = RIFF_DEFAULT_CHORUS_RATE
+    rVoices(voiceHandle).ChorusPhase = 0#
+
+    rVoices(voiceHandle).FlangerRate = RIFF_DEFAULT_FLANGER_RATE
+    rVoices(voiceHandle).FlangerDepth = 0!
+    rVoices(voiceHandle).FlangerFeedback = 0!
+    rVoices(voiceHandle).FlangerPhase = 0#
+
+    rVoices(voiceHandle).ReverbMix = 0!
+    rVoices(voiceHandle).ReverbTime = RIFF_DEFAULT_REVERB_TIME
+    rVoices(voiceHandle).RevDamp1L = 0!
+    rVoices(voiceHandle).RevDamp1R = 0!
+    rVoices(voiceHandle).RevDamp2L = 0!
+    rVoices(voiceHandle).RevDamp2R = 0!
+    rVoices(voiceHandle).RevDamp3L = 0!
+    rVoices(voiceHandle).RevDamp3R = 0!
+    rVoices(voiceHandle).RevDamp4L = 0!
+    rVoices(voiceHandle).RevDamp4R = 0!
+
+    rVoices(voiceHandle).BqLowPassZ1L = 0!
+    rVoices(voiceHandle).BqLowPassZ2L = 0!
+    rVoices(voiceHandle).BqLowPassZ1R = 0!
+    rVoices(voiceHandle).BqLowPassZ2R = 0!
+    rVoices(voiceHandle).BqHighPassZ1L = 0!
+    rVoices(voiceHandle).BqHighPassZ2L = 0!
+    rVoices(voiceHandle).BqHighPassZ1R = 0!
+    rVoices(voiceHandle).BqHighPassZ2R = 0!
+    rVoices(voiceHandle).EqBassZ1L = 0!
+    rVoices(voiceHandle).EqBassZ2L = 0!
+    rVoices(voiceHandle).EqBassZ1R = 0!
+    rVoices(voiceHandle).EqBassZ2R = 0!
+    rVoices(voiceHandle).EqMidZ1L = 0!
+    rVoices(voiceHandle).EqMidZ2L = 0!
+    rVoices(voiceHandle).EqMidZ1R = 0!
+    rVoices(voiceHandle).EqMidZ2R = 0!
+    rVoices(voiceHandle).EqTrebleZ1L = 0!
+    rVoices(voiceHandle).EqTrebleZ2L = 0!
+    rVoices(voiceHandle).EqTrebleZ1R = 0!
+    rVoices(voiceHandle).EqTrebleZ2R = 0!
+
+    rVoices(voiceHandle).delayTime = 0!
+    rVoices(voiceHandle).DelayFeedback = 0!
+    rVoices(voiceHandle).DelayMix = 0!
+
+    RtlZeroMemory VarPtr(rRingBuf(voiceHandle * RIFF_RING_SAMPLES_PER_VOICE)), RIFF_RING_SAMPLES_PER_VOICE * RIFF_SINGLE_BYTES
 End Sub
 
 '/**
@@ -3008,21 +3527,14 @@ Public Property Get RiffVoiceVolume(ByVal voiceHandle As Long) As Single
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    RiffVoiceVolume = rVoices(voiceHandle).Volume
+    RiffVoiceVolume = rVoices(voiceHandle).volume
 End Property
 Public Property Let RiffVoiceVolume(ByVal voiceHandle As Long, ByVal value As Single)
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    
-    If value < 0! Then
-        value = 0!
-    End If
-    If value > RIFF_UNITY_GAIN Then
-        value = RIFF_UNITY_GAIN
-    End If
-    
-    rVoices(voiceHandle).Volume = value
+
+    rVoices(voiceHandle).volume = RiffClampVoiceVolume(value)
 End Property
 
 '/**
@@ -3039,12 +3551,8 @@ Public Property Let RiffVoicePitch(ByVal voiceHandle As Long, ByVal value As Sin
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    
-    If value <= RIFF_MIN_VOICE_PITCH Then
-        value = RIFF_MIN_VOICE_PITCH
-    End If
-    
-    rVoices(voiceHandle).Pitch = CDbl(value)
+
+    rVoices(voiceHandle).Pitch = RiffClampVoicePitch(CDbl(value))
 End Property
 
 '/**
@@ -3055,21 +3563,14 @@ Public Property Get RiffVoicePan(ByVal voiceHandle As Long) As Single
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    RiffVoicePan = rVoices(voiceHandle).Pan
+    RiffVoicePan = rVoices(voiceHandle).pan
 End Property
 Public Property Let RiffVoicePan(ByVal voiceHandle As Long, ByVal value As Single)
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    
-    If value < RIFF_NEGATIVE_UNITY_GAIN Then
-        value = RIFF_NEGATIVE_UNITY_GAIN
-    End If
-    If value > RIFF_UNITY_GAIN Then
-        value = RIFF_UNITY_GAIN
-    End If
-    
-    rVoices(voiceHandle).Pan = value
+
+    rVoices(voiceHandle).pan = RiffClampVoicePan(value)
 End Property
 
 
@@ -3632,7 +4133,7 @@ Public Property Get RiffVoiceDelayTime(ByVal voiceHandle As Long) As Single
     If Not RiffRequireVoiceHandle(voiceHandle) Then
         Exit Property
     End If
-    RiffVoiceDelayTime = rVoices(voiceHandle).DelayTime
+    RiffVoiceDelayTime = rVoices(voiceHandle).delayTime
 End Property
 Public Property Let RiffVoiceDelayTime(ByVal voiceHandle As Long, ByVal value As Single)
     If Not RiffRequireVoiceHandle(voiceHandle) Then
@@ -3644,7 +4145,7 @@ Public Property Let RiffVoiceDelayTime(ByVal voiceHandle As Long, ByVal value As
     If value > RIFF_UNITY_GAIN Then
         value = RIFF_UNITY_GAIN
     End If
-    rVoices(voiceHandle).DelayTime = value
+    rVoices(voiceHandle).delayTime = value
 End Property
 
 '/**
@@ -3715,6 +4216,106 @@ Private Function RiffClamp(ByVal value As Single, ByVal minValue As Single, ByVa
     Else
         RiffClamp = value
     End If
+End Function
+
+'/**
+' * @function RiffSanitizeSample
+' * @brief Forces invalid or runaway DSP samples back into a bounded safe range.
+' */
+Private Function RiffSanitizeSample(ByVal value As Single) As Single
+    If value <> value Then
+        RiffSanitizeSample = 0!
+    ElseIf value > RIFF_DSP_SAMPLE_LIMIT Then
+        RiffSanitizeSample = RIFF_DSP_SAMPLE_LIMIT
+    ElseIf value < -RIFF_DSP_SAMPLE_LIMIT Then
+        RiffSanitizeSample = -RIFF_DSP_SAMPLE_LIMIT
+    Else
+        RiffSanitizeSample = value
+    End If
+End Function
+
+'/**
+' * @function RiffMakeNoiseSeed
+' * @brief Builds a non-zero deterministic seed for a noise voice.
+' */
+Private Function RiffMakeNoiseSeed(ByVal voiceIndex As Long) As Long
+    Dim seedValue As Double
+
+    seedValue = (CDbl(Timer) * 1000#) + CDbl((voiceIndex + 1) * 110351) + CDbl(rCtx.RenderPeriodMs * 97)
+    seedValue = seedValue - (Int(seedValue / (RIFF_NOISE_SEED_MOD - 1#)) * (RIFF_NOISE_SEED_MOD - 1#))
+    If seedValue < 1# Then
+        seedValue = CDbl(voiceIndex + 1)
+    End If
+
+    RiffMakeNoiseSeed = CLng(seedValue)
+End Function
+
+'/**
+' * @function RiffNextWhiteNoise
+' * @brief Generates one deterministic bipolar white-noise sample from a per-voice seed.
+' */
+Private Function RiffNextWhiteNoise(ByRef seed As Long) As Single
+    Dim nextValue As Double
+
+    If seed <= 0 Then
+        seed = 1
+    End If
+
+    nextValue = CDbl(seed) * RIFF_NOISE_SEED_MULT
+    nextValue = nextValue - (Int(nextValue / RIFF_NOISE_SEED_MOD) * RIFF_NOISE_SEED_MOD)
+
+    If nextValue < 1# Then
+        nextValue = 1#
+    End If
+
+    seed = CLng(nextValue)
+    RiffNextWhiteNoise = CSng((nextValue / RIFF_NOISE_SEED_SCALE) - RIFF_UNITY_GAIN)
+End Function
+
+'/**
+' * @function RiffNextPinkNoise
+' * @brief Generates one filtered pink-noise sample using Paul Kellet style one-pole sections.
+' */
+Private Function RiffNextPinkNoise(ByRef seed As Long, ByRef b0 As Single, ByRef b1 As Single, ByRef b2 As Single, ByRef b3 As Single, ByRef b4 As Single, ByRef b5 As Single, ByRef b6 As Single) As Single
+    Dim white As Single
+    Dim pink As Single
+
+    white = RiffNextWhiteNoise(seed)
+
+    b0 = 0.99886! * b0 + white * 0.0555179!
+    b1 = 0.99332! * b1 + white * 0.0750759!
+    b2 = 0.969! * b2 + white * 0.153852!
+    b3 = 0.8665! * b3 + white * 0.3104856!
+    b4 = 0.55! * b4 + white * 0.5329522!
+    b5 = -0.7616! * b5 - white * 0.016898!
+    pink = b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362!
+    b6 = white * 0.115926!
+
+    RiffNextPinkNoise = RiffSanitizeSample(pink * RIFF_PINK_GAIN)
+End Function
+
+'/**
+' * @function RiffNextBrownNoise
+' * @brief Generates one leaky-integrated brown-noise sample from white noise.
+' */
+Private Function RiffNextBrownNoise(ByRef seed As Long, ByRef brownState As Single) As Single
+    brownState = (brownState + (RiffNextWhiteNoise(seed) * RIFF_BROWN_INPUT_GAIN)) / RIFF_BROWN_LEAK
+    RiffNextBrownNoise = RiffSanitizeSample(brownState * RIFF_BROWN_OUTPUT_GAIN)
+End Function
+
+'/**
+' * @function RiffNextNoiseSample
+' * @brief Generates one noise sample for offline rendering with explicit local noise state.
+' */
+Private Function RiffNextNoiseSample(ByVal waveType As RiffWaveType, ByRef seed As Long, ByRef p0 As Single, ByRef p1 As Single, ByRef p2 As Single, ByRef p3 As Single, ByRef p4 As Single, ByRef p5 As Single, ByRef p6 As Single, ByRef brownState As Single) As Single
+    Select Case waveType
+        Case RiffWavePinkNoise
+            RiffNextNoiseSample = RiffNextPinkNoise(seed, p0, p1, p2, p3, p4, p5, p6)
+        Case RiffWaveBrownNoise
+            RiffNextNoiseSample = RiffNextBrownNoise(seed, brownState)
+        Case Else
+            RiffNextNoiseSample = RiffNextWhiteNoise(seed)
+    End Select
 End Function
 
 '/**
@@ -3856,8 +4457,12 @@ Private Function RiffNextOscillatorSample(ByVal voiceIndex As Long) As Single
             sample = CSng((RIFF_BIPOLAR_DOUBLE_SCALE * phase01) - RIFF_PHASE_FULL)
             sample = sample - RiffPolyBLEP(phase01, dt)
             sample = sample * RIFF_OSCILLATOR_BLEP_LEVEL
+        Case RiffWavePinkNoise
+            sample = RiffNextPinkNoise(rVoices(voiceIndex).noiseSeed, rVoices(voiceIndex).NoisePinkB0, rVoices(voiceIndex).NoisePinkB1, rVoices(voiceIndex).NoisePinkB2, rVoices(voiceIndex).NoisePinkB3, rVoices(voiceIndex).NoisePinkB4, rVoices(voiceIndex).NoisePinkB5, rVoices(voiceIndex).NoisePinkB6)
+        Case RiffWaveBrownNoise
+            sample = RiffNextBrownNoise(rVoices(voiceIndex).noiseSeed, rVoices(voiceIndex).NoiseBrown)
         Case Else
-            sample = (Rnd() * RIFF_BIPOLAR_SINGLE_SCALE) - RIFF_UNITY_GAIN
+            sample = RiffNextWhiteNoise(rVoices(voiceIndex).noiseSeed)
     End Select
 
     rVoices(voiceIndex).OscPhase = rVoices(voiceIndex).OscPhase + (dt * PI2)
@@ -4225,6 +4830,150 @@ Private Function RiffHasActiveVoices() As Boolean
     Next i
 End Function
 
+
+'/**
+' * @function RiffAdaptiveNotifyUnderrun
+' * @brief Raises the adaptive queue target after WASAPI padding becomes dangerously low.
+' */
+Private Sub RiffAdaptiveNotifyUnderrun()
+    rCtx.UnderrunCount = rCtx.UnderrunCount + 1
+    rCtx.AdaptiveStableTicks = 0
+
+    If rCtx.AdaptiveTargetQueueMs < RIFF_QUEUE_SAFE_MS Then
+        rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_SAFE_MS
+    End If
+End Sub
+
+'/**
+' * @function RiffAdaptiveUpdateQueue
+' * @brief Slowly returns the adaptive queue target to low latency after a stable render period.
+' */
+Private Sub RiffAdaptiveUpdateQueue()
+    If rCtx.AdaptiveLastUnderruns <> rCtx.UnderrunCount Then
+        rCtx.AdaptiveLastUnderruns = rCtx.UnderrunCount
+        rCtx.AdaptiveStableTicks = 0
+        Exit Sub
+    End If
+
+    If rCtx.AdaptiveTargetQueueMs <= RIFF_QUEUE_MIN_MS Then
+        rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_MIN_MS
+        rCtx.AdaptiveStableTicks = 0
+        Exit Sub
+    End If
+
+    rCtx.AdaptiveStableTicks = rCtx.AdaptiveStableTicks + 1
+
+    If rCtx.AdaptiveStableTicks >= RIFF_QUEUE_RECOVER_DELAY_TICKS Then
+        rCtx.AdaptiveTargetQueueMs = rCtx.AdaptiveTargetQueueMs - RIFF_QUEUE_RECOVER_STEP_MS
+
+        If rCtx.AdaptiveTargetQueueMs < RIFF_QUEUE_MIN_MS Then
+            rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_MIN_MS
+        End If
+
+        rCtx.AdaptiveStableTicks = 0
+    End If
+End Sub
+
+'/**
+' * @function RiffAdaptiveFramesToWrite
+' * @brief Calculates how many frames should be written to reach the current adaptive queue target.
+' * @param padding Current queued WASAPI frames.
+' * @return {Long} Frames to write this tick.
+' */
+Private Function RiffAdaptiveFramesToWrite(ByVal padding As Long) As Long
+    Dim targetFrames As Long
+    Dim availableFrames As Long
+
+    If rCtx.sampleRate <= 0 Then
+        Exit Function
+    End If
+
+    targetFrames = (rCtx.sampleRate * rCtx.AdaptiveTargetQueueMs) \ RIFF_MS_PER_SEC
+    If targetFrames < 1 Then targetFrames = 1
+    If targetFrames > rCtx.BufferSize Then targetFrames = rCtx.BufferSize
+
+    availableFrames = rCtx.BufferSize - padding
+    If availableFrames <= 0 Then
+        Exit Function
+    End If
+
+    RiffAdaptiveFramesToWrite = targetFrames - padding
+
+    If RiffAdaptiveFramesToWrite <= 0 Then
+        Exit Function
+    End If
+
+    If RiffAdaptiveFramesToWrite > availableFrames Then
+        RiffAdaptiveFramesToWrite = availableFrames
+    End If
+
+    If rCtx.MaxWriteFrames > 0 Then
+        If RiffAdaptiveFramesToWrite > rCtx.MaxWriteFrames Then
+            RiffAdaptiveFramesToWrite = rCtx.MaxWriteFrames
+        End If
+    End If
+End Function
+
+'/**
+' * @property RiffAdaptiveQueueMs
+' * @brief Returns the current adaptive output queue target in milliseconds.
+' * @return {Long} Current queue target used by the render loop.
+' */
+Public Property Get RiffAdaptiveQueueMs() As Long
+    RiffAdaptiveQueueMs = rCtx.AdaptiveTargetQueueMs
+End Property
+
+'/**
+' * @property RiffUnderrunCount
+' * @brief Returns how many low-padding underrun recoveries were detected by the adaptive renderer.
+' * @return {Long} Number of detected underrun recoveries.
+' */
+Public Property Get RiffUnderrunCount() As Long
+    RiffUnderrunCount = rCtx.UnderrunCount
+End Property
+
+'/**
+' * @property RiffLastPaddingFrames
+' * @brief Returns the last WASAPI padding value observed by the render callback.
+' * @return {Long} Queued output frames reported by WASAPI.
+' */
+Public Property Get RiffLastPaddingFrames() As Long
+    RiffLastPaddingFrames = rCtx.LastPaddingFrames
+End Property
+
+'/**
+' * @property RiffLastFramesAvailable
+' * @brief Returns the last physical free frame count in the WASAPI shared buffer.
+' * @return {Long} Free frames available before adaptive limiting.
+' */
+Public Property Get RiffLastFramesAvailable() As Long
+    RiffLastFramesAvailable = rCtx.LastFramesAvailable
+End Property
+
+'/**
+' * @property RiffLastFramesWritten
+' * @brief Returns how many frames were written by the last render tick.
+' * @return {Long} Frames submitted to IAudioRenderClient in the last tick.
+' */
+Public Property Get RiffLastFramesWritten() As Long
+    RiffLastFramesWritten = rCtx.LastFramesWritten
+End Property
+
+'/**
+' * @function RiffResetAdaptiveStats
+' * @brief Clears adaptive renderer diagnostics and returns the queue target to low-latency mode.
+' */
+Public Sub RiffResetAdaptiveStats()
+    rCtx.UnderrunCount = 0
+    rCtx.RenderTickCount = 0
+    rCtx.AdaptiveLastUnderruns = 0
+    rCtx.AdaptiveStableTicks = 0
+    rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_MIN_MS
+    rCtx.LastPaddingFrames = 0
+    rCtx.LastFramesAvailable = 0
+    rCtx.LastFramesWritten = 0
+End Sub
+
 #If VBA7 Then
 Private Sub RiffTimerCallback(ByVal hWnd As LongPtr, ByVal uMsg As Long, ByVal idEvent As LongPtr, ByVal dwTime As Long)
 #Else
@@ -4373,18 +5122,35 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
         rCtx.TimerCallbackActive = False
         Exit Sub
     End If
-    
-    framesAvailable = rCtx.BufferSize - padding
+
+    rCtx.RenderTickCount = rCtx.RenderTickCount + 1
+    rCtx.LastPaddingFrames = padding
+    rCtx.LastFramesAvailable = rCtx.BufferSize - padding
+    rCtx.LastFramesWritten = 0
+
+    If rCtx.LastFramesAvailable <= 0 Then
+        rCtx.TimerCallbackActive = False
+        Exit Sub
+    End If
+
+    If rCtx.RenderTickCount > 3 Then
+        If padding <= ((rCtx.sampleRate * RIFF_UNDERRUN_PADDING_MS) \ RIFF_MS_PER_SEC) Then
+            RiffAdaptiveNotifyUnderrun
+            If rCtx.AdaptiveTargetQueueMs < RIFF_QUEUE_PANIC_MS Then
+                rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_PANIC_MS
+            End If
+        End If
+    End If
+
+    RiffAdaptiveUpdateQueue
+
+    framesAvailable = RiffAdaptiveFramesToWrite(padding)
     If framesAvailable <= 0 Then
         rCtx.TimerCallbackActive = False
         Exit Sub
     End If
 
-    If rCtx.MaxWriteFrames > 0 Then
-        If framesAvailable > rCtx.MaxWriteFrames Then
-            framesAvailable = rCtx.MaxWriteFrames
-        End If
-    End If
+    rCtx.LastFramesWritten = framesAvailable
     
     RiffTickBusFades framesAvailable
     
@@ -4540,7 +5306,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     rt2 = rVoices(i).RevTap2
                     rt3 = rVoices(i).RevTap3
                     rt4 = rVoices(i).RevTap4
-                    dTime = rVoices(i).DelayTime
+                    dTime = rVoices(i).delayTime
                     dFB = rVoices(i).DelayFeedback
                     dMix = rVoices(i).DelayMix
                     dSamples = Int(dTime * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
@@ -4569,7 +5335,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     Dim currentVoiceBus As Long
                     Dim baseVol As Single
                     currentVoiceBus = rVoices(i).busID
-                    baseVol = rVoices(i).Volume * rCtx.MasterVolume * RiffBusMixVolume(currentVoiceBus)
+                    baseVol = rVoices(i).volume * rCtx.MasterVolume * RiffBusMixVolume(currentVoiceBus)
                     
                     If nChannels = RIFF_WAV_EXPORT_CHANNELS Then
                         For frame = 0 To framesAvailable - 1
@@ -4640,8 +5406,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             End If
                             
                             If dsFactor > 1 Then
-                                If dsCount >= dsFactor Then
-                                    dsCount = 0
+                                If dsCount <= 0 Or dsCount >= dsFactor Then
+                                    dsCount = 1
                                     lastL = fL
                                     lastR = fR
                                 Else
@@ -4760,6 +5526,11 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 RiffProcessFreeverb i, dBase, dWrite, rMix, rTime, fL, fR, bufInL, bufInR
                             End If
                             
+                            bufInL = RiffSanitizeSample(bufInL)
+                            bufInR = RiffSanitizeSample(bufInR)
+                            fL = RiffSanitizeSample(fL)
+                            fR = RiffSanitizeSample(fR)
+
                             rRingBuf(dBase + dWrite) = bufInL
                             rRingBuf(dBase + dWrite + 1) = bufInR
                             dWrite = dWrite + RIFF_WAV_EXPORT_CHANNELS
@@ -4790,7 +5561,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             End If
                             
                             Dim curPan As Single
-                            curPan = rVoices(i).Pan
+                            curPan = rVoices(i).pan
                             If apDepth > 0! Then
                                 curPan = curPan + (Sin(apPhase) * apDepth)
                                 If curPan > 1! Then
@@ -4854,6 +5625,7 @@ NextVoice32:
         If currentMasterPeakR > rCtx.MasterPeakR Then rCtx.MasterPeakR = currentMasterPeakR
         
         For frame = 0 To sampleCount32 - 1
+            rMixArr32(frame) = RiffSanitizeSample(rMixArr32(frame))
             If rMixArr32(frame) > 1! Then
                 rMixArr32(frame) = 1!
             ElseIf rMixArr32(frame) < -1! Then
@@ -4986,7 +5758,7 @@ NextVoice32:
                     rt2 = rVoices(i).RevTap2
                     rt3 = rVoices(i).RevTap3
                     rt4 = rVoices(i).RevTap4
-                    dTime = rVoices(i).DelayTime
+                    dTime = rVoices(i).delayTime
                     dFB = rVoices(i).DelayFeedback
                     dMix = rVoices(i).DelayMix
                     dSamples = Int(dTime * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
@@ -5015,7 +5787,7 @@ NextVoice32:
                     Dim cVoiceBus16 As Long
                     Dim bVol16 As Single
                     cVoiceBus16 = rVoices(i).busID
-                    bVol16 = rVoices(i).Volume * rCtx.MasterVolume * RiffBusMixVolume(cVoiceBus16)
+                    bVol16 = rVoices(i).volume * rCtx.MasterVolume * RiffBusMixVolume(cVoiceBus16)
 
                     If nChannels = RIFF_WAV_EXPORT_CHANNELS Then
                         For frame = 0 To framesAvailable - 1
@@ -5075,8 +5847,8 @@ NextVoice32:
                             End If
                             
                             If dsFactor > 1 Then
-                                If dsCount >= dsFactor Then
-                                    dsCount = 0
+                                If dsCount <= 0 Or dsCount >= dsFactor Then
+                                    dsCount = 1
                                     lastL = fL
                                     lastR = fR
                                 Else
@@ -5195,6 +5967,11 @@ NextVoice32:
                                 RiffProcessFreeverb i, dBase, dWrite, rMix, rTime, fL, fR, bufInL16, bufInR16
                             End If
                             
+                            bufInL16 = RiffSanitizeSample(bufInL16)
+                            bufInR16 = RiffSanitizeSample(bufInR16)
+                            fL = RiffSanitizeSample(fL)
+                            fR = RiffSanitizeSample(fR)
+
                             rRingBuf(dBase + dWrite) = bufInL16
                             rRingBuf(dBase + dWrite + 1) = bufInR16
                             dWrite = dWrite + RIFF_WAV_EXPORT_CHANNELS
@@ -5225,7 +6002,7 @@ NextVoice32:
                             End If
                             
                             Dim cPan16 As Single
-                            cPan16 = rVoices(i).Pan
+                            cPan16 = rVoices(i).pan
                             If apDepth > 0! Then
                                 cPan16 = cPan16 + (Sin(apPhase) * apDepth)
                                 If cPan16 > 1! Then
@@ -5737,7 +6514,7 @@ Private Function InitWASAPI() As Boolean
         Exit Function
     End If
 
-    rCtx.MaxWriteFrames = (rCtx.sampleRate * 60) \ 1000
+    rCtx.MaxWriteFrames = (rCtx.sampleRate * RIFF_MAX_WRITE_MS) \ RIFF_MS_PER_SEC
     
     hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_GET_BUFFER_SIZE, VarPtr(rCtx.BufferSize))
     If hr <> 0 Then
