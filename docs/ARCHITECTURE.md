@@ -1,30 +1,48 @@
 # Riff Architecture
 
-This document describes the internal architecture of Riff. It is intended for contributors, advanced users, and anyone who wants to understand how the engine works under the hood.
+This document describes the internal architecture of Riff v1.0.9. It is intended for contributors, advanced users, and anyone who wants to understand how the engine works under the hood.
+
+Riff is a single-file VBA audio engine for Windows Office hosts. It combines Media Foundation decoding, WASAPI shared-mode output, a native timer thunk, a real-time DSP mixer, per-voice effects, persistent bus presets, and optional master bus processing while remaining contained inside one `.bas` module.
 
 ## Table of Contents
 
 - [High-Level Overview](#high-level-overview)
+- [Design Goals](#design-goals)
+- [Runtime Model](#runtime-model)
 - [Global State](#global-state)
   - [RiffContext](#riffcontext)
   - [RiffBuffer Pool](#riffbuffer-pool)
   - [RiffVoice Pool](#riffvoice-pool)
+  - [RiffBus State](#riffbus-state)
+  - [Master Processor State](#master-processor-state)
   - [Ring Buffer](#ring-buffer)
 - [Initialization Sequence](#initialization-sequence)
   - [Thunk Compilation](#thunk-compilation)
   - [WASAPI Initialization](#wasapi-initialization)
   - [Media Foundation Startup](#media-foundation-startup)
-- [Audio Decoding Pipeline](#audio-decoding-pipeline)
-  - [File-Based Loading](#file-based-loading)
+  - [Default Mixer State](#default-mixer-state)
+- [Audio Loading Pipeline](#audio-loading-pipeline)
+  - [RiffLoad Dispatch](#riffload-dispatch)
+  - [WAV Fast Path](#wav-fast-path)
+  - [Media Foundation Decode Path](#media-foundation-decode-path)
   - [Memory-Based Loading](#memory-based-loading)
-  - [CoreProcessSourceReader](#coreprocesssourcereader)
+  - [Decode Hot Path Optimization](#decode-hot-path-optimization)
+- [Playback Allocation](#playback-allocation)
+  - [Unified Playback Entry Point](#unified-playback-entry-point)
+  - [Voice Allocation](#voice-allocation)
+  - [Voice Stealing](#voice-stealing)
+  - [Burst Caps](#burst-caps)
+  - [RiffPlayOnce](#riffplayonce)
 - [DSP Timer Callback](#dsp-timer-callback)
+  - [Callback Guards](#callback-guards)
+  - [Adaptive Buffering](#adaptive-buffering)
   - [WASAPI Buffer Acquisition](#wasapi-buffer-acquisition)
   - [Voice Iteration](#voice-iteration)
   - [Source Reading and Pitch Shifting](#source-reading-and-pitch-shifting)
-  - [Oscillator Generation](#oscillator-generation)
-- [DSP Pipeline](#dsp-pipeline)
+  - [Oscillator and Noise Generation](#oscillator-and-noise-generation)
+- [Per-Voice DSP Pipeline](#per-voice-dsp-pipeline)
   - [Stage Order](#stage-order)
+  - [Smoothing](#smoothing)
   - [Bitcrusher](#bitcrusher)
   - [Distortion](#distortion)
   - [Low-Pass and High-Pass Filters](#low-pass-and-high-pass-filters)
@@ -32,150 +50,240 @@ This document describes the internal architecture of Riff. It is intended for co
   - [Ring Modulator](#ring-modulator)
   - [Tremolo](#tremolo)
   - [Stereo Width](#stereo-width)
-  - [Ring Buffer Effects: Flanger, Chorus, Delay, Reverb](#ring-buffer-effects-flanger-chorus-delay-reverb)
+  - [Ring Buffer Effects](#ring-buffer-effects)
   - [Compressor](#compressor)
   - [Auto-Pan and Final Gain](#auto-pan-and-final-gain)
   - [Fade Envelope](#fade-envelope)
   - [Mix Accumulation](#mix-accumulation)
+- [Bus Architecture](#bus-architecture)
+  - [Bus Gain, Mute, and Solo](#bus-gain-mute-and-solo)
+  - [Bus Fades](#bus-fades)
+  - [Persistent Bus Presets](#persistent-bus-presets)
+  - [Bus Peak Metering](#bus-peak-metering)
+- [Preset Architecture](#preset-architecture)
+  - [Voice Presets](#voice-presets)
+  - [Musical Preset Packs](#musical-preset-packs)
+  - [Bus Preset Application](#bus-preset-application)
+- [Master Bus Processors](#master-bus-processors)
+  - [Master Processor Stage](#master-processor-stage)
+  - [Master Presets](#master-presets)
+  - [Soft Clipping and Safety Limiting](#soft-clipping-and-safety-limiting)
 - [Output Paths](#output-paths)
-  - [32-Bit Float Path (Modern Hardware)](#32-bit-float-path-modern-hardware)
-  - [16-Bit Integer Path (Legacy Hardware)](#16-bit-integer-path-modern-hardware)
-- [Peak Metering](#peak-metering)
-- [Audio Buses](#audio-buses)
-- [Loop and Seek](#loop-and-seek)
-- [Fade System](#fade-system)
+  - [32-Bit Float Path](#32-bit-float-path)
+  - [32-Bit PCM Path](#32-bit-pcm-path)
+  - [16-Bit PCM Path](#16-bit-pcm-path)
+- [Peak Metering and Diagnostics](#peak-metering-and-diagnostics)
+- [Loop, Seek, and Fade Systems](#loop-seek-and-fade-systems)
 - [COM VTable Dispatch](#com-vtable-dispatch)
 - [Platform Compatibility](#platform-compatibility)
 - [Memory Layout](#memory-layout)
 - [Shutdown Sequence](#shutdown-sequence)
+- [Known Architectural Boundaries](#known-architectural-boundaries)
 
 ## High-Level Overview
 
-Riff is a single-file VBA module (`Riff.bas`) that implements a complete real-time audio engine using only native Windows APIs and COM interfaces. It carries no external dependencies beyond what ships with every modern Windows installation.
+Riff is a single-file VBA module (`Riff.bas`) that implements a complete real-time audio engine using native Windows APIs and COM interfaces. It carries no external dependency beyond components already available on modern Windows systems.
 
-The engine is organized into four distinct layers:
+The engine is organized into six conceptual layers:
 
 ```mermaid
 graph TD
-    A["Your VBA Code<br/>RiffPlay / RiffLoad / DSP Properties"]
-    B["Public API Layer<br/>Handle validation, voice allocation, property routing"]
-    C["DSP Engine Layer<br/>Timer callback, sample-accurate pipeline, mix accumulation"]
-    D["WASAPI Layer<br/>IAudioClient, IAudioRenderClient, device enumeration"]
-    E["Media Foundation Layer<br/>IMFSourceReader, format conversion, PCM extraction"]
-    F["Windows Kernel<br/>Audio driver, physical output device"]
+    A["Your VBA Code<br/>RiffPlay / RiffLoad / Presets / DSP Properties"]
+    B["Public API Layer<br/>Validation, handles, compatibility wrappers"]
+    C["Asset Layer<br/>WAV fast path, Media Foundation decode, buffer pool"]
+    D["Mixer and DSP Layer<br/>Voice processing, bus routing, presets, master processors"]
+    E["WASAPI Layer<br/>IAudioClient, IAudioRenderClient, shared-mode output"]
+    F["Windows Audio Stack<br/>Audio engine, driver, physical device"]
 
-    A --> B --> C --> D --> F
-    B --> E
+    A --> B
+    B --> C
+    B --> D
+    D --> E
+    E --> F
 
     style A fill:#f9f,stroke:#333,stroke-width:2px
     style B fill:#ccf,stroke:#333,stroke-width:2px
-    style C fill:#cfc,stroke:#333,stroke-width:2px
-    style D fill:#ffc,stroke:#333,stroke-width:2px
-    style E fill:#fca,stroke:#333,stroke-width:2px
+    style C fill:#fca,stroke:#333,stroke-width:2px
+    style D fill:#cfc,stroke:#333,stroke-width:2px
+    style E fill:#ffc,stroke:#333,stroke-width:2px
     style F fill:#ddd,stroke:#333,stroke-width:2px
 ```
 
-Riff is dual-architecture compatible. All Win32 API declarations are guarded by `#If VBA7 Then ... #Else ... #End If` blocks and pointer-sized fields use `LongPtr` on 64-bit hosts and `Long` on 32-bit hosts, allowing the same source file to run on both Office x86 and Office x64 without modification.
+The public API remains small and handle-based. The user loads a buffer, starts a voice, routes it to a bus, and optionally applies presets or DSP parameters. Internally, Riff performs real-time mixing into the WASAPI render buffer.
+
+## Design Goals
+
+Riff is built around a few strict goals:
+
+| Goal | Architectural Choice |
+|:---|:---|
+| Single-file deployment | Everything lives inside `Riff.bas`. |
+| No installer or registration | Uses Windows APIs directly, no ActiveX or external DLL requirement. |
+| Office compatibility | Pure VBA API surface, x86/x64 declarations, safe cleanup paths. |
+| Game-like audio | Polyphonic voices, buses, fades, looping, noise, oscillators, presets. |
+| Practical performance | Native timer thunk, scratch buffers, direct memory copies, fast WAV path. |
+| Safe host behavior | `EbMode` guard, `MagicCookie`, timer suspend/wake, explicit shutdown. |
+| Musical workflow | Preset packs, persistent bus effects, master processing, scene recipes. |
+
+The engine is not a replacement for a native C/Rust audio thread. It is a highly optimized real-time audio system hosted inside Office/VBA.
+
+## Runtime Model
+
+The runtime model is handle-based:
+
+```txt
+Buffer handle = decoded audio asset in native memory
+Voice handle  = active playback instance
+Bus id        = routing group
+Preset enum   = preconfigured DSP recipe
+```
+
+A buffer can be played by many voices. A voice can be routed to one bus. A bus can hold a persistent preset rule. The full mixed output can be processed by the master processor chain.
+
+```txt
+Buffer -> Voice DSP -> Bus gain/mute/solo -> Mix accumulation -> Master processors -> WASAPI
+```
 
 ## Global State
 
-Riff stores its entire state in three module-level structures and one dynamic array. There are no class instances, no COM object references in VBA objects, and no heap allocations via VBA. All memory management goes through `VirtualAlloc` and `VirtualFree` directly.
+Riff avoids object-heavy VBA abstractions. Almost all engine state lives in module-level UDTs and arrays.
 
 ### RiffContext
 
-`RiffContext` is a single `Private` UDT instance (`rCtx`) that holds the engine-level state:
+`RiffContext` is the main engine state object. It is stored as a single private module-level instance, usually named `rCtx`.
 
-| Category | Fields |
+Typical categories inside the context:
+
+| Category | Purpose |
 |:---|:---|
-| Guard | `MagicCookie`, `Initialized` |
-| Master | `MasterVolume`, `MasterPeakL`, `MasterPeakR` |
-| Device format | `SampleRate`, `AvgBytesPerSec`, `MixFormatPtr` |
-| WASAPI pointers | `DeviceEnumerator`, `Device`, `AudioClient`, `RenderClient`, `BufferSize` |
-| Timer | `ThunkTimerCB`, `TimerID` |
-| Buses | `Buses(0 To 15)` |
-| Buffer pool | `Buffers(0 To 63)` as `RiffBuffer` |
+| Guard | `MagicCookie`, `Initialized`, shutdown state |
+| Device format | sample rate, block align, bits per sample, average bytes/sec |
+| WASAPI pointers | device enumerator, device, audio client, render client, mix format |
+| Timer | thunk pointer, timer id, auto-suspend state |
+| Master | master volume, master peaks, soft clip, master processor state |
+| Buses | 16 bus states |
+| Buffers | 64 buffer slots |
+| Diagnostics | underruns, render errors, clipped samples, last padding/written frames |
 
-The `MagicCookie` field is set to `&H52494646` ("RIFF" in ASCII) at initialization and cleared to `0` on shutdown. The timer callback checks this value as its very first operation and exits immediately if it does not match, making the callback safe against stale timer firings after `RiffClose`.
-
-### Auto-Suspend Logic
-To minimize CPU impact during silence, Riff includes an optional `AutoSuspendTimer` feature. When enabled, the engine monitors active voice counts. If no voices are processed for a pre-defined interval, the `SetTimer` callback is killed. The engine "wakes up" automatically via `RiffEnsureRenderTimer` whenever a new `RiffPlay` or `RiffPlayOscillator` call is issued.
+The `MagicCookie` is a defensive guard. It is set during `RiffOpen` and cleared early in `RiffClose`. Timer callbacks check it before touching engine state.
 
 ### RiffBuffer Pool
 
-`RiffBuffer` is a 64-entry array embedded within `RiffContext`. Each entry holds:
+Riff uses a fixed pool of 64 decoded audio buffers. Each slot stores:
 
-| Field | Type | Purpose |
-|:---|:---|:---|
-| `Active` | `Boolean` | Whether this slot contains valid PCM data |
-| `BufferPtr` | `LongPtr` / `Long` | Pointer to the `VirtualAlloc`-ed PCM block |
-| `BufferLen` | `Long` | Size of the PCM block in bytes |
+| Field | Purpose |
+|:---|:---|
+| `Active` | slot contains valid decoded PCM |
+| `BufferPtr` | pointer to `VirtualAlloc` memory |
+| `BufferLen` | decoded PCM size in bytes |
 
-Buffer slots are allocated linearly on first-fit. `RiffLoad` and `RiffLoadFromMemory` scan from index `0` to `63` and take the first `Active = False` slot. `RiffUnload` sets `Active = False` and calls `VirtualFree` on `BufferPtr`.
+The buffer pool avoids allocating VBA objects per sound. PCM data is stored in native memory, and the mixer reads from it using byte offsets.
 
 ### RiffVoice Pool
 
-`rVoices` is a 32-entry array of `RiffVoice` UDTs declared at module level. Each voice contains the complete DSP state for one polyphonic channel:
+Riff uses a fixed pool of 32 voices. Each `RiffVoice` contains playback state and its complete DSP state.
 
-| Category | Fields |
+Major categories:
+
+| Category | Examples |
 |:---|:---|
-| Identification | `Active`, `Playing`, `Paused`, `busID`, `BufferIndex` |
-| Oscillator | `IsOscillator`, `OscType`, `OscFreq`, `OscPhase` |
-| Metering | `PeakL`, `PeakR` |
-| Playback control | `Position`, `Volume`, `Pitch`, `Pan` |
-| Fade | `fadeState`, `FadeFramesTotal`, `FadeFramesCurrent` |
-| Loop | `Looping`, `loopStart`, `loopEnd` |
-| Ring buffer | `RingWritePos` |
-| Bitcrusher | `BitcrushSteps`, `BitcrushDownsample`, `BitcrushDsCount`, `BitcrushLastL`, `BitcrushLastR` |
-| Distortion | `Distortion` |
-| Filters | `LowPass`, `HighPass`, `FilterStateL`, `FilterStateR`, `FilterStateHP_L`, `FilterStateHP_R` |
-| EQ | `EqBass`, `EqMid`, `EqTreble`, `EqStateLowL`, `EqStateLowR`, `EqStateHighL`, `EqStateHighR` |
-| Compressor | `CompThreshold`, `CompRatio`, `CompEnv` |
-| Ring Modulator | `RingModFreq`, `RingModMix`, `RingModPhase` |
-| Tremolo | `TremoloRate`, `TremoloDepth`, `TremoloPhase` |
-| Auto-Pan | `AutoPanRate`, `AutoPanDepth`, `AutoPanPhase` |
-| Chorus | `ChorusRate`, `ChorusDepth`, `ChorusPhase` |
-| Flanger | `FlangerRate`, `FlangerDepth`, `FlangerFeedback`, `FlangerPhase` |
-| Reverb | `ReverbMix`, `ReverbTime`, `RevTap1`, `RevTap2`, `RevTap3`, `RevTap4` |
-| Delay | `DelayTime`, `DelayFeedback`, `DelayMix` |
-| Stereo Width | `StereoWidth` |
+| Activity | active, playing, paused |
+| Source | buffer index, oscillator flag, waveform/noise type |
+| Transport | position, pitch, loop start/end |
+| Routing | bus id, volume, pan, fade state |
+| Smoothing | current/target volume, pan, pitch transition state |
+| Metering | left/right peak values |
+| DSP | filters, EQ, delay, reverb, chorus, flanger, compressor, distortion |
+| Noise | per-voice random/noise filter state |
+| Ring buffer | write pointer and tap state |
 
-Voice allocation is performed by `InternalGetFreeVoice`, which scans from index `0` to `31` and returns the first slot where `Active = False`. Allocation is O(n) in the worst case but O(1) amortized in typical usage patterns.
+The fixed voice pool keeps iteration simple and predictable:
+
+```vb
+For i = 0 To RiffMaxVoices - 1
+    If rVoices(i).Active Then
+        ' process voice
+    End If
+Next i
+```
+
+### RiffBus State
+
+Each of the 16 buses stores group-level mixer state:
+
+| State | Purpose |
+|:---|:---|
+| Volume | multiplicative gain |
+| Muted | bypass output for this bus |
+| Solo | solo routing logic |
+| Fade target | smooth bus volume changes |
+| Peak L/R | bus metering |
+| Persistent preset enabled | whether new voices inherit a preset |
+| Persistent preset id | preset stored on the bus |
+| Persistent preset amount | preset intensity |
+
+The persistent bus preset fields are a v1.0.9 addition. They make scene-wide effects practical in slide-based or UI-heavy projects because new voices automatically inherit the current scene coloration.
+
+### Master Processor State
+
+The master processor state contains final mix controls:
+
+| Processor | Purpose |
+|:---|:---|
+| Enabled | bypass or enable optional master chain |
+| Low-pass | darken or soften the full mix |
+| High-pass | remove low rumble from the full mix |
+| 3-band EQ | global tone shaping |
+| Compressor | glue and safety control |
+| Drive | global warmth/saturation |
+| Stereo width | widen or narrow final mix |
+| Output gain | final trim after processing |
+| Soft clip | safety stage to reduce harsh clipping |
+
+Master processors run after all voices and buses are mixed. They are not per-bus processors; they affect the final output.
 
 ### Ring Buffer
 
-`rRingBuf` is a module-level `Single` array declared as:
+Time-based effects share a large module-level ring buffer:
 
 ```vb
 Private rRingBuf() As Single
-ReDim rRingBuf(0 To (32 * 192000) - 1)
 ```
 
-This is a **contiguous 1D array** of 6,144,000 `Single` samples representing 32 per-voice blocks of 192,000 samples each. Voice `i` maps to the slice `rRingBuf(i * 192000)` through `rRingBuf((i + 1) * 192000 - 1)`.
+The design is a contiguous 1D layout divided into per-voice regions:
 
-The 1D layout is deliberate. A 2D VBA array `rRingBuf(31, 191999)` would be stored in column-major order, making `RtlZeroMemory` on a single row incorrect. With a 1D layout, zeroing voice `i`'s block is a single correct `RtlZeroMemory` call:
-
-```vb
-RtlZeroMemory VarPtr(rRingBuf(slot * 192000)), 192000 * 4
+```txt
+voice 0 region -> rRingBuf(0 ... N-1)
+voice 1 region -> rRingBuf(N ... 2N-1)
+...
+voice 31 region
 ```
 
-At 48 kHz stereo, 192,000 samples represents approximately 2 seconds of interleaved stereo audio per voice. The ring buffer is shared by Delay, Chorus, Flanger, and Reverb for the same voice; all four effects read from different offsets behind the write pointer.
+A 1D layout is intentional. It allows clearing one voice's region with a single memory operation and avoids confusion caused by VBA's multi-dimensional array layout.
+
+The ring buffer is used by:
+
+- delay
+- reverb
+- chorus
+- flanger
 
 ## Initialization Sequence
 
-`RiffOpen` executes the following sequence. If any step fails, all previously acquired resources are released before returning `False`.
+`RiffOpen` performs the full engine startup. If any critical step fails, resources acquired so far are released before returning `False`.
 
 ```mermaid
 graph TD
-    A[RiffOpen]
-    B["Set MagicCookie and defaults<br/>MasterVolume = 1.0, Buses = 1.0"]
-    C["InitThunks<br/>compile machine code into VirtualAlloc'd memory"]
-    D["MFStartup<br/>initialize Media Foundation runtime"]
-    E["InitWASAPI<br/>enumerate device → acquire IAudioClient → get mix format"]
-    F["Initialize IAudioClient<br/>Shared Mode, 150ms buffer"]
-    G["Get IAudioRenderClient<br/>Start audio stream"]
-    H["Allocate ring buffer<br/>ReDim rRingBuf(0 To 6,143,999)"]
-    I["timeBeginPeriod 1<br/>increase system timer resolution"]
-    J["SetTimer 15ms<br/>register ThunkTimerCB"]
+    A["RiffOpen"]
+    B["Initialize context defaults<br/>magic cookie, buses, master state"]
+    C["Compile timer thunk<br/>VirtualAlloc executable memory"]
+    D["MFStartup<br/>Media Foundation runtime"]
+    E["Initialize WASAPI<br/>device, audio client, render client"]
+    F["Allocate shared DSP buffers<br/>ring buffer and scratch state"]
+    G["Initialize bus state<br/>volume, mute, solo, presets"]
+    H["Initialize master processors<br/>clean default state"]
+    I["Start WASAPI stream"]
+    J["Start render timer"]
     K["Initialized = True"]
 
     A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K
@@ -188,601 +296,728 @@ graph TD
 
 ### Thunk Compilation
 
-`InitThunks` allocates a block of executable memory via `VirtualAlloc` with `PAGE_EXECUTE_READWRITE` and writes a sequence of machine-code opcodes into it. This native thunk serves as the bridge between the Win32 timer callback ABI (which passes four parameters on the stack) and the VBA subroutine `RiffTimerCallback`.
+Riff uses a tiny native machine-code thunk to bridge the Win32 timer callback ABI into VBA. The thunk is allocated with `VirtualAlloc` and executable permissions.
 
-The thunk performs two checks before dispatching to VBA:
+The thunk exists because Windows timers call a raw function pointer, while VBA procedures have runtime constraints. The thunk performs safety checks and then dispatches into the VBA callback.
 
-1. It calls `EbMode` from `vbe7.dll` (or `vba6.dll` on 32-bit hosts). `EbMode` returns `1` if VBA is in a break or design state. If so, the thunk calls `KillTimer` to remove itself and returns without invoking the VBA callback, preventing a crash on project reset.
-2. If VBA is running normally (`EbMode` returns `0`), the thunk calls `RiffTimerCallback` with the original four timer parameters.
+Important responsibilities:
 
-The thunk is architecture-specific. Two separate opcode sequences are compiled conditionally:
+1. Check the VBE execution mode using `EbMode`.
+2. Avoid calling VBA when the project is in break/design/reset state.
+3. Kill the timer when the host is no longer safe.
+4. Dispatch into `RiffTimerCallback` only when execution is valid.
 
-| Condition | Opcode sequence |
+The code is architecture-specific:
+
+| Host | Thunk ABI |
 |:---|:---|
-| `#If Win64` | 64-bit System V–style ABI with `sub rsp, 28h` stack alignment |
-| `#Else` | 32-bit `stdcall` with `push` arguments and `ret 16` epilogue |
-
-After writing the opcodes, the addresses of `EbMode`, `KillTimer`, and `RiffTimerCallback` are patched directly into the machine code at their pre-calculated offsets.
+| Office x86 | 32-bit stdcall |
+| Office x64 | 64-bit Windows calling convention with stack alignment |
 
 ### WASAPI Initialization
 
-`InitWASAPI` acquires the Windows audio output device through COM interfaces without using `CoCreateInstance` from VBA's runtime — instead it uses the raw `CoCreateInstance` API from `ole32.dll` directly. All COM method calls go through `vCall`, the internal VTable dispatcher described in [COM VTable Dispatch](#com-vtable-dispatch).
-
-The initialization sequence inside `InitWASAPI`:
+Riff uses WASAPI shared mode for output. The initialization sequence is:
 
 ```mermaid
 graph TD
-    A["CoCreateInstance<br/>CLSID_MMDeviceEnumerator"]
-    B["IMMDeviceEnumerator::GetDefaultAudioEndpoint<br/>eRender, eConsole"]
-    C["IMMDevice::Activate<br/>IID_IAudioClient"]
-    D["IAudioClient::GetMixFormat<br/>stores MixFormatPtr, SampleRate, AvgBytesPerSec"]
-    E["IAudioClient::Initialize<br/>AUDCLNT_SHAREMODE_SHARED, 150ms buffer<br/>(retries without AUDCLNT_STREAMFLAGS_EVENTCALLBACK on failure)"]
-    F["IAudioClient::GetBufferSize<br/>stores rCtx.BufferSize"]
-    G["IAudioClient::GetService<br/>IID_IAudioRenderClient → RenderClient"]
-    H["IAudioClient::Start"]
+    A["CoCreateInstance<br/>MMDeviceEnumerator"]
+    B["GetDefaultAudioEndpoint<br/>render, console"]
+    C["Activate IAudioClient"]
+    D["GetMixFormat"]
+    E["Select supported output format"]
+    F["IAudioClient.Initialize<br/>shared mode"]
+    G["GetBufferSize"]
+    H["GetService<br/>IAudioRenderClient"]
+    I["IAudioClient.Start"]
 
-    A --> B --> C --> D --> E --> F --> G --> H
-
-    style A fill:#e1f5fe,stroke:#0277bd
-    style D fill:#fff9c4,stroke:#f9a825
-    style H fill:#c8e6c9,stroke:#2e7d32
+    A --> B --> C --> D --> E --> F --> G --> H --> I
 ```
 
-The device's native mix format is read from `MixFormatPtr`, then Riff attempts to promote it to stereo 32-bit float and checks the candidate with `IAudioClient::IsFormatSupported`. If Windows rejects that format, Riff restores the original mix format and only proceeds if the fallback is stereo PCM16 or PCM32. The active `MixFormatPtr` remains valid for the entire session and is freed by `CoTaskMemFree` in `ReleaseWASAPI`. The fields read at runtime are `nChannels` (offset +2), `nSamplesPerSec` (offset +4), `nAvgBytesPerSec` (offset +8), `nBlockAlign` (offset +12), and `wBitsPerSample` (offset +14).
+Riff prefers practical stereo output formats and supports float and PCM paths. The active mix format is stored in context so the decoder and renderer agree on sample rate, channel count, block alignment, and bit depth.
 
 ### Media Foundation Startup
 
-`MFStartup(MF_VERSION, 0)` initializes the Media Foundation platform. This call is required before any `IMFSourceReader` can be created. The constant `MF_VERSION = &H20070` corresponds to Media Foundation version 2.0 (Windows 7 and later). `MFShutdown` is called symmetrically in `RiffClose`.
+Media Foundation is initialized through `MFStartup`. It is used for compressed and general audio decoding. The fast WAV path can bypass Media Foundation for compatible WAV files, but Media Foundation remains the fallback for broad format support.
 
-## Audio Decoding Pipeline
+### Default Mixer State
 
-Both `RiffLoad` and `RiffLoadFromMemory` converge on the same internal function `CoreProcessSourceReader`, which performs all the heavy work of extracting PCM data.
+During initialization, Riff resets audio state to safe defaults:
 
-### File-Based Loading
+```txt
+Master volume = 1.0
+Master processors = clean/neutral
+Soft clip = enabled
+Bus volumes = 1.0
+Bus mute/solo = false
+Bus persistent presets = disabled
+Voice pool = inactive
+Buffer pool = inactive
+Diagnostics = zeroed
+```
 
-`RiffLoad` calls `MFCreateSourceReaderFromURL` with the file path as a `LongPtr` to a wide-character string (`StrPtr`). Before creating the reader, it attempts to create an `MFAttributes` store and set the `MF_SOURCE_READER_ENABLE_AUDIO_PROCESSING` attribute (GUID `{7632CB14-D379-4770-AE7D-EA24154D9298}`) to `1`. This attribute enables Media Foundation's built-in audio resampling pipeline, ensuring that the decoded audio is automatically converted to Riff's active WASAPI sample rate and format without manual resampling in VBA.
+## Audio Loading Pipeline
+
+### RiffLoad Dispatch
+
+`RiffLoad` selects the best loading path:
+
+```mermaid
+graph TD
+    A["RiffLoad(path)"]
+    B{"File exists?"}
+    C{"Looks like WAV?"}
+    D["Try WAV fast path"]
+    E{"Fast path succeeded?"}
+    F["Return buffer handle"]
+    G["Media Foundation decode path"]
+    H{"Decode succeeded?"}
+    I["Return buffer handle"]
+    J["Set error and return -1"]
+
+    A --> B
+    B -- No --> J
+    B -- Yes --> C
+    C -- Yes --> D
+    C -- No --> G
+    D --> E
+    E -- Yes --> F
+    E -- No --> G
+    G --> H
+    H -- Yes --> I
+    H -- No --> J
+```
+
+This preserves compatibility while improving common WAV asset loading.
+
+### WAV Fast Path
+
+The WAV fast path parses compatible RIFF/WAVE files directly in VBA/native memory. It avoids Media Foundation startup and COM source-reader loops for simple assets.
+
+Conceptual flow:
+
+```txt
+Open WAV file
+Read RIFF chunks
+Find fmt chunk
+Find data chunk
+Validate format
+Allocate Riff buffer
+Copy or convert PCM into native memory
+Return buffer handle
+```
+
+Best-case path:
+
+```txt
+PCM16 stereo WAV matching output sample rate
+-> direct read/copy
+-> buffer active
+```
+
+Supported fast-path cases may include:
+
+- PCM16
+- PCM24
+- PCM32
+- Float32
+- mono/stereo conversion
+- simple sample-rate conversion if implemented in the module version
+
+Unsupported or unusual WAV files automatically fall back to Media Foundation.
+
+### Media Foundation Decode Path
+
+For compressed formats and fallback cases, Riff uses `IMFSourceReader`.
+
+Main steps:
+
+1. Create source reader from URL or byte stream.
+2. Select the first audio stream.
+3. Request output matching Riff's active mix format.
+4. Read samples in a loop.
+5. Lock media buffers.
+6. Copy decoded PCM into a growing native buffer.
+7. Store final PCM in a Riff buffer slot.
+8. Release COM objects.
+
+```mermaid
+graph TD
+    A["IMFSourceReader"]
+    B["Set stream selection"]
+    C["Set output media type"]
+    D["ReadSample loop"]
+    E["Get sample buffer"]
+    F["Lock media buffer"]
+    G["Copy PCM"]
+    H["Unlock and Release"]
+    I{"End of stream?"}
+    J["Commit Riff buffer"]
+
+    A --> B --> C --> D --> E --> F --> G --> H --> I
+    I -- No --> D
+    I -- Yes --> J
+```
 
 ### Memory-Based Loading
 
-`RiffLoadFromMemory` follows a longer chain:
+`RiffLoadFromMemory` wraps a VBA `Byte()` array as a stream and feeds it into Media Foundation. It is intended for embedded audio or generated encoded file data.
 
-```mermaid
-graph TD
-    A["Byte array in VBA memory"]
-    B["SHCreateMemStream<br/>wraps byte array as IStream<br/>(no copy — shares the VBA array's memory)"]
-    C["MFCreateMFByteStreamOnStream<br/>wraps IStream as IMFByteStream"]
-    D["MFCreateSourceReaderFromByteStream<br/>creates IMFSourceReader from IMFByteStream"]
-    E["CoreProcessSourceReader"]
+The byte array must contain a complete encoded audio file, not raw PCM.
 
-    A --> B --> C --> D --> E
+### Decode Hot Path Optimization
 
-    style A fill:#e1f5fe,stroke:#0277bd
-    style E fill:#c8e6c9,stroke:#2e7d32
+The decode loop is expensive because it repeatedly calls COM methods. Riff optimizes hot paths by avoiding generic `ParamArray` dispatch where possible and reusing argument descriptors for repeated calls.
+
+Optimized areas include:
+
+- `IMFSourceReader::ReadSample`
+- sample/buffer conversion calls
+- media buffer lock/unlock
+- `IUnknown::Release`
+
+The goal is not to make compressed decoding "free"; it reduces VBA/COM overhead. The actual MP3/OGG/AAC decode work is still performed by Media Foundation.
+
+## Playback Allocation
+
+### Unified Playback Entry Point
+
+`RiffPlay` is the primary playback function:
+
+```vb
+voice = RiffPlay(bufferHandle, busID, looped, volume, pan)
 ```
 
-> [!NOTE]
-> `SHCreateMemStream` does not copy the byte array — it returns an `IStream` backed directly by the VBA array's memory. The array must remain alive until `CoreProcessSourceReader` completes. Since VBA passes arrays `ByRef` and `CoreProcessSourceReader` runs synchronously, this is always safe.
+It validates arguments, allocates a voice, applies routing and initial parameters before activation, and starts the render timer if needed.
 
-Both `pByteStream` and `pStream` are released via `IUnknown::Release` (VTable index 2 via `vCall`) after the reader is created, since the reader holds its own reference.
+Compatibility wrappers such as `RiffPlayBus` forward into the unified path.
 
-### CoreProcessSourceReader
+### Voice Allocation
 
-`CoreProcessSourceReader` configures the `IMFSourceReader` to output audio in Riff's active WASAPI mix format, then reads all decoded samples into a temporary `VirtualAlloc`-ed buffer, growing it as needed.
+The normal allocator scans the 32 voice slots for an inactive voice.
 
-```mermaid
-graph TD
-    A["IMFSourceReader::SetStreamSelection<br/>ALL_STREAMS → False<br/>FIRST_AUDIO_STREAM → True"]
-    B["MFCreateMediaType + MFInitMediaTypeFromWaveFormatEx<br/>creates a partial type matching the device's WAVEFORMATEX"]
-    C["IMFSourceReader::SetCurrentMediaType<br/>forces output to active WASAPI PCM/float format"]
-    D["Loop: IMFSourceReader::ReadSample"]
-    E["IMFSample::GetBufferByIndex(0)"]
-    F["IMFMediaBuffer::Lock → get raw PCM pointer"]
-    G["RtlMoveMemory into tempPtr (VirtualAlloc, grows as needed)"]
-    H["IMFMediaBuffer::Unlock"]
-    I["IUnknown::Release on buffer and sample"]
-    J{"dwFlags & MF_SOURCE_READERF_ENDOFSTREAM?"}
-    K["VirtualAlloc final buffer<br/>copy tempPtr → BufferPtr<br/>set BufferLen, Active = True"]
-
-    A --> B --> C --> D --> E --> F --> G --> H --> I --> J
-    J -- No --> D
-    J -- Yes --> K
-
-    style A fill:#e1f5fe,stroke:#0277bd
-    style D fill:#fff9c4,stroke:#f9a825
-    style J fill:#fff9c4,stroke:#f9a825
-    style K fill:#c8e6c9,stroke:#2e7d32
+```vb
+For i = 0 To RiffMaxVoices - 1
+    If Not rVoices(i).Active Then
+        InternalResetVoice i
+        InternalConfigureVoice i
+        Exit Function
+    End If
+Next i
 ```
 
-The temporary buffer starts at 50 MB (`1048576 * 50` bytes) and is reallocated by doubling whenever remaining capacity would be exceeded. After the read loop, a final tight-fitting `VirtualAlloc` is made and the data is copied in, after which the temporary buffer is freed. This ensures the final physical memory footprint matches the actual decoded audio size with no wasted pages.
+### Voice Stealing
 
-All `IMFSourceReader`, `IMFSample`, and `IMFMediaBuffer` COM method calls are made via `DispCallFunc` directly rather than through the `vCall` helper. This is because the ReadSample call requires six parameters including `ByRef`-typed output pointers for `dwFlags`, `llTimestamp`, and `ppSample`, which must be laid out precisely to match the COM ABI. Pre-built argument type arrays (`rTypes`, `rPtrs`) are constructed before the loop and reused on every iteration to avoid per-iteration allocation overhead.
+When all voices are active, Riff can optionally steal a safe voice. This is controlled by:
+
+```vb
+RiffVoiceStealingEnabled = True
+```
+
+The stealing policy is conservative:
+
+- Prefer non-looping voices.
+- Prefer older or less important one-shot voices.
+- Avoid stealing persistent looped music/ambience when possible.
+- Reset the stolen voice cleanly before reuse.
+
+This prevents SFX bursts from making `RiffPlay` fail constantly while protecting music.
+
+### Burst Caps
+
+Burst caps prevent the same sound or same bus from being overloaded.
+
+```vb
+RiffMaxVoicesPerBuffer = 4
+RiffMaxVoicesPerBus = 16
+```
+
+Per-buffer caps stop rapid button clicks from stacking too many copies of the same sample. Per-bus caps keep a category from dominating the mixer.
+
+### RiffPlayOnce
+
+`RiffPlayOnce` checks if the same buffer is already active on the requested bus. If found, it returns the existing voice handle instead of starting another copy.
+
+This is the recommended path for:
+
+- background music
+- ambience loops
+- menu loops
+- persistent narration beds
 
 ## DSP Timer Callback
 
-`RiffTimerCallback` is the engine's heartbeat. It is called by the native thunk every 10 ms. Its job is to query how many audio frames WASAPI needs, synthesize that many frames by running the DSP pipeline across all active voices, and deliver the result to the hardware.
+`RiffTimerCallback` is the audio engine heartbeat. It is called periodically by the native thunk. Its job is to determine how many frames WASAPI can accept, render that many frames, and release them to the output device.
+
+### Callback Guards
+
+The callback exits immediately if any guard fails:
+
+```txt
+MagicCookie mismatch
+Engine not initialized
+Render client missing
+Audio client missing
+VBA in unsafe state
+No frames available
+Shutdown in progress
+```
+
+These guards reduce the chance of crashes during Office shutdown, VBE reset, breakpoint states, or stale timer calls.
+
+### Adaptive Buffering
+
+Riff tracks output padding and underrun risk. It changes its target queue size depending on stability.
+
+Typical behavior:
+
+```txt
+Normal:    low queue target for responsiveness
+Recovery:  higher queue target after underrun/stall risk
+Panic:     maximum safe target when padding gets dangerously low
+Recovery:  gradually returns to low latency after stable ticks
+```
+
+Diagnostics expose the current state:
+
+```vb
+Debug.Print RiffAdaptiveQueueMs
+Debug.Print RiffUnderrunCount
+Debug.Print RiffLastPaddingFrames
+Debug.Print RiffLastFramesAvailable
+Debug.Print RiffLastFramesWritten
+```
 
 ### WASAPI Buffer Acquisition
 
 ```mermaid
 graph TD
-    A["IAudioClient::GetCurrentPadding → padding"]
-    B["framesAvailable = BufferSize - padding"]
-    C{"framesAvailable > 0?"}
-    D["IAudioRenderClient::GetBuffer(framesAvailable) → pData"]
-    E["Run DSP pipeline, fill mix array"]
-    F["RtlMoveMemory(pData, mixArray, bytesToWrite)"]
-    G["IAudioRenderClient::ReleaseBuffer(framesAvailable, 0)"]
+    A["GetCurrentPadding"]
+    B["Compute queued frames"]
+    C["Compute adaptive target"]
+    D["Compute frames to write"]
+    E{"framesToWrite > 0?"}
+    F["IAudioRenderClient.GetBuffer"]
+    G["Render DSP into scratch mix"]
+    H["Apply master processing"]
+    I["Copy to WASAPI buffer"]
+    J["ReleaseBuffer"]
 
-    A --> B --> C
-    C -- Yes --> D --> E --> F --> G
-    C -- No --> H[Exit]
-
-    style D fill:#fff9c4,stroke:#f9a825
-    style E fill:#c8e6c9,stroke:#2e7d32
-    style G fill:#e1f5fe,stroke:#0277bd
+    A --> B --> C --> D --> E
+    E -- Yes --> F --> G --> H --> I --> J
+    E -- No --> K["Exit"]
 ```
-
-`GetCurrentPadding` returns the number of frames already queued in the hardware buffer that have not yet been played. Subtracting from `BufferSize` gives the number of frames Riff must write this tick. This pull-based model is standard WASAPI shared-mode operation.
 
 ### Voice Iteration
 
-The callback iterates over all 32 voice slots. For each slot where `Active = True`, `Playing = True`, and `Paused = False`, it extracts all DSP parameters from the voice struct into local variables before the inner sample loop begins. This is a deliberate optimization: accessing module-level UDT fields inside a tight `For` loop in VBA is slower than reading local `Single` variables, because each UDT field access goes through an additional indirection.
+The mixer iterates through the fixed voice pool. For each active, playing, non-paused voice, it pulls frequently used fields into local variables before the inner loop. This is important because module-level UDT field access is slower inside tight VBA loops.
 
 ### Source Reading and Pitch Shifting
 
-For buffer-backed voices, the callback reads ahead from the source buffer based on the current pitch multiplier:
+Buffer-backed voices read PCM from native memory. Pitch changes are implemented by changing how quickly the source position advances.
 
-```
-framesNeeded = Int(framesAvailable × pitch) + 2
-bytesNeeded  = framesNeeded × blockAlign
-```
-
-The `+ 2` guard leaves room for interpolation against the next stereo frame. The needed slice is copied from physical memory into reusable scratch arrays (`rSrcArr32`, `rSrcArrI32`, or `rSrcArr16`) via `RtlMoveMemory` before the per-frame loop. These arrays grow only when the current callback needs more capacity, then the active region is cleared and reused on later callbacks.
-
-Within the per-frame loop, playback advances by `srcIdx + pitch` on each frame and the buffer position advances by `ptchAlign = pitch × blockAlign`. The source sample index is computed as `Int(srcIdx) × 2` (for stereo interleaved pairs), while the fractional component is used for linear interpolation between adjacent frames. This keeps pitched playback continuous across timer callbacks.
-
-Loop boundaries are checked at the start of each frame:
-
-```
-If pos >= loopEnd Then
-    If Looping Then
-        pos = loopStart
-    Else
-        rVoices(i).Active = False
-        Exit For
-    End If
-End If
+```txt
+pitch = 1.0 -> normal
+pitch = 2.0 -> twice as fast, one octave up
+pitch = 0.5 -> half speed, one octave down
 ```
 
-### Oscillator Generation
+Riff uses interpolation where possible to avoid harsh stepping when pitch is not an integer ratio.
 
-For oscillator voices (`IsOscillator = True`), no buffer reading occurs. Instead, each frame computes a sample mathematically:
+Looping and seeking use byte offsets aligned to the output block size.
 
-| `OscType` | Waveform | Formula |
-|:---|:---|:---|
-| 0 | Sine | `Sin(OscPhase)` |
-| 1 | Square | `IIf(Phase < 0.5, 1.0, -1.0) + BLEP` |
-| 2 | Sawtooth | `(2.0 × Phase) - 1.0 - BLEP` |
-| 3 | White Noise | `(Rnd() × 2.0) - 1.0` |
-| 4 | Pink Noise | `Filtered White (Voss-McCartney)` |
-| 5 | Brown Noise | `Accumulated White (Integrator)` |
+### Oscillator and Noise Generation
 
-The phase advances by `oscStep = (PI2 × OscFreq) / SampleRate` per frame and wraps modulo `PI2`. The same value is written to both `fL` and `fR` before pan and width processing, producing a mono-center oscillator that can be spread with `RiffVoiceStereoWidth`.
+Oscillator voices generate audio mathematically:
 
-## DSP Pipeline
+| Type | Source |
+|:---|:---|
+| Sine | sinusoidal oscillator |
+| Square | band-limited square-style waveform |
+| Saw | band-limited saw-style waveform |
+| White noise | per-voice deterministic random source |
+| Pink noise | filtered noise state |
+| Brown noise | integrated low-heavy noise state |
+
+Per-voice noise state avoids relying on global `Rnd()` inside the audio path and makes simultaneous noise voices independent.
+
+## Per-Voice DSP Pipeline
 
 ### Stage Order
 
-Every active voice processes each frame through the following fixed-order pipeline. Stages with zero-valued mix or depth parameters are not fully skipped by conditional logic — each stage has its own `If` guard in the inner loop, so inactive stages cost one branch check per frame.
+The per-voice pipeline follows a predictable order:
 
 ```mermaid
 graph TD
-    A["Source Sample (fL, fR)"]
-    B["Sample Rate Reduction<br/>(Bitcrusher downsampler)"]
-    C["Bit Depth Reduction<br/>(Bitcrusher quantizer)"]
-    D["Distortion<br/>(multiply + hard clip)"]
-    E["Low-Pass Filter<br/>(biquad IIR)"]
-    F["High-Pass Filter<br/>(biquad IIR)"]
-    G["3-Band EQ<br/>(three cascaded biquads → bass/mid/treble)"]
-    H["Ring Modulator<br/>(sine oscillator × signal)"]
-    I["Tremolo<br/>(volume LFO)"]
-    J["Stereo Width<br/>(mid/side processing)"]
-    K["Flanger<br/>(short LFO-swept comb filter via ring buffer)"]
-    L["Chorus<br/>(modulated delay tap via ring buffer)"]
-    M["Delay / Echo<br/>(fixed delay tap with feedback via ring buffer)"]
-    N["Reverb<br/>(four-tap comb filter via ring buffer)"]
-    O["Ring Buffer Write<br/>(bufInL, bufInR → rRingBuf at dWrite)"]
-    P["Compressor<br/>(envelope follower + gain reduction)"]
-    Q["Auto-Pan<br/>(LFO-modulated pan)"]
-    R["Volume × Bus × Master × Fade"]
-    S["Mix Accumulation<br/>(add to mixArr)"]
+    A["Source sample"]
+    B["Smoothing updates"]
+    C["Sample-rate reduction"]
+    D["Bit-depth reduction"]
+    E["Distortion"]
+    F["Low-pass / High-pass"]
+    G["3-band EQ"]
+    H["Ring modulation"]
+    I["Tremolo"]
+    J["Stereo width"]
+    K["Flanger"]
+    L["Chorus"]
+    M["Delay"]
+    N["Reverb"]
+    O["Compressor"]
+    P["Auto-pan"]
+    Q["Voice volume / bus volume / master volume"]
+    R["Fade envelope"]
+    S["Bus peak and voice peak"]
+    T["Mix accumulation"]
 
-    A-->B-->C-->D-->E-->F-->G-->H-->I-->J-->K-->L-->M-->N-->O-->P-->Q-->R-->S
-
-    style A fill:#e1f5fe,stroke:#0277bd
-    style O fill:#f3e5f5,stroke:#7b1fa2
-    style S fill:#c8e6c9,stroke:#2e7d32
+    A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K --> L --> M --> N --> O --> P --> Q --> R --> S --> T
 ```
+
+Inactive stages are skipped by branch guards.
+
+### Smoothing
+
+Voice smoothing prevents clicks when changing volume, pan, or pitch.
+
+```vb
+RiffVoiceVolumeTo voice, 0.2, 500
+RiffVoicePanTo voice, -0.5, 150
+RiffVoicePitchTo voice, 1.2, 100
+```
+
+Internally, smoothing stores target values and per-frame or per-tick increments. The renderer moves the current value toward the target over the requested duration.
 
 ### Bitcrusher
 
-The bitcrusher runs in two independent sub-stages. Sample rate reduction comes first, implemented as a sample-hold:
+Bitcrusher has two parts:
 
-```
-If dsCount >= dsFactor Then
-    dsCount = 0
-    lastL = fL : lastR = fR   ' capture new sample
-Else
-    fL = lastL : fR = lastR   ' hold previous sample
-    dsCount = dsCount + 1
-End If
-```
+1. sample-rate reduction through sample hold
+2. bit-depth quantization
 
-Bit depth reduction follows, implemented as uniform scalar quantization:
-
-```
-fL = Int(fL × bdSteps) / bdSteps
-fR = Int(fR × bdSteps) / bdSteps
-```
-
-Where `bdSteps = 2 ^ bitDepth`. When `bdSteps = 0` (disabled), this stage is skipped.
+Sample-rate reduction holds a previously captured sample for multiple frames. Bit-depth reduction maps the continuous signal into fewer steps.
 
 ### Distortion
 
-Hard-clip distortion multiplies the signal by the distortion factor and then clamps:
-
-```
-fL = fL × dist
-If fL > 1.0 Then fL = 1.0
-If fL < -1.0 Then fL = -1.0
-```
-
-At `dist = 1.0` the signal is unchanged. At high values (e.g. `10.0`), nearly the entire waveform is clipped, producing a square-wave-like fuzz.
+Distortion multiplies the signal and clips/saturates it. Subtle values add warmth. Aggressive values produce fuzz or harsh clipping.
 
 ### Low-Pass and High-Pass Filters
 
-Both filters are implemented as Direct Form 1 biquad filters. A biquad filter uses two previous input samples and two previous output samples (the Z1 and Z2 state variables) to create a steep, resonant, or smooth cutoff depending on its Q factor.
-
-```
-fL = (fL × b0) + (Z1L × b1) + (Z2L × b2) - (Z1OutL × a1) - (Z2OutL × a2)
-```
-
-The filter state variables (`BqLowPassZ1L`, `BqLowPassZ2L`, etc.) are stored in the voice struct and persist across timer callback invocations. The coefficients (`a1`, `a2`, `b0`, `b1`, `b2`) are calculated per callback based on the normalized cutoff property and the engine's sample rate.
+Filters use persistent per-voice state. Low-pass darkens or muffles the sound. High-pass removes low frequency content.
 
 ### 3-Band EQ
 
-The EQ is implemented as three cascaded parametric biquad filters (a low shelf, a mid peaking filter, and a high shelf). Each band has its own independent per-voice state variables:
-
-```
-' Bass shelf at ~120 Hz
-fL = RiffBiquadProcess(fL, EqBassZ1L, EqBassZ2L, ...)
-
-' Mid peaking filter at ~1000 Hz
-fL = RiffBiquadProcess(fL, EqMidZ1L, EqMidZ2L, ...)
-
-' Treble shelf at ~6500 Hz
-fL = RiffBiquadProcess(fL, EqTrebleZ1L, EqTrebleZ2L, ...)
-```
-
-The EQ computation is guarded by a check that all three gain values equal exactly `1.0`, in which case the entire block is skipped:
-
-```
-If eqB <> 1.0 Or eqM <> 1.0 Or eqT <> 1.0 Then
-    ' ... Biquad cascaded EQ computation ...
-End If
-```
+The EQ stage provides bass, mid, and treble shaping. Neutral is `1.0` for each band. Values below `1.0` reduce a band, and values above `1.0` boost it.
 
 ### Ring Modulator
 
-The ring modulator multiplies the audio signal by a sine oscillator with frequency `RingModFreq`. A wet/dry blend is applied:
-
-```
-rmOsc = Sin(rmPhase)
-fL = fL × (1 - rmMix) + (fL × rmOsc) × rmMix
-```
-
-The phase advances by `rmStep = (PI2 × rmFreq) / SampleRate` per frame and wraps modulo `PI2`.
+Ring modulation multiplies the signal by an internal oscillator. It produces metallic, robotic, or sci-fi tones.
 
 ### Tremolo
 
-Tremolo modulates the output amplitude with a sine LFO. The LFO output is mapped to a range that avoids hard silence unless `TremoloDepth = 1.0`:
-
-```
-trmMult = 1 - TremoloDepth × (0.5 + 0.5 × Sin(trmPhase))
-fL = fL × trmMult
-```
-
-At `TremoloDepth = 0`, `trmMult = 1.0` (no modulation). At `TremoloDepth = 1.0`, `trmMult` oscillates between `0.0` and `1.0`.
+Tremolo modulates volume over time using an LFO. It is useful for alarms, pulses, old electric sounds, and ambience movement.
 
 ### Stereo Width
 
-Mid/side processing separates the signal into a center (mid) and difference (side) component, then scales the side component:
+Stereo width uses mid/side processing:
 
-```
-mid  = (fL + fR) × 0.5
-side = (fL - fR) × 0.5
-fL   = mid + side × StereoWidth
-fR   = mid - side × StereoWidth
-```
-
-At `StereoWidth = 1.0` the signal is unchanged. At `0.0` both channels become identical (mono). Values above `1.0` exaggerate the stereo field. This stage is guarded by `If sWidth <> 1.0`.
-
-### Ring Buffer Effects: Flanger, Chorus, Delay, Reverb
-
-All four time-based effects share the same ring buffer region for voice `i` (`rRingBuf(i × 192000)`) and the same write pointer `dWrite`. The write pointer advances by 2 each frame (one stereo pair) and wraps at 192,000.
-
-**Flanger** reads a tap at an LFO-swept short delay (2–7 ms) and mixes it back:
-
-```
-fDel = Int((0.002 + 0.005 × Sin(flgPhase)) × SampleRate) aligned to even
-fRd  = (dWrite - fDel + 192000) Mod 192000
-fL   = fL + rRingBuf(dBase + fRd) × flgDepth
+```txt
+width = 0.0 -> mono
+width = 1.0 -> unchanged
+width > 1.0 -> wider stereo
 ```
 
-The feedback path (`flgFB`) is added to `bufInL` before the ring buffer write.
+### Ring Buffer Effects
 
-**Chorus** reads a longer, slower-swept tap (20–25 ms) and blends it at a reduced dry level:
+Delay, reverb, chorus, and flanger share the per-voice ring buffer.
 
-```
-cDelay = Int((0.02 + 0.005 × Sin(cPhase)) × SampleRate) aligned to even
-fL     = fL × (1 - cDepth × 0.5) + rRingBuf(dBase + cRead) × cDepth
-```
-
-**Delay** reads a fixed tap at `dSamples = Int(DelayTime × SampleRate)` frames behind the write pointer. The feedback coefficient is added to `bufInL` before the ring buffer write:
-
-```
-dRead    = (dWrite - dSamples + 192000) Mod 192000
-fL       = fL + rRingBuf(dBase + dRead) × dMix
-bufInL   = bufInL + rRingBuf(dBase + dRead) × dFB
-```
-
-**Reverb** uses a four-tap comb filter. The tap delays are computed once at voice reset from the sample rate:
-
-```
-RevTap1 = Int(0.029 × SampleRate) aligned to even   ' ~29 ms
-RevTap2 = Int(0.043 × SampleRate) aligned to even   ' ~43 ms
-RevTap3 = Int(0.073 × SampleRate) aligned to even   ' ~73 ms
-RevTap4 = Int(0.097 × SampleRate) aligned to even   ' ~97 ms
-```
-
-The reverb output is the average of all four taps, and the feedback coefficient (`ReverbTime`) is added to `bufInL` before the ring buffer write:
-
-```
-revL   = (tap1L + tap2L + tap3L + tap4L) × 0.25
-fL     = fL + revL × rMix
-bufInL = bufInL + revL × rTime
-```
-
-Because all four effects write their feedback contributions to `bufInL` before the ring buffer write, the ring buffer at any given read position contains the mixed accumulation of the dry signal, delay feedback, flanger feedback, and reverb feedback from previous frames. The chorus does not contribute feedback.
+| Effect | Ring Buffer Use |
+|:---|:---|
+| Delay | fixed tap with feedback |
+| Reverb | multiple taps with feedback |
+| Chorus | modulated medium delay tap |
+| Flanger | short modulated comb tap |
 
 ### Compressor
 
-The compressor is an envelope follower-based gain processor. The envelope tracker has asymmetric time constants: fast attack (`0.01`) and slow release (`0.001`):
-
-```
-If peak > cmpEnv Then
-    cmpEnv = cmpEnv + 0.01  × (peak - cmpEnv)   ' attack
-Else
-    cmpEnv = cmpEnv + 0.001 × (peak - cmpEnv)   ' release
-End If
-```
-
-Gain reduction is applied only when `cmpEnv > cmpThresh`:
-
-```
-If cmpEnv > cmpThresh Then
-    cmpGain = (cmpThresh + (cmpEnv - cmpThresh) / cmpRatio) / cmpEnv
-    fL = fL × cmpGain
-    fR = fR × cmpGain
-End If
-```
-
-`CompEnv` persists in the voice struct across callback invocations, giving the envelope follower its memory. Setting `CompRatio = 1.0` disables the computation because the `If cmpRatio > 1.0` guard skips the entire block.
+The compressor uses an envelope follower and gain reduction. It smooths loud peaks and can make a voice feel more controlled.
 
 ### Auto-Pan and Final Gain
 
-Auto-Pan computes a time-varying pan offset added to the voice's static `Pan` property:
+Auto-pan modulates pan over time. Static pan and auto-pan combine into the final per-channel gain.
 
+Final gain includes:
+
+```txt
+voice volume × bus volume × master volume × fade
 ```
-curPan = Pan + Sin(apPhase) × apDepth
-curPan = Clamp(curPan, -1.0, 1.0)
-```
-
-The final per-channel gain is computed as:
-
-```
-vL = Volume × MasterVolume × BusVolume
-vR = Volume × MasterVolume × BusVolume
-
-If curPan > 0 Then vL = vL × (1 - curPan)   ' attenuate left
-If curPan < 0 Then vR = vR × (1 + curPan)   ' attenuate right
-```
-
-This is a linear panning law. No constant-power (equal-power) correction is applied.
 
 ### Fade Envelope
 
-The fade system uses a `fadeState` integer per voice: `0` = no fade, `1` = fade-in, `2` = fade-out. The multiplier is computed per frame:
-
-```
-' Fade-in
-fadeMult = FadeFramesCurrent / FadeFramesTotal
-
-' Fade-out
-fadeMult = 1 - (FadeFramesCurrent / FadeFramesTotal)
-```
-
-When a fade-out completes (`fadeCur >= fadeTot`), the voice is marked `Active = False` and `Playing = False` immediately at the frame boundary, causing the inner loop to exit and no further samples to be written for that voice.
+Fades are sample-based rather than callback-based. This makes fades smooth even when the timer period changes.
 
 ### Mix Accumulation
 
-After all gain stages, the final `fL` and `fR` values are accumulated into the shared mix array:
+Each processed voice adds its output into the shared mix scratch buffer. The final mix is then processed by the master stage and copied to WASAPI.
 
-```
-mixArr32(writeIdx)     = mixArr32(writeIdx)     + fL
-mixArr32(writeIdx + 1) = mixArr32(writeIdx + 1) + fR
+## Bus Architecture
+
+### Bus Gain, Mute, and Solo
+
+Each voice routes to one bus. The bus applies category-level gain and routing logic.
+
+If one or more buses are soloed, non-solo buses are muted. If no bus is soloed, all unmuted buses pass normally.
+
+### Bus Fades
+
+Bus fades smooth category volume changes:
+
+```vb
+RiffBusFadeTo RiffBusMusic, 0.25, 500
 ```
 
-For the 32-bit float path, accumulation happens in `Single` scratch buffers and is clamped to `[-1.0, 1.0]` before handing frames to WASAPI. For 32-bit PCM fallback, the same normalized mix is converted to signed 32-bit integers. For the 16-bit integer path, per-sample clamping to `[-32768, 32767]` is required during accumulation.
+This is useful for:
+
+- dialogue ducking
+- pause menus
+- scene transitions
+- cinematic emphasis
+
+### Persistent Bus Presets
+
+Persistent bus presets are a v1.0.9 feature.
+
+```vb
+RiffBusApplyPreset RiffBusMusic, RiffFxUnderwater, 0.55
+```
+
+By default, this does two things:
+
+1. applies the preset to currently active voices on that bus
+2. stores the preset so future voices routed to that bus inherit it
+
+This is especially useful in PowerPoint games and visual novels where new voices may be created by slide events after the scene state has already been set.
+
+### Bus Peak Metering
+
+Bus peaks are tracked independently from master peaks. This allows category-level visual meters and debugging.
+
+```vb
+RiffBusGetPeak RiffBusSfx, leftPeak, rightPeak
+```
+
+## Preset Architecture
+
+### Voice Presets
+
+Voice presets are recipes over the existing per-voice DSP properties. They do not introduce a separate effect engine; they configure the normal DSP pipeline.
+
+A preset typically performs:
+
+```txt
+clear or normalize voice DSP state
+clamp amount
+set filters/EQ/compression/modulation/time effects
+leave transport/routing intact
+```
+
+### Musical Preset Packs
+
+v1.0.9 adds expanded musical preset packs:
+
+| Pack Style | Presets |
+|:---|:---|
+| Warm/analog | `RiffFxWarmTape`, `RiffFxVHS`, `RiffFxLoFi` |
+| Dream/space | `RiffFxDreamPad`, `RiffFxSoftFocus`, `RiffFxAmbient` |
+| Device/speaker | `RiffFxTinySpeaker`, `RiffFxMegaphone`, `RiffFxRadio` |
+| Retro/game | `RiffFxGameBoy` |
+| Environment | `RiffFxWind`, `RiffFxRain`, `RiffFxDarkCave` |
+| Cinematic/horror | `RiffFxCinematicBoom`, `RiffFxHorrorDrone` |
+
+Because presets are just property assignments, they remain lightweight and composable with manual tweaks.
+
+### Bus Preset Application
+
+Bus presets use the same voice preset system internally. Applying a preset to a bus loops through active voices and applies the preset to matching voice slots.
+
+When persistent mode is enabled, the bus stores the preset id and amount. Future calls to `RiffPlay` or `RiffVoiceBus(...) = busID` can apply that stored preset automatically.
+
+## Master Bus Processors
+
+### Master Processor Stage
+
+After all voices are mixed, Riff can run a final master processor chain.
+
+Conceptual order:
+
+```txt
+mixed stereo frame
+-> master low-pass/high-pass
+-> master EQ
+-> master compressor
+-> master drive/saturation
+-> master stereo width
+-> output gain
+-> soft clip/safety limiting
+-> WASAPI buffer
+```
+
+The master stage is useful for final polish, not individual sound design.
+
+### Master Presets
+
+Master presets configure the master stage:
+
+| Preset | Purpose |
+|:---|:---|
+| `RiffMasterFxClean` | reset/neutral |
+| `RiffMasterFxGlue` | cohesive compression |
+| `RiffMasterFxWarm` | warm tone |
+| `RiffMasterFxBright` | brighter output |
+| `RiffMasterFxDark` | darker output |
+| `RiffMasterFxRadio` | global band-limited tone |
+| `RiffMasterFxCinematic` | wider, fuller mix |
+| `RiffMasterFxNight` | softer night mix |
+| `RiffMasterFxSoftLimiter` | safety limiting |
+
+### Soft Clipping and Safety Limiting
+
+The soft clipper is designed to reduce harsh digital clipping when multiple voices overlap. It is not a mastering limiter, but it is a practical safety layer for Office games and presentations with bursty SFX.
+
+```vb
+RiffSoftClipEnabled = True
+RiffMasterApplyPreset RiffMasterFxSoftLimiter, 0.7
+```
 
 ## Output Paths
 
-After all voices are processed, the mix array is delivered to WASAPI via `RtlMoveMemory` from the VBA array's memory directly to the pointer returned by `GetBuffer`. No intermediate copy is made.
+### 32-Bit Float Path
 
-### 32-Bit Float Path (Modern Hardware)
+Modern shared-mode devices commonly use float output. In this mode, Riff mixes into `Single` scratch arrays and copies float frames to WASAPI.
 
-For devices reporting `wBitsPerSample = 32`, Riff uses reusable scratch arrays:
+### 32-Bit PCM Path
 
-```vb
-RiffEnsureSingleScratch rMixArr32, rMixArr32Cap, sampleCount32
-RiffClearSingleScratch rMixArr32, sampleCount32
+If a device uses 32-bit PCM, Riff converts normalized float mix values to signed 32-bit integer samples before writing them.
+
+### 16-Bit PCM Path
+
+For 16-bit output, Riff converts normalized float values to signed 16-bit samples and clamps to the valid range.
+
+```txt
+-1.0 -> -32768
+ 0.0 -> 0
+ 1.0 -> 32767
 ```
 
-All DSP arithmetic runs in single-precision floating point natively. At the end of the callback, the active region of the mix buffer is copied to WASAPI as float32 or converted to PCM32 when the fallback mix format requires it.
+## Peak Metering and Diagnostics
 
-### 16-Bit Integer Path (Legacy Hardware)
+Riff tracks peak meters and render diagnostics.
 
-For devices reporting `wBitsPerSample = 16`, Riff reuses an `Integer` scratch array and accumulates each voice's contribution after scaling and clamping:
-
-```vb
-l1 = CLng(rMixArr16(writeIdx)) + CLng(fL × 32767.0)
-If l1 > 32767  Then l1 = 32767
-If l1 < -32768 Then l1 = -32768
-rMixArr16(writeIdx) = CInt(l1)
-```
-
-The scale factor `32767.0` maps the normalized `[-1.0, 1.0]` float range to the signed 16-bit integer range. Accumulation uses `Long` intermediates to avoid integer overflow during addition of multiple voices.
-
-## Peak Metering
-
-Peak values are tracked at two levels. Per-voice peaks (`PeakL`, `PeakR`) are updated inside the inner frame loop after final gain application. Master peaks (`MasterPeakL`, `MasterPeakR`) are updated during mix accumulation.
-
-Both levels use the same decay pattern. At the start of each timer callback, existing peak values are multiplied by `0.9`:
+Common diagnostics:
 
 ```vb
-rCtx.MasterPeakL = rCtx.MasterPeakL × 0.9
-rVoices(i).PeakL = rVoices(i).PeakL × 0.9
+RiffAdaptiveQueueMs
+RiffUnderrunCount
+RiffLastPaddingFrames
+RiffLastFramesAvailable
+RiffLastFramesWritten
+RiffActiveVoiceCount()
+RiffBufferVoiceCount(bufferHandle, busID)
+RiffBusVoiceCount(busID)
 ```
 
-During frame processing, if the current frame's absolute amplitude exceeds the decayed peak, the peak is updated. This gives a fast-attack, gradual-release meter behavior. At 10 ms callback intervals, the master peak reaches half its value after approximately `log(0.5) / log(0.9) ≈ 6.6` callbacks, or ~66 ms.
+Peak metering exists at:
 
-## Audio Buses
+- voice level
+- bus level
+- master level
 
-Audio buses provide a mechanism for global gain control and logical signal routing. Riff implements 16 independent buses (`rCtx.Buses(0 To 15)`), each serving as a destination for one or more playback voices.
+Peaks decay over time for meter-like behavior.
 
-### Signal Flow Arithmetic
-The engine uses a non-destructive, multiplicative gain stage. The final amplitude of a sample processed through the mixer is calculated as:
+## Loop, Seek, and Fade Systems
 
-`Final Sample = Input × Voice Volume × Bus Volume × Master Volume`
+Loop and seek use byte offsets aligned to the output block size. This prevents positions from landing in the middle of a stereo frame.
 
-This hierarchy allows for granular control at the source (Voice), group control at the mixer (Bus), and hardware-level control (Master) without altering the state of unrelated audio paths.
-
-### Mixing and Routing
-The sixteen buses are simple `Single` scalars initialized to `1.0` (unity gain). There is no bus-level DSP processing or cross-bus routing; buses are optimized purely for fast gain multiplication within the inner render loop.
-
-Each voice's `busID` field is evaluated on every timer callback. Modifying a bus volume via `RiffBusVolume(busID) = value` or `RiffBusFadeTo` updates the corresponding scalar in `rCtx.Buses`, taking effect on the very next render tick with no additional latency.
-
-## Loop and Seek
-
-Loop boundaries (`loopStart`, `loopEnd`) are stored as byte offsets into the PCM buffer rather than as sample indices or seconds. This is because the inner loop position variable `pos` is also a byte offset, making boundary comparisons a direct numeric comparison with no conversion.
-
-`RiffSetLoopRegionSec` converts seconds to byte offsets using `AvgBytesPerSec`, then aligns the result to `nBlockAlign` (the size of one stereo sample pair in bytes) to prevent the position from drifting to a mid-frame byte offset:
-
-```vb
-sByte = Int(startSec × AvgBytesPerSec)
-sByte = (CLng(sByte) \ align) × align
-```
-
-Similarly, `RiffVoicePositionSec` on the write path converts seconds to bytes and aligns to block boundaries. On the read path it divides the current byte position by `AvgBytesPerSec`. Both paths assume constant bitrate, which is always the case for raw PCM buffers stored after Media Foundation decoding.
-
-## Fade System
-
-`RiffFadeIn` and `RiffFadeOut` convert a duration in seconds to a frame count by multiplying by `SampleRate`:
-
-```vb
-FadeFramesTotal = CLng(durationSec × rCtx.SampleRate)
-FadeFramesCurrent = 0
-fadeState = 1  ' or 2
-```
-
-The fade is computed per frame inside the inner DSP loop, not per callback. This gives sample-accurate fades regardless of the WASAPI buffer size or the 10 ms timer period. For example, a 3-second fade at 48 kHz results in 144,000 frame-level multiplier steps, each incrementing by `1 / 144,000 ≈ 6.94e-6` per frame.
+Fades use frame-based progress and are evaluated in the render loop. A fade-out marks a voice inactive when complete.
 
 ## COM VTable Dispatch
 
-All COM method calls in Riff go through `vCall`, a private variadic function that wraps `DispCallFunc` from `oleaut32.dll`:
+Riff calls COM interfaces through VTable dispatch. The general helper uses `DispCallFunc`, and hot decode paths can use specialized call helpers or prebuilt argument arrays to reduce repeated overhead.
 
-```vb
-Private Function vCall(ByVal pUnk As LongPtr, ByVal vTableIndex As Long, _
-                       ParamArray args() As Variant) As Long
+Key COM areas:
+
+- WASAPI interfaces
+- Media Foundation source readers
+- media samples and buffers
+- `IUnknown::Release`
+
+The dispatch system must respect pointer size:
+
+```txt
+x86 vtable stride = 4 bytes
+x64 vtable stride = 8 bytes
 ```
-
-`DispCallFunc` is a documented OLE Automation API that invokes a function at a given offset from a pointer, using a given calling convention and argument type list. Riff uses it with `CC_STDCALL = 4` and `vtReturn = vbLong` for all COM interface methods, which matches the `HRESULT STDMETHODCALLTYPE` signature of every WASAPI and Media Foundation method.
-
-The VTable offset is computed as:
-
-```
-offset = vTableIndex × pointerSize
-```
-
-Where `pointerSize` is 8 on Win64 and 4 on Win32. VTable index 2 is always `IUnknown::Release`, index 3 is the first interface-specific method (since index 0 is `QueryInterface` and index 1 is `AddRef`).
-
-`CoreProcessSourceReader` bypasses `vCall` for the hot ReadSample loop and calls `DispCallFunc` directly with pre-built argument arrays to avoid variadic `ParamArray` overhead on every sample read iteration.
 
 ## Platform Compatibility
 
-| Feature | 32-bit VBA (Office x86) | 64-bit VBA (Office x64) |
+| Feature | 32-bit VBA | 64-bit VBA |
 |:---|:---|:---|
 | Pointer type | `Long` | `LongPtr` |
-| VTable offset stride | 4 bytes | 8 bytes |
-| Thunk opcodes | 32-bit `stdcall` push/ret sequence | 64-bit ABI with RSP alignment |
-| `LongLong` for WASAPI durations | Simulated via `Currency` | Native `LongLong` |
-| 64-bit REFERENCE_TIME | `Currency` (`CCur(100)` → 100 × 10,000 = 1,000,000 in 100 ns units) | `CLngLng(1000000)` (100 ns units) |
+| VTable stride | 4 bytes | 8 bytes |
+| Thunk | 32-bit stdcall | 64-bit Windows ABI |
+| WASAPI duration | Currency surrogate | LongLong |
+| Memory API | 32-bit pointers | 64-bit pointers |
 
-The `REFERENCE_TIME` values passed to `IAudioClient::Initialize` differ by architecture. On Win64, the 100 ms buffer duration is `1,000,000` in 100-nanosecond units. On Win32, `Currency` is used as a surrogate for 64-bit integers: the value `CCur(100)` represents `1,000,000` because `Currency` has an implicit 10,000× scaling factor.
+The source uses conditional compilation to keep the same `.bas` working on both Office x86 and Office x64.
 
 ## Memory Layout
 
-```
-Module-level allocations:
+Approximate fixed allocations:
 
-  rCtx:           1 × RiffContext UDT (~512 bytes, stack-allocated in module)
-  rVoices:        32 × RiffVoice UDT (~3 KB each, ~96 KB total)
-  rRingBuf:       32 × 192,000 × 4 bytes = 24,576,000 bytes (~23.4 MB, heap via VBA ReDim)
-
-  Per loaded buffer (VirtualAlloc, physical pages):
-    BufferPtr:    variable (raw PCM size, e.g. ~10 MB for a 1 min 44.1kHz stereo WAV)
-
-  Thunk:          1 KB VirtualAlloc'd executable page
-
-  Total fixed overhead: ~23.5 MB + loaded audio data
+```txt
+RiffContext       module-level UDT
+RiffVoice pool    32 voice UDTs
+RiffBuffer pool   64 buffer slots
+Ring buffer       large Single() array shared by time effects
+Scratch arrays    reused render/decode buffers
+Thunk memory      executable VirtualAlloc page
+Loaded buffers    VirtualAlloc PCM blocks
 ```
 
-> [!NOTE]
-> The 23.4 MB ring buffer is the dominant fixed allocation. It is present regardless of how many voices or buffers are active. If memory pressure is a concern, the ring buffer size per voice can be reduced by changing the `192000` constant, which trades maximum delay/reverb time for lower memory usage.
+The largest fixed allocation is usually the per-voice ring buffer. The largest variable allocation is decoded audio data.
 
 ## Shutdown Sequence
 
-`RiffClose` executes the inverse of `RiffOpen` in safe order:
+`RiffClose` shuts down in a defensive order:
 
 ```mermaid
 graph TD
-    A[RiffClose]
-    B["Clear MagicCookie → thunk guard fires on next tick"]
-    C["KillTimer → stop 15ms callbacks"]
-    D["timeEndPeriod 1 → restore timer resolution"]
-    E["Deactivate all voices (Active = False for 0..31)"]
-    F["RiffUnload each active buffer (VirtualFree BufferPtr)"]
-    G["Erase rRingBuf → release VBA heap"]
-    H["ReleaseWASAPI<br/>Release RenderClient → Stop + Release AudioClient → Release Device → Release DeviceEnumerator → CoTaskMemFree MixFormatPtr"]
-    I["MFShutdown"]
-    J["FreeThunks → VirtualFree ThunkTimerCB"]
-    K["Initialized = False"]
+    A["RiffClose"]
+    B["Set closing state"]
+    C["Clear MagicCookie"]
+    D["Kill render timer"]
+    E["Stop WASAPI client"]
+    F["Deactivate voices"]
+    G["Unload buffers"]
+    H["Erase ring/scratch buffers"]
+    I["Release WASAPI COM interfaces"]
+    J["MFShutdown"]
+    K["Free thunk memory"]
+    L["Clear context"]
 
-    A-->B-->C-->D-->E-->F-->G-->H-->I-->J-->K
-
-    style A fill:#e1f5fe,stroke:#0277bd
-    style B fill:#ffcdd2,stroke:#c62828
-    style K fill:#c8e6c9,stroke:#2e7d32
+    A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K --> L
 ```
 
-Clearing `MagicCookie` before calling `KillTimer` is intentional. There is a narrow race window between the last timer callback check and `KillTimer` completing on the Windows side. If a stale callback fires in that window, it will read `MagicCookie = 0`, fail the guard check at the first line of `RiffTimerCallback`, and exit immediately without touching any partially-released state.
+Clearing `MagicCookie` before releasing resources is intentional. If a stale timer callback fires during shutdown, it exits before touching partially released state.
+
+## Known Architectural Boundaries
+
+Riff is intentionally ambitious for a pure VBA engine, but it still runs inside Office. Important boundaries:
+
+| Boundary | Impact |
+|:---|:---|
+| Office is not a real-time host | Severe host stalls can still affect timing. |
+| Audio render runs through VBA callback path | Safer than raw VBA threads, but not equivalent to a native audio thread. |
+| Media Foundation decode is synchronous | Large MP3/OGG files can still take time to load. |
+| Per-voice DSP costs CPU | Many voices with heavy effects can become expensive. |
+| Shared-mode WASAPI adds system mixing latency | Good compatibility, not exclusive-mode ultra-low latency. |
+
+The current design favors maximum deployability and practical power in Office. A future optional native backend could improve decoding speed or render isolation, but the v1.0.9 architecture remains fully usable as a single-file `.bas` module.
