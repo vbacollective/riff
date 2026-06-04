@@ -6,13 +6,13 @@
 
 <p align="center">
   <b>A high-performance, single-file audio engine for Microsoft Office.</b><br/>
-  Real-time WASAPI playback, Media Foundation decoding, Studio DSP, adaptive buffering, and BLEP synthesis.
+  Real-time WASAPI playback, Media Foundation decoding, Studio DSP, adaptive buffering, musical presets, and master bus processing.
 </p>
 
 <p align="center">
   <img src="https://github.com/vbacollective/riff/actions/workflows/ci.yml/badge.svg" alt="CI" />
   <img src="https://github.com/vbacollective/riff/actions/workflows/release-assets.yml/badge.svg" alt="Release" />
-  <img src="https://img.shields.io/badge/version-v1.0.8-blue.svg" alt="Version" />
+  <img src="https://img.shields.io/badge/version-v1.0.9-blue.svg" alt="Version" />
   <img src="https://img.shields.io/badge/language-VBA-867DB1.svg" alt="Language" />
   <img src="https://img.shields.io/badge/platform-Windows-0078D6.svg" alt="Platform" />
   <img src="https://img.shields.io/badge/arch-32%20%26%2064--bit-green.svg" alt="Architecture" />
@@ -23,11 +23,11 @@
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License" />
 </p>
 
-**Riff** is a complete, production-grade audio engine contained within a single `.bas` module. It allows VBA developers to integrate professional-quality audio playback, synthesis, routing, and DSP into Microsoft Office applications without external DLLs, ActiveX controls, installers, or additional references.
+**Riff** is a complete, production-grade audio engine contained within a single `.bas` module. It allows VBA developers to integrate professional-quality audio playback, synthesis, routing, DSP, effect presets, and final mix processing into Microsoft Office applications without external DLLs, ActiveX controls, installers, or additional references.
 
 Whether you are building interactive dashboards in Excel, immersive presentations in PowerPoint, educational tools in Word, or automation systems in Access, Riff provides a practical real-time audio layer powered by the Windows Audio Session API (WASAPI), Media Foundation, and a native timer-driven DSP loop.
 
-Riff is designed for developers who want game-like audio behavior inside Office: responsive UI sounds, background music, routed buses, soft limiting, fades, presets, procedural oscillators, noise generation, and safe cleanup when the host application closes.
+Riff is designed for developers who want game-like audio behavior inside Office: responsive UI sounds, background music, routed buses, persistent scene effects, master bus processing, soft limiting, fades, procedural oscillators, white/pink/brown noise, and safe cleanup when the host application closes.
 
 ## Key Capabilities
 
@@ -36,19 +36,21 @@ Riff is designed for developers who want game-like audio behavior inside Office:
 - **WASAPI Playback:** Shared-mode Windows audio output with low-latency rendering.
 - **Media Foundation Decoding:** Loads common formats supported by the system, including WAV, MP3, AAC, FLAC, WMA, and more.
 - **WAV Fast Path:** Compatible WAV files bypass Media Foundation and load through a direct RIFF parser for much faster startup.
-- **Unified Playback API:** `RiffPlay` now accepts bus, loop, volume, and pan parameters directly.
+- **Unified Playback API:** `RiffPlay` accepts bus, loop, volume, and pan parameters directly.
 - **Duplicate Prevention:** `RiffPlayOnce` prevents music or repeated ambience from stacking accidentally.
 - **Adaptive Buffering:** Dynamically increases render queue safety during host stalls and returns to low latency when stable.
 - **Burst Protection:** Voice stealing, per-buffer caps, and per-bus caps reduce stutter when many SFX are triggered rapidly.
 - **Studio DSP Pipeline:** Independent per-voice effects including Reverb, Delay, Chorus, Flanger, Compressor, EQ, Filters, Distortion, Bitcrusher, Ring Modulation, Tremolo, Auto-Pan, and Stereo Width.
-- **Effect Presets:** Ready-to-use presets such as Lo-Fi, Radio, Underwater, Echo, Small Room, Hall, Cathedral, Telephone, and more.
+- **Musical Preset Packs:** Expanded voice presets for tape, VHS, dream pads, caves, tiny speakers, megaphones, retro game effects, wind, rain, horror drones, cinematic booms, and soft-focus scenes.
+- **Persistent Bus Effects:** Apply a preset to a whole bus so current and future voices inherit the scene style automatically.
+- **Master Bus Processors:** Final mix chain with low-pass, high-pass, 3-band EQ, compressor, drive, stereo width, output gain, soft clipping, and master presets.
 - **Real-Time Synthesis:** BLEP-corrected oscillators for sine, square, and saw waveforms.
 - **Noise Generation:** White, pink, and brown noise for procedural ambience, wind, rain, static, rumble, and retro effects.
 - **Audio Routing:** 16 global buses for Music, SFX, UI, Voice, and auxiliary groups.
 - **Mixer Controls:** Bus volume, mute, solo, fades, peak meters, and master peak monitoring.
 - **Smoothing:** Volume, pan, and pitch smoothing reduce clicks during parameter changes.
 - **Soft Clipping:** Master soft clipper helps prevent harsh digital clipping when many voices overlap.
-- **Diagnostics:** Render counters, underrun counters, clipping counters, buffer status, and adaptive queue information.
+- **Diagnostics:** Render counters, underrun counters, clipping counters, buffer status, active voice counts, and adaptive queue information.
 - **WAV Export:** Export loaded buffers and generated oscillators as standard PCM WAV files.
 - **Architecture Aware:** Compatible with both 32-bit and 64-bit Office through `#If VBA7` / `#If Win64` declarations.
 
@@ -115,7 +117,7 @@ End Sub
 
 ### Load Assets Once
 
-Audio loading is synchronous. Load your assets during startup, not during gameplay or button-spam interactions.
+Audio loading is synchronous. Load your assets during startup, not during gameplay, animation ticks, or button-spam interactions.
 
 ```vb
 Private sndClick As Long
@@ -161,7 +163,7 @@ End Sub
 
 Public Sub StopMusic()
     If RiffVoiceActive(musicVoice) Then
-        RiffVoiceFadeTo musicVoice, 0, 500
+        RiffFadeOut musicVoice, 0.5
     End If
 End Sub
 ```
@@ -188,8 +190,8 @@ Public Sub PlayRainLayer()
 
     If v >= 0 Then
         RiffVoiceLoop(v) = True
-        RiffVoiceLowPass(v) = 0.55
-        RiffVoiceReverbMix(v) = 0.2
+        RiffVoiceApplyPreset v, RiffFxRain, 0.65
+        RiffVoiceStereoWidth(v) = 1.35
     End If
 End Sub
 ```
@@ -198,14 +200,14 @@ End Sub
 
 Riff supports logical summing through 16 independent audio buses. Buses allow you to group related sounds, such as Music, SFX, UI, Voice, or Ambience, and control them as a single unit.
 
-This is more efficient and cleaner than iterating through active voices manually. It also enables mixer-like behavior such as lowering music during dialogue, muting UI sounds, soloing a bus for debugging, or fading whole categories.
+This is more efficient and cleaner than iterating through active voices manually. It also enables mixer-like behavior such as lowering music during dialogue, muting UI sounds, soloing a bus for debugging, fading whole categories, or applying scene-wide effects.
 
 ### Signal Hierarchy
 
 The final volume of a sound is determined by:
 
 ```text
-Master Volume × Bus Volume × Voice Volume × Fade/Smoothing
+Master Volume × Bus Volume × Voice Volume × Fade/Smoothing × Master Processing
 ```
 
 ```vb
@@ -317,7 +319,7 @@ RiffPlayOscillatorBus waveType, frequencyHz, busID
 RiffPlayNoiseBus noiseType, busID
 ```
 
-They now forward internally to the unified playback path.
+They forward internally to the unified playback path.
 
 ## Effect Presets
 
@@ -327,10 +329,10 @@ Presets provide fast, musical starting points for common sound design situations
 RiffVoiceApplyPreset voice, RiffFxLoFi, 0.55
 RiffVoiceApplyPreset voice, RiffFxRadio, 0.6
 RiffVoiceApplyPreset voice, RiffFxUnderwater, 0.7
-RiffVoiceApplyPreset voice, RiffFxSmallRoom, 0.4
+RiffVoiceApplyPreset voice, RiffFxWarmTape, 0.5
 ```
 
-### Typical Presets
+### Core Presets
 
 | Preset | Use Case |
 |:---|:---|
@@ -341,20 +343,129 @@ RiffVoiceApplyPreset voice, RiffFxSmallRoom, 0.4
 | `RiffFxEcho` | Musical delay/echo effect. |
 | `RiffFxLoFi` | Tape/sampler-style degradation without destroying the sound. |
 | `RiffFxRadio` | Band-limited radio or speaker effect. |
-| `RiffFxTelephone` | Narrow voice effect. |
 | `RiffFxUnderwater` | Muffled filtered sound with movement. |
 | `RiffFxRobot` | Ring-modulated robotic coloration. |
 | `RiffFxWide` | Enhanced stereo width. |
-| `RiffFxMono` | Mono collapse for compatibility or retro effects. |
+| `RiffFxAmbient` | Spacious ambience for beds and pads. |
+
+### Musical Preset Packs
+
+| Preset | Use Case |
+|:---|:---|
+| `RiffFxWarmTape` | Warm tape-like coloration for music, ambience, or narration. |
+| `RiffFxVHS` | Warbly degraded old-media sound. |
+| `RiffFxDreamPad` | Wide, soft chorus/reverb for dream scenes and pads. |
+| `RiffFxDarkCave` | Dark, deep, cave-like space. |
+| `RiffFxTinySpeaker` | Phone, toy speaker, laptop, or small radio tone. |
+| `RiffFxMegaphone` | PA, announcement, or projected voice tone. |
+| `RiffFxGameBoy` | Crunchy retro handheld game color. |
+| `RiffFxHorrorDrone` | Dark modulated unsettling texture. |
+| `RiffFxWind` | Airy filtered wind/noise treatment. |
+| `RiffFxRain` | Soft natural noise ambience. |
+| `RiffFxCinematicBoom` | Big low-heavy impact treatment. |
+| `RiffFxSoftFocus` | Gentle smoothing and width. |
 
 ### Preset Amount
 
 `amount` usually ranges from `0.0` to `1.0`.
 
 ```vb
-RiffVoiceApplyPreset v, RiffFxLoFi, 0.3  ' light coloration
-RiffVoiceApplyPreset v, RiffFxLoFi, 0.8  ' stronger effect
-RiffVoiceApplyPreset v, RiffFxDry, 1.0   ' clear preset-style coloration
+RiffVoiceApplyPreset v, RiffFxWarmTape, 0.3  ' light coloration
+RiffVoiceApplyPreset v, RiffFxWarmTape, 0.7  ' stronger effect
+RiffVoiceApplyPreset v, RiffFxDry, 1.0       ' clear preset-style coloration
+```
+
+## Persistent Bus Effects
+
+v1.0.9 can apply voice presets to a whole bus. This is useful for scene-wide states such as underwater, cave, radio, dream, horror, or retro menus.
+
+By default, `RiffBusApplyPreset` affects currently active voices and stores the preset for future voices routed to that bus.
+
+```vb
+Public Sub EnterUnderwaterScene()
+    RiffBusApplyPreset RiffBusMusic, RiffFxUnderwater, 0.55
+    RiffBusApplyPreset RiffBusSfx, RiffFxUnderwater, 0.8
+    RiffBusApplyPreset RiffBusVoice, RiffFxUnderwater, 0.45
+End Sub
+
+Public Sub LeaveUnderwaterScene()
+    RiffBusClearEffects RiffBusMusic
+    RiffBusClearEffects RiffBusSfx
+    RiffBusClearEffects RiffBusVoice
+End Sub
+```
+
+Apply only to future voices:
+
+```vb
+RiffBusApplyPreset RiffBusVoice, RiffFxRadio, 0.65, True, False
+```
+
+Apply only to currently active voices:
+
+```vb
+RiffBusApplyPreset RiffBusSfx, RiffFxSmallRoom, 0.4, False, True
+```
+
+Inspect bus preset state:
+
+```vb
+Debug.Print RiffBusPresetEnabled(RiffBusMusic)
+Debug.Print RiffBusPreset(RiffBusMusic)
+Debug.Print RiffBusPresetAmount(RiffBusMusic)
+```
+
+## Master Bus Processors
+
+Master processors run after the full voice/bus mix. They are intended for final polish, safety limiting, and broad scene coloration.
+
+```vb
+RiffMasterApplyPreset RiffMasterFxGlue, 0.7
+RiffMasterApplyPreset RiffMasterFxCinematic, 0.6
+```
+
+### Master Presets
+
+| Preset | Use Case |
+|:---|:---|
+| `RiffMasterFxClean` | Neutral master stage. |
+| `RiffMasterFxGlue` | Light compression and soft limiting for a cohesive mix. |
+| `RiffMasterFxWarm` | Warmer tone and subtle saturation. |
+| `RiffMasterFxBright` | Brighter overall mix. |
+| `RiffMasterFxDark` | Darker and softer output. |
+| `RiffMasterFxRadio` | Global radio/band-limited sound. |
+| `RiffMasterFxCinematic` | Wider, fuller, slightly compressed cinematic shaping. |
+| `RiffMasterFxNight` | Softer, lower-energy night mix. |
+| `RiffMasterFxSoftLimiter` | Safety limiting for SFX-heavy scenes. |
+
+### Manual Master Chain
+
+```vb
+Public Sub ApplyManualMasterChain()
+    RiffMasterProcessorEnabled = True
+
+    RiffMasterLowPass = 0.92
+    RiffMasterHighPass = 0.02
+
+    RiffMasterEqBass = 1.08
+    RiffMasterEqMid = 1
+    RiffMasterEqTreble = 0.95
+
+    RiffMasterCompressorThreshold = 0.72
+    RiffMasterCompressorRatio = 2.5
+
+    RiffMasterDrive = 1.06
+    RiffMasterStereoWidth = 1.1
+    RiffMasterOutputGain = 0.96
+    RiffSoftClipEnabled = True
+End Sub
+```
+
+Clear master processing:
+
+```vb
+RiffMasterClearProcessors
+RiffMasterApplyPreset RiffMasterFxClean
 ```
 
 ## Manual DSP Helpers
@@ -401,7 +512,7 @@ RiffPlayNoise RiffWavePinkNoise, RiffBusSfx, 0.08, 0
 
 ## WAV Fast Path
 
-`RiffLoad` now attempts a direct WAV fast path before falling back to Media Foundation.
+`RiffLoad` attempts a direct WAV fast path before falling back to Media Foundation.
 
 When possible, compatible WAV files are parsed directly by Riff:
 
@@ -434,7 +545,7 @@ If the WAV format is unsupported by the fast path, Riff automatically falls back
 
 Office hosts can occasionally stall when switching tabs, opening menus, recalculating, rendering slides, or interacting with the VBA editor. Because Riff is implemented in pure VBA with a native callback bridge, those stalls can affect how often the render loop gets serviced.
 
-Riff v1.0.8 includes adaptive buffering to reduce audible dropouts:
+Riff includes adaptive buffering to reduce audible dropouts:
 
 ```text
 Normal state:
@@ -496,8 +607,10 @@ RiffMaxVoicesPerBus = 16
 | **Core** | Single `.bas`, 32 voices, 64 buffers, 16 buses, x86/x64 support |
 | **I/O** | Media Foundation decoding, in-memory loading, WAV fast path, WAV export |
 | **Playback** | Unified `RiffPlay`, `RiffPlayOnce`, seeking, looping, fades, stop/reset behavior |
-| **Routing** | Bus volume, mute, solo, fade, peak meters, master volume |
+| **Routing** | Bus volume, mute, solo, fade, peak meters, persistent bus presets, master volume |
 | **Stability** | Adaptive buffering, burst protection, voice stealing, cleanup safeguards |
+| **Presets** | Core FX presets, musical preset packs, persistent bus effects, master presets |
+| **Master Processing** | Soft clip, low-pass, high-pass, 3-band EQ, compressor, drive, stereo width, output gain |
 | **Synthesis** | BLEP sine/square/saw, white noise, pink noise, brown noise |
 | **Dynamics** | Compressor, soft clipping, distortion, bitcrusher |
 | **Spatial** | Reverb, delay, stereo width, pan, auto-pan |
@@ -506,37 +619,28 @@ RiffMaxVoicesPerBus = 16
 | **Diagnostics** | Underruns, render errors, clipped samples, buffer state, active voices |
 | **Export** | Loaded buffer export and oscillator render to PCM WAV |
 
-## v1.0.8 Highlights
+## v1.0.9 Highlights
 
-- Unified playback API with bus, loop, volume, and pan parameters.
-- Added `RiffPlayOnce` for duplicate-safe music and ambience.
-- Reworked bus system with volume, mute, solo, fades, and peak meters.
-- Added polished FX presets and helper APIs.
-- Added white, pink, and brown noise.
-- Improved noise generation with deterministic per-voice RNG.
-- Added smoothing for voice volume, pan, and pitch.
-- Added master soft clipper to reduce harsh clipping.
-- Added adaptive buffering for better stability when Office or Windows stalls.
-- Added render diagnostics, underrun counters, clipping counters, and queue stats.
-- Added WAV fast path for faster `RiffLoad` on compatible WAV assets.
-- Optimized decode-path vtable calls.
-- Fixed decode buffer growth failure handling.
-- Improved stop behavior with WASAPI reset for more responsive stopping.
-- Added timer suspend/wake and safer cleanup behavior.
-- Added voice stealing and burst limits for rapid SFX triggering.
-- Preserved compatibility wrappers for older API calls.
+- Added expanded musical voice preset packs.
+- Added persistent bus presets for current and future voices.
+- Added master bus processors.
+- Added master presets for glue, warm, bright, dark, radio, cinematic, night, and soft-limiter mixes.
+- Added manual master controls for filters, EQ, compression, drive, stereo width, output gain, and soft clipping.
+- Improved scene-level workflows for underwater, cave, dream, horror, retro, radio, and cinematic states.
+- Preserved the unified playback API and compatibility wrappers from v1.0.8.
+- Preserved adaptive buffering, burst safety, noise generation, WAV fast path, and diagnostics.
 
 ## Documentation
 
 - [**API Reference**](docs/API_REFERENCE.md) – Detailed guide to every function, property, enum, and practical pattern.
 - [**Architecture**](docs/ARCHITECTURE.md) – Deep dive into WASAPI, Media Foundation, thunks, callback flow, buffers, and DSP.
-- [**Effect Cookbook**](docs/EFFECT_COOKBOOK.md) – Ready-to-use recipes for radio voices, underwater states, ambience, retro effects, and more.
+- [**Effect Cookbook**](docs/EFFECT_COOKBOOK.md) – Ready-to-use recipes for voice presets, bus scenes, master processing, ambience, retro effects, and more.
 - [**Troubleshooting**](docs/TROUBLESHOOTING.md) – Fixes for initialization, device, stutter, cleanup, and host-specific issues.
 - [**Examples**](examples/README.md) – Practical demos and integration patterns.
 
 ## Roadmap
 
-### Current Version (v1.0.8)
+### Current Version (v1.0.9)
 
 - [x] WASAPI Shared Mode playback.
 - [x] Media Foundation decoding.
@@ -545,8 +649,12 @@ RiffMaxVoicesPerBus = 16
 - [x] 32-voice polyphonic mixer.
 - [x] 16-bus routing system.
 - [x] Bus mute, solo, fade, and peak meters.
+- [x] Persistent bus effect presets.
 - [x] Full per-voice Studio DSP pipeline.
-- [x] Effect presets.
+- [x] Core effect presets.
+- [x] Musical preset packs.
+- [x] Master bus processors.
+- [x] Master processor presets.
 - [x] White, pink, and brown noise.
 - [x] BLEP oscillators.
 - [x] Adaptive buffering.
@@ -558,11 +666,10 @@ RiffMaxVoicesPerBus = 16
 ### Planned
 
 - [ ] Optional native decode backend for faster MP3/OGG loading.
-- [ ] Optional streaming API for long music tracks.
 - [ ] Background preload helpers.
-- [ ] More musical preset packs.
-- [ ] Additional master bus processors.
 - [ ] Higher-level asset registry, such as `RiffLoadAs` and `RiffPlayKey`.
+- [ ] More musical preset packs and scene templates.
+- [ ] Additional master bus processors and metering tools.
 - [ ] macOS support through CoreAudio/AudioToolbox if the project expands beyond Windows.
 
 ## Performance Notes
@@ -574,6 +681,8 @@ For best performance in Office:
 - Avoid decoding MP3/OGG during interaction-heavy moments.
 - Use `RiffPlayOnce` for music and ambience.
 - Use bus volume/fades instead of changing many voices one by one.
+- Use persistent bus presets for scene-wide effects.
+- Use master processors lightly for final polish rather than heavy per-sample coloration on every voice.
 - Keep effect-heavy processing for important voices only.
 - Use `RiffMaxVoicesPerBuffer` to prevent repeated button clicks from stacking too many copies.
 - Always call `RiffClose` on exit.
