@@ -1,7 +1,5 @@
 # Riff Architecture
 
-This document describes the internal architecture of Riff v1.0.9. It is intended for contributors, advanced users, and anyone who wants to understand how the engine works under the hood.
-
 Riff is a single-file VBA audio engine for Windows Office hosts. It combines Media Foundation decoding, WASAPI shared-mode output, a native timer thunk, a real-time DSP mixer, per-voice effects, persistent bus presets, and optional master bus processing while remaining contained inside one `.bas` module.
 
 ## Table of Contents
