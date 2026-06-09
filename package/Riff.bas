@@ -6,7 +6,7 @@ Attribute VB_Name = "Riff"
 ' * Studio DSP Pipeline featuring Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad EQ, Bitcrusher,
 ' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, Peak Meters, musical preset packs, and master bus processors.
 ' * @author UesleiDev
-' * @version 1.0.9
+' * @version 1.1.0
 ' */
 
 Option Explicit
