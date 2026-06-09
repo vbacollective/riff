@@ -1,6 +1,6 @@
 # Effect Cookbook
 
-This cookbook contains practical Riff effect recipes you can paste into VBA projects. It covers the v1.0.9 preset system, musical preset packs, persistent bus effects, master bus processors, procedural noise, and manual DSP recipes.
+This cookbook contains practical Riff effect recipes you can paste into VBA projects. It covers the v1.0.9 preset system, musical preset packs, persistent bus effects, master bus processors, procedural noise, manual DSP recipes, gameplay-safe one-shots, Hz-based filtering, performance-oriented preset usage, and VBE-safe cleanup patterns.
 
 Riff effects can be applied at three levels:
 
@@ -60,6 +60,47 @@ Public Sub ResetMasterMix()
 End Sub
 ```
 
+### Gameplay-Safe One-Shot SFX
+
+For fast gameplay effects, prefer finite one-shots. The current Riff build is optimized for this path and protects against accidental accumulation.
+
+```vb
+Public Sub PlayUiTick()
+    RiffPlayOscillator RiffWaveSquare, 1320!, RiffBusUi, 0.16!, 0!, 0.035!
+End Sub
+
+Public Sub PlayDustHit()
+    Dim v As Long
+
+    v = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.09!, 0!, 0.045!)
+    If v >= 0 Then RiffVoiceSetFilterHz v, 2200!, 120!
+End Sub
+```
+
+### Continuous Noise Ambience
+
+Use the explicit loop helper for ambience. Do not use default `RiffPlayNoise` for long ambience, because it is now a finite one-shot by default.
+
+```vb
+Private windVoice As Long
+
+Public Sub StartWindBed()
+    windVoice = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.04!, 0!)
+    If windVoice >= 0 Then
+        RiffVoiceSetFilterHz windVoice, 1800!, 80!
+        RiffVoiceApplyPreset windVoice, RiffFxWind, 0.6!
+        RiffFadeIn windVoice, 1.5!
+    End If
+End Sub
+
+Public Sub StopWindBed()
+    If windVoice >= 0 Then
+        RiffFadeOut windVoice, 1.2!
+        windVoice = -1
+    End If
+End Sub
+```
+
 ## The Preset System
 
 The easiest way to apply complex effects is to use the built-in preset engine. A preset configures multiple DSP stages in a single call: filters, EQ, reverb, chorus, delay, compression, distortion, stereo width, and modulation.
@@ -104,6 +145,30 @@ Or use the dry preset:
 ```vb
 RiffVoiceApplyPreset v, RiffFxDry
 ```
+
+### Performance Notes for Presets
+
+The current performance build uses lazy temporal-buffer preparation. This means presets that use delay, reverb, chorus, or flanger no longer pay the full ring-buffer cleanup cost during the `RiffVoiceApplyPreset` call. The heavy temporal buffer is prepared only when the voice actually renders with a temporal effect enabled.
+
+For very high-rate gameplay SFX, the recommended pattern is still:
+
+```vb
+Dim v As Long
+
+v = RiffPlay(sndHit, RiffBusSfx, False, 0.55!, 0!)
+If v >= 0 Then
+    RiffVoiceApplyPreset v, RiffFxSmallRoom, 0.35!
+End If
+```
+
+For repeated UI beeps and procedural SFX, prefer finite oscillator/noise calls instead of creating an infinite voice and fading it later:
+
+```vb
+RiffPlayOscillator RiffWaveSine, 880!, RiffBusUi, 0.18!, 0!, 0.045!
+RiffPlayNoise RiffWaveWhiteNoise, RiffBusSfx, 0.08!, 0!, 0.035!
+```
+
+Presets are sanitized after application. Amounts and internal DSP values are clamped so exaggerated combinations are less likely to create runaway feedback, harsh pops, or invalid filter states.
 
 ## Voice Preset Reference
 
@@ -186,8 +251,7 @@ Public Sub ApplyTelephoneVoice(ByVal v As Long)
     If v < 0 Then Exit Sub
 
     RiffVoiceApplyPreset v, RiffFxTinySpeaker, 0.75
-    RiffVoiceHighPass(v) = 0.35
-    RiffVoiceLowPass(v) = 0.55
+    RiffVoiceSetFilterHz v, 3000!, 300!
     RiffVoiceCompressorRatio(v) = 3.5
 End Sub
 ```
@@ -236,8 +300,7 @@ Public Sub ApplyDarkCave(ByVal v As Long)
     If v < 0 Then Exit Sub
 
     RiffVoiceApplyPreset v, RiffFxDarkCave, 0.8
-    RiffVoiceLowPass(v) = 0.45
-    RiffVoiceHighPass(v) = 0.02
+    RiffVoiceSetFilterHz v, 1400!, 45!
 End Sub
 ```
 
@@ -501,6 +564,33 @@ End Sub
 
 If you need fine-grained control beyond presets, use these manual recipes as starting points.
 
+### Hz-Based Filter Cheat Sheet
+
+Use `RiffVoiceSetFilterHz` when you want predictable, audio-style filter points instead of normalized filter values.
+
+```vb
+' Radio/telephone band.
+RiffVoiceSetFilterHz v, 3000!, 300!
+
+' Muffled wall/underwater tone.
+RiffVoiceSetFilterHz v, 900!, 0!
+
+' Remove low rumble but keep the source mostly open.
+RiffVoiceSetFilterHz v, 0!, 80!
+```
+
+Typical starting points:
+
+| Effect | Low-pass Hz | High-pass Hz |
+|:---|---:|---:|
+| Telephone / radio | `3000` | `300` |
+| Muffled wall | `700` to `1200` | `0` |
+| Underwater | `500` to `1000` | `20` to `80` |
+| Soft rain / wind | `1800` to `3500` | `80` to `150` |
+| Remove sub-rumble | `0` | `40` to `100` |
+| Bright UI click polish | `5000` to `8000` | `120` to `300` |
+
+
 ### Clean UI Click
 
 Perfect for worksheet buttons, PowerPoint buttons, and form interactions.
@@ -632,10 +722,8 @@ Use oscillators and noise generators for procedural effects without audio files.
 Public Sub PlayCleanBeep()
     Dim v As Long
 
-    v = RiffPlayOscillator(RiffWaveSine, 880, RiffBusUi, 0.22, 0)
+    v = RiffPlayOscillator(RiffWaveSine, 880!, RiffBusUi, 0.22!, 0!, 0.08!)
     If v < 0 Then Exit Sub
-
-    RiffFadeOut v, 0.12
 End Sub
 ```
 
@@ -645,12 +733,11 @@ End Sub
 Public Sub PlayRetroBeep()
     Dim v As Long
 
-    v = RiffPlayOscillator(RiffWaveSquare, 660, RiffBusUi, 0.18, 0)
+    v = RiffPlayOscillator(RiffWaveSquare, 660!, RiffBusUi, 0.18!, 0!, 0.07!)
     If v < 0 Then Exit Sub
 
     RiffVoiceBitDepth(v) = 8
     RiffVoiceSampleRateReduction(v) = 2
-    RiffFadeOut v, 0.09
 End Sub
 ```
 
@@ -690,13 +777,13 @@ End Sub
 Public Sub PlayWind()
     Dim v As Long
 
-    v = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.12, 0)
+    v = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusSfx, 0.12!, 0!)
     If v < 0 Then Exit Sub
 
-    RiffVoiceApplyPreset v, RiffFxWind, 0.65
-    RiffVoiceLoop(v) = True
-    RiffVoiceAutoPanRate(v) = 0.05
-    RiffVoiceAutoPanDepth(v) = 0.6
+    RiffVoiceApplyPreset v, RiffFxWind, 0.65!
+    RiffVoiceSetFilterHz v, 1800!, 80!
+    RiffVoiceAutoPanRate(v) = 0.05!
+    RiffVoiceAutoPanDepth(v) = 0.6!
 End Sub
 ```
 
@@ -706,12 +793,12 @@ End Sub
 Public Sub PlayRain()
     Dim v As Long
 
-    v = RiffPlayNoise(RiffWavePinkNoise, RiffBusMusic, 0.08, 0)
+    v = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.08!, 0!)
     If v < 0 Then Exit Sub
 
-    RiffVoiceApplyPreset v, RiffFxRain, 0.7
-    RiffVoiceLoop(v) = True
-    RiffVoiceStereoWidth(v) = 1.35
+    RiffVoiceApplyPreset v, RiffFxRain, 0.7!
+    RiffVoiceSetFilterHz v, 2600!, 120!
+    RiffVoiceStereoWidth(v) = 1.35!
 End Sub
 ```
 
@@ -721,11 +808,11 @@ End Sub
 Public Sub PlayVinylCrackle()
     Dim v As Long
 
-    v = RiffPlayNoise(RiffWaveWhiteNoise, RiffBusSfx, 0.05, 0)
+    v = RiffPlayNoise(RiffWaveWhiteNoise, RiffBusSfx, 0.05!, 0!, 0.035!)
     If v < 0 Then Exit Sub
 
     RiffVoiceBitDepth(v) = 3
-    RiffVoiceHighPass(v) = 0.6
+    RiffVoiceSetFilterHz v, 7000!, 1200!
     RiffVoiceSampleRateReduction(v) = 2
 End Sub
 ```
@@ -736,14 +823,13 @@ End Sub
 Public Sub PlayEarthquakeRumble()
     Dim v As Long
 
-    v = RiffPlayNoise(RiffWaveBrownNoise, RiffBusSfx, 0.16, 0)
+    v = RiffPlayNoise(RiffWaveBrownNoise, RiffBusSfx, 0.16!, 0!, 2.5!)
     If v < 0 Then Exit Sub
 
-    RiffVoiceLowPass(v) = 0.18
-    RiffVoiceEqBass(v) = 1.6
-    RiffVoiceTremoloRate(v) = 4
-    RiffVoiceTremoloDepth(v) = 0.25
-    RiffFadeOut v, 2.5
+    RiffVoiceSetFilterHz v, 180!, 25!
+    RiffVoiceEqBass(v) = 1.6!
+    RiffVoiceTremoloRate(v) = 4!
+    RiffVoiceTremoloDepth(v) = 0.25!
 End Sub
 ```
 
@@ -764,12 +850,11 @@ Public Sub StartUnderwaterLevel()
     RiffBusFadeTo RiffBusMusic, 0.28, 800
     RiffBusFadeTo RiffBusSfx, 0.6, 400
 
-    underwaterAmbience = RiffPlayNoise(RiffWaveBrownNoise, RiffBusMusic, 0.06, 0)
+    underwaterAmbience = RiffPlayNoiseLoop(RiffWaveBrownNoise, RiffBusMusic, 0.06!, 0!)
     If underwaterAmbience >= 0 Then
-        RiffVoiceLoop(underwaterAmbience) = True
-        RiffVoiceLowPass(underwaterAmbience) = 0.2
-        RiffVoiceStereoWidth(underwaterAmbience) = 1.3
-        RiffFadeIn underwaterAmbience, 2
+        RiffVoiceSetFilterHz underwaterAmbience, 650!, 35!
+        RiffVoiceStereoWidth(underwaterAmbience) = 1.3!
+        RiffFadeIn underwaterAmbience, 2!
     End If
 End Sub
 
@@ -801,11 +886,11 @@ Public Sub StartHorrorScene()
     RiffBusApplyPreset RiffBusMusic, RiffFxDarkCave, 0.55
     RiffBusApplyPreset RiffBusSfx, RiffFxHorrorDrone, 0.35
 
-    horrorDrone = RiffPlayNoise(RiffWaveBrownNoise, RiffBusMusic, 0.08, 0)
+    horrorDrone = RiffPlayNoiseLoop(RiffWaveBrownNoise, RiffBusMusic, 0.08!, 0!)
     If horrorDrone >= 0 Then
-        RiffVoiceApplyPreset horrorDrone, RiffFxHorrorDrone, 0.8
-        RiffVoiceLoop(horrorDrone) = True
-        RiffFadeIn horrorDrone, 3
+        RiffVoiceApplyPreset horrorDrone, RiffFxHorrorDrone, 0.8!
+        RiffVoiceSetFilterHz horrorDrone, 320!, 25!
+        RiffFadeIn horrorDrone, 3!
     End If
 End Sub
 
@@ -837,21 +922,19 @@ End Sub
 Public Sub RetroMenuMove()
     Dim v As Long
 
-    v = RiffPlayOscillator(RiffWaveSquare, 660, RiffBusUi, 0.16, 0)
+    v = RiffPlayOscillator(RiffWaveSquare, 660!, RiffBusUi, 0.16!, 0!, 0.06!)
     If v < 0 Then Exit Sub
 
-    RiffVoiceApplyPreset v, RiffFxGameBoy, 0.8
-    RiffFadeOut v, 0.08
+    RiffVoiceApplyPreset v, RiffFxGameBoy, 0.8!
 End Sub
 
 Public Sub RetroMenuConfirm()
     Dim v As Long
 
-    v = RiffPlayOscillator(RiffWaveSquare, 990, RiffBusUi, 0.18, 0)
+    v = RiffPlayOscillator(RiffWaveSquare, 990!, RiffBusUi, 0.18!, 0!, 0.12!)
     If v < 0 Then Exit Sub
 
-    RiffVoiceApplyPreset v, RiffFxGameBoy, 0.7
-    RiffFadeOut v, 0.16
+    RiffVoiceApplyPreset v, RiffFxGameBoy, 0.7!
 End Sub
 ```
 
@@ -869,11 +952,84 @@ Public Sub PlayCinematicTransition(ByVal boomBuffer As Long)
         RiffVoiceApplyPreset boom, RiffFxCinematicBoom, 0.85
     End If
 
-    rumble = RiffPlayNoise(RiffWaveBrownNoise, RiffBusSfx, 0.1, 0)
+    rumble = RiffPlayNoise(RiffWaveBrownNoise, RiffBusSfx, 0.1!, 0!, 1.2!)
     If rumble >= 0 Then
-        RiffVoiceLowPass(rumble) = 0.15
-        RiffFadeOut rumble, 1.2
+        RiffVoiceSetFilterHz rumble, 160!, 25!
     End If
+End Sub
+```
+
+## Gameplay SFX Recipes
+
+These recipes are designed for high-frequency game loops where the same sound can be triggered many times per second.
+
+### Footstep Tick With Burst Safety
+
+```vb
+Public Sub PlayFootstep(ByVal sndStep As Long, Optional ByVal pan As Single = 0!)
+    Dim v As Long
+
+    v = RiffPlay(sndStep, RiffBusSfx, False, 0.38!, pan)
+    If v < 0 Then Exit Sub
+
+    RiffVoiceSetFilterHz v, 4200!, 90!
+End Sub
+```
+
+Recommended global safety for footsteps, bullets, UI ticks, and collision sounds:
+
+```vb
+RiffVoiceStealingEnabled = True
+RiffMaxVoicesPerBuffer = 4
+RiffMaxVoicesPerBus = 18
+```
+
+### Dust Puff / Landing Noise
+
+```vb
+Public Sub PlayLandingDust()
+    Dim v As Long
+
+    v = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.12!, 0!, 0.055!)
+    If v < 0 Then Exit Sub
+
+    RiffVoiceSetFilterHz v, 1800!, 120!
+    RiffVoiceApplyPreset v, RiffFxSmallRoom, 0.25!
+End Sub
+```
+
+### Coin Pickup Without Audio File
+
+```vb
+Public Sub PlayCoinPickup()
+    RiffPlayOscillator RiffWaveSquare, 880!, RiffBusUi, 0.18!, 0!, 0.045!
+    RiffPlayOscillator RiffWaveSquare, 1320!, RiffBusUi, 0.14!, 0!, 0.06!
+End Sub
+```
+
+### Low Hit Layer
+
+```vb
+Public Sub PlayLowHitLayer()
+    Dim v As Long
+
+    v = RiffPlayNoise(RiffWaveBrownNoise, RiffBusSfx, 0.13!, 0!, 0.18!)
+    If v < 0 Then Exit Sub
+
+    RiffVoiceSetFilterHz v, 190!, 25!
+    RiffVoiceCompressorThreshold(v) = 0.55!
+    RiffVoiceCompressorRatio(v) = 5!
+End Sub
+```
+
+### Debug Voice Accumulation
+
+```vb
+Public Sub PrintAudioBurstState(ByVal snd As Long)
+    Debug.Print "Active voices:", RiffActiveVoiceCount()
+    Debug.Print "SFX bus voices:", RiffBusVoiceCount(RiffBusSfx)
+    Debug.Print "This buffer voices:", RiffBufferVoiceCount(snd, RiffBusSfx)
+    Debug.Print "Underruns:", RiffUnderrunCount
 End Sub
 ```
 
@@ -988,5 +1144,48 @@ Public Sub ResetAudioColor()
 
     RiffMasterClearProcessors
     RiffSoftClipEnabled = True
+End Sub
+```
+
+
+### VBE-Safe Development Cleanup
+
+When testing audio directly from the VBE, the editor can be interrupted with the Stop/Reset button. The current stop-safe build kills orphaned timer callbacks automatically, but this helper is available as an emergency cleanup tool during development:
+
+```vb
+Public Sub EmergencyAudioEditorReset()
+    RiffEditorEmergencyStop
+End Sub
+```
+
+Use normal cleanup in application code:
+
+```vb
+Public Sub ShutdownAudioNormally()
+    RiffClose
+End Sub
+```
+
+Use `RiffEditorEmergencyStop` only for editor recovery after interrupted tests, not as a normal game shutdown path.
+
+### Gameplay Timer Warmth
+
+For active gameplay, you can keep the audio path warm so short SFX do not hit an empty WASAPI buffer between bursts:
+
+```vb
+Public Sub StartGameplayAudioMode()
+    RiffOpen
+    RiffAutoSuspendTimer = False
+End Sub
+```
+
+The stop-safe build still releases the VBE when idle, so IntelliSense should not remain stuck in a permanent Running state after one-shot playback finishes.
+
+For menus, editors, and mostly idle screens, prefer:
+
+```vb
+Public Sub StartMenuAudioMode()
+    RiffOpen
+    RiffAutoSuspendTimer = True
 End Sub
 ```
