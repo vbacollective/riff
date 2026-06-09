@@ -2,6 +2,8 @@
 
 **Riff.bas** is a high-performance VBA audio engine for Windows Office hosts. It uses Media Foundation for decoding, WASAPI shared-mode output for playback, and a real-time DSP pipeline written directly in VBA with a small native timer thunk. It supports x86 and x64 VBA, static audio buffers, polyphonic voices, audio buses, synthetic oscillators, white/pink/brown noise, WAV export, peak meters, adaptive buffering, musical preset packs, master bus processors, and a full per-voice effects chain.
 
+This reference includes the current stability/performance pass: anti-accumulation voice caps, finite procedural one-shots, Hz-based filter helpers, lazy temporal-buffer preparation, faster `RiffPlay`/preset setup, warm-silence underrun protection, and the VBE-safe idle timer that prevents IntelliSense from being held in a permanent running state.
+
 ```vb
 voice = RiffPlay(bufferHandle, RiffBusSfx, False, 0.9, 0!)
 music = RiffPlayOnce(musicBuffer, RiffBusMusic, True, 0.45, 0!)
@@ -21,6 +23,8 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!, 0.12!)
   - [Audio Buses](#audio-buses)
   - [Adaptive Buffering](#adaptive-buffering)
   - [Timer and Host Behavior](#timer-and-host-behavior)
+  - [VBE-Safe Idle Timer](#vbe-safe-idle-timer)
+  - [Performance Model](#performance-model)
   - [DSP Pipeline](#dsp-pipeline)
   - [Oscillators and Noise](#oscillators-and-noise)
   - [WAV Export](#wav-export)
@@ -60,6 +64,7 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!, 0.12!)
   - [Delay](#delay)
 - [Practical Recipes](#practical-recipes)
 - [Best Practices](#best-practices)
+- [Performance Benchmarks](#performance-benchmarks)
 - [Troubleshooting](#troubleshooting)
 - [Complete Public API Index](#complete-public-api-index)
 
@@ -297,6 +302,70 @@ The adaptive build also supports timer suspension:
 
 Office is not a real-time audio host. If the UI freezes, Windows is under heavy load, or the VBE is in an unusual state, playback can still be affected. The adaptive queue reduces audible dropouts but cannot fully replace a native audio thread.
 
+### VBE-Safe Idle Timer
+
+The current performance build includes a VBE-safe idle policy for the render timer. Earlier performance builds could keep the render timer alive indefinitely when `RiffAutoSuspendTimer = False`, which kept the VBA project visually stuck in a running state. In the VBE this could make IntelliSense stop working and make the title bar flicker between normal and running states.
+
+The updated behavior is:
+
+```txt
+Active audio                    -> render timer stays active
+Short silence after gameplay SFX -> timer keeps WASAPI warm briefly
+Longer idle period              -> timer stops automatically
+Next Play/Wake call             -> timer restarts safely
+```
+
+This keeps the low-underrun behavior needed for rapid SFX bursts while avoiding the common Office/VBE problem where a timer callback keeps the editor in `Running` mode after the sound has finished.
+
+Recommended setup for games:
+
+```vb
+Public Sub AudioInitForGame()
+    If Not RiffOpen() Then Exit Sub
+
+    ' Keeps short SFX responsive, but the VBE-safe idle guard
+    ' still stops the timer after the engine is truly idle.
+    RiffAutoSuspendTimer = False
+End Sub
+```
+
+Recommended setup for tools, demos, editors, and normal Office workflows:
+
+```vb
+Public Sub AudioInitForOfficeTool()
+    If Not RiffOpen() Then Exit Sub
+    RiffAutoSuspendTimer = True
+End Sub
+```
+
+If IntelliSense ever appears stuck after a manual break/reset during development, call `RiffClose` once to force all timers, voices, buffers, and COM state to be released.
+
+### Performance Model
+
+The performance build optimizes the common gameplay path: loading happens once, `RiffPlay` is called many times, and most short sounds are dry or only lightly processed. The main improvements are internal and do not change the public API.
+
+Key performance changes:
+
+- `RiffPlay` no longer clears the large per-voice temporal ring buffer for ordinary dry SFX.
+- Delay, reverb, chorus, and flanger ring buffers are prepared lazily only when a temporal effect is actually used.
+- `RiffVoiceApplyPreset` no longer pays the full temporal-buffer reset cost for dry/EQ/compressor/filter/radio-style presets.
+- Voice allocation performs fewer repeated scans when choosing a free or stealable voice.
+- Generated noise/oscillator sources use finite lifetime counters when a duration is provided, so they do not remain active accidentally.
+- Preset values are sanitized after application to reduce invalid feedback/filter/width/compressor states.
+- The render path skips neutral DSP stages where possible.
+
+Expected practical impact from the internal benchmark suite:
+
+```txt
+Dry RiffPlay path:       around 11-13 us/call in the tested Office/VBA host
+Noise one-shot:          around 14-15 us/call
+Oscillator one-shot:     around 13-15 us/call
+Preset/DSP setup path:   around 20 us/call after lazy temporal-buffer optimization
+Game-loop benchmark:     0 failed handles, 0 final active voices, stable memory
+```
+
+These numbers are benchmark-dependent, but the important trend is that the regular SFX path is now much cheaper than earlier builds that cleared large DSP buffers during every play or preset setup.
+
 ### DSP Pipeline
 
 Each active voice goes through a fixed per-sample DSP chain. The conceptual order is:
@@ -323,6 +392,10 @@ Each active voice goes through a fixed per-sample DSP chain. The conceptual orde
 20. Master bus processing: optional soft clip, filters, EQ, compression, drive, stereo width, and output gain.
 
 Most DSP stages are skipped when their parameters are at neutral defaults. For example, delay is skipped when `RiffVoiceDelayMix = 0`, and EQ is skipped when all EQ bands are `1.0`.
+
+The performance build also avoids clearing and preparing heavy temporal-effect memory unless it is needed. Delay, reverb, chorus, and flanger use a large per-voice ring buffer. Earlier builds could clear this buffer during normal voice reset or preset application, which made fast repeated SFX noticeably heavier. The current build marks temporal state as stale and prepares it lazily when a temporal effect first needs it.
+
+This means a dry sound, a filtered UI click, a bitcrushed beep, or a radio-style preset does not pay the same setup cost as a voice with delay/reverb/chorus/flanger.
 
 ### Oscillators and Noise
 
@@ -702,7 +775,17 @@ Controls whether Riff may automatically stop/suspend its timer after a period of
 RiffAutoSuspendTimer = True
 ```
 
-Use `False` when you need the render loop to stay warm for rapid repeated playback, but prefer `True` for Office stability.
+When `True`, Riff aggressively suspends the timer after idle periods, which is the safest mode for normal Office tools, demos, and editing workflows.
+
+When `False`, Riff keeps the audio path warm for rapid repeated playback, which is useful for games with lots of short SFX. In the VBE-safe performance build, this no longer means the timer stays alive forever: after a short warm-idle period with no active voices, Riff still stops the timer automatically so the VBE can return to a normal editable state and IntelliSense can recover.
+
+```vb
+' Game-style usage: responsive bursts, still VBE-safe after idle.
+RiffAutoSuspendTimer = False
+
+' Office/editor-style usage: release the VBE as soon as practical.
+RiffAutoSuspendTimer = True
+```
 
 ## Diagnostics
 
@@ -2860,6 +2943,69 @@ RiffVoiceSetFilterHz v, 900!, 0!     ' muffled
 RiffVoiceSetFilterHz v, 0!, 80!      ' remove sub-rumble
 ```
 
+### Keep the VBE Responsive During Development
+
+If you are testing inside the editor, prefer explicit cleanup in stop/shutdown paths. The VBE-safe timer reduces the chance of IntelliSense getting stuck, but explicit cleanup is still the cleanest workflow when editing a lot.
+
+```vb
+Public Sub AudioDevReset()
+    RiffStopAll
+    RiffSuspend
+End Sub
+
+Public Sub AudioFullShutdown()
+    RiffClose
+End Sub
+```
+
+For gameplay tests, `RiffAutoSuspendTimer = False` is acceptable because the current build keeps audio warm only briefly while idle. For macro tools, examples, and code snippets that users may run from the VBE, prefer `True`.
+
+### Avoid Applying Heavy Presets Per Frame
+
+`RiffVoiceApplyPreset` is much faster in the lazy temporal-buffer build, but it is still setup work. Apply presets when a voice starts, when a bus/scene changes, or when a sound-design state changes. Avoid reapplying the same preset every frame.
+
+Good:
+
+```vb
+v = RiffPlay(sndRadioVoice, RiffBusVoice, False, 0.8!)
+If v <> -1 Then RiffVoiceApplyPreset v, RiffFxRadio, 0.7!
+```
+
+Bad:
+
+```vb
+' Do not do this every frame for the same active voice.
+RiffVoiceApplyPreset v, RiffFxRadio, 0.7!
+```
+
+## Performance Benchmarks
+
+The benchmark modules used during the performance pass measured burst playback, generated sources, preset setup, memory stability, active-voice cleanup, and game-loop behavior. The exact values depend on host, CPU, Office version, and audio device, but the tested performance build reached roughly:
+
+```txt
+Short dry RiffPlay:       ~11 us/call
+Long dry RiffPlay:        ~13 us/call
+Noise one-shot:           ~14-15 us/call
+Oscillator one-shot:      ~13-15 us/call
+Preset/DSP setup:         ~20 us/call
+Failed handles:           0
+Active voices after wait: 0
+Game-loop underruns:      0 in the final pumped-wait benchmark
+Final active voices:      0
+Memory delta:             stable / no observed leak in the benchmark runs
+```
+
+The most important benchmark signs are not just low `us/call`. For real gameplay stability, also watch:
+
+```txt
+Failed handles            should remain 0 or intentionally capped/limited
+Active voices after wait  should return to 0 for finite sounds
+Underrun delta            should stay low, ideally 0 in normal test loops
+Private MB delta          should stay stable across repeated runs
+```
+
+If a synthetic benchmark uses `Sleep` without pumping messages, the VBE/Office timer may not process enough callbacks during the wait. For audio cleanup tests, a pumped wait that periodically calls `DoEvents` gives a more realistic result inside Office.
+
 ## Troubleshooting
 
 ### `RiffOpen` returns `False`
@@ -2914,7 +3060,11 @@ If underruns increase, reduce expensive UI work, avoid busy-wait loops, preload 
 
 ### VBE autocomplete stops or VBE looks like it is still running
 
-This usually means some timer/callback is still active. Call:
+This usually means a timer/callback is still active and the VBA project is being kept in a running state. In affected builds, this could make IntelliSense stop working or make the VBE title bar flicker between normal and running states.
+
+The VBE-safe performance build reduces this by stopping the render timer automatically after a short idle period, even when `RiffAutoSuspendTimer = False` was used for game-style warm playback.
+
+For immediate recovery during development, call:
 
 ```vb
 RiffStopAll
@@ -2927,7 +3077,17 @@ For full cleanup:
 RiffClose
 ```
 
-Use `RiffAutoSuspendTimer = True` for normal Office workflows.
+Recommended settings:
+
+```vb
+' Normal Office/editor workflows.
+RiffAutoSuspendTimer = True
+
+' Gameplay loop / rapid SFX testing. VBE-safe idle guard still stops later.
+RiffAutoSuspendTimer = False
+```
+
+If IntelliSense is still stuck after a manual break or host-level interruption, run `RiffClose` once and then start the engine again with `RiffOpen`.
 
 ### Fast repeated SFX eventually stutter or feel like they accumulate
 
@@ -2946,6 +3106,25 @@ Active voices should fall back toward 0 after finite sounds finish.
 Private memory should not climb continuously between test runs.
 Peak voices should not stay stuck at 32.
 ```
+
+### `RiffPlay` is fast but preset setup is still heavier
+
+This is expected. A dry `RiffPlay` only needs to allocate/reset a voice and route it. A preset may configure filters, EQ, compressor, delay, reverb, chorus, flanger, stereo width, and other DSP parameters.
+
+The current build uses lazy temporal-buffer preparation, so presets are much cheaper than earlier builds. Still, prefer applying presets once at voice creation or at bus/scene transitions, not every frame.
+
+```vb
+Dim v As Long
+v = RiffPlay(sndHit, RiffBusSfx, False, 0.8!)
+If v <> -1 Then RiffVoiceApplyPreset v, RiffFxSmallRoom, 0.35!
+```
+
+### Underruns appear during synthetic tests but not during gameplay
+
+Check whether the test is blocking the Office message loop. A raw `Sleep` can prevent the VBA timer callback from running during the wait. Use a pumped wait with periodic `DoEvents` when testing cleanup, voice lifetime, and timer behavior inside Office.
+
+Also verify that assets are already loaded and that the test is not decoding files during the benchmark.
+
 
 Recommended fixes:
 
@@ -3207,8 +3386,11 @@ Public Function RiffRenderOscillatorWav(ByVal waveType As RiffWaveType, ByVal fr
 ```vb
 Public Function RiffPlay(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
 Public Function RiffPlayOnce(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
-Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
-Public Function RiffPlayNoise(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = 0!) As Long
+Public Function RiffPlayNoise(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = RIFF_DEFAULT_NOISE_DURATION_SEC) As Long
+Public Function RiffPlayNoiseOnBus(ByVal busID As RiffBusId, Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = RIFF_DEFAULT_NOISE_DURATION_SEC) As Long
+Public Function RiffPlayNoiseLoop(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayNoiseLoopOnBus(ByVal busID As RiffBusId, Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
 ```
 
 ### Compatibility Playback Wrappers
@@ -3216,8 +3398,8 @@ Public Function RiffPlayNoise(Optional ByVal noiseType As RiffWaveType = RiffWav
 ```vb
 Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
 Public Function RiffPlayBusOnce(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
-Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
-Public Function RiffPlayNoiseBus(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = 0!) As Long
+Public Function RiffPlayNoiseBus(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = RIFF_DEFAULT_NOISE_DURATION_SEC) As Long
 ```
 
 ### Voice Transport and State
@@ -3266,6 +3448,7 @@ Public Sub RiffVoiceSetDelay(ByVal voiceHandle As Long, ByVal delayTime As Singl
 Public Sub RiffVoiceSetChorus(ByVal voiceHandle As Long, ByVal depth As Single, ByVal rate As Single)
 Public Sub RiffVoiceSetFlanger(ByVal voiceHandle As Long, ByVal depth As Single, ByVal rate As Single, ByVal feedback As Single)
 Public Sub RiffVoiceSetFilter(ByVal voiceHandle As Long, ByVal lowPass As Single, ByVal highPass As Single)
+Public Sub RiffVoiceSetFilterHz(ByVal voiceHandle As Long, ByVal lowPassHz As Single, Optional ByVal highPassHz As Single = 0!)
 Public Sub RiffVoiceApplyPreset(ByVal voiceHandle As Long, ByVal preset As RiffEffectPreset, Optional ByVal amount As Single = 1!)
 ```
 
