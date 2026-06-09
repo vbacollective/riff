@@ -1,16 +1,13 @@
 # Riff API Reference
 
-> Current target: **Riff v1.0.9**.
-
 **Riff.bas** is a high-performance VBA audio engine for Windows Office hosts. It uses Media Foundation for decoding, WASAPI shared-mode output for playback, and a real-time DSP pipeline written directly in VBA with a small native timer thunk. It supports x86 and x64 VBA, static audio buffers, polyphonic voices, audio buses, synthetic oscillators, white/pink/brown noise, WAV export, peak meters, adaptive buffering, musical preset packs, master bus processors, and a full per-voice effects chain.
-
-This reference documents the current public API from the **v1.0.9 musical-preset and master-processor build**. Older helper names are still documented when they remain available for compatibility, but the recommended API style is now the unified form:
 
 ```vb
 voice = RiffPlay(bufferHandle, RiffBusSfx, False, 0.9, 0!)
 music = RiffPlayOnce(musicBuffer, RiffBusMusic, True, 0.45, 0!)
-noise = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.08, 0!)
-osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!)
+noise = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.08, 0!, 0.06!)
+wind = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.05!, 0!)
+osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!, 0.12!)
 ```
 
 ## Table of Contents
@@ -20,6 +17,7 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!)
   - [Engine Lifecycle](#engine-lifecycle)
   - [Buffer Pool](#buffer-pool)
   - [Voice Pool](#voice-pool)
+  - [Anti-Accumulation and Burst Safety](#anti-accumulation-and-burst-safety)
   - [Audio Buses](#audio-buses)
   - [Adaptive Buffering](#adaptive-buffering)
   - [Timer and Host Behavior](#timer-and-host-behavior)
@@ -35,6 +33,7 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!)
   - [RiffErrorCode](#rifferrorcode)
 - [Initialization and Teardown](#initialization-and-teardown)
 - [Diagnostics](#diagnostics)
+  - [Runtime Voice Counters](#runtime-voice-counters)
 - [Global Settings](#global-settings)
 - [Master Bus Processors](#master-bus-processors)
 - [Audio Buses](#audio-buses-api)
@@ -154,7 +153,55 @@ If v <> -1 Then
 End If
 ```
 
-Each voice has its own source position, loop state, volume, pitch, pan, peak meters, and DSP state.
+Each voice has its own source position, loop state, volume, pitch, pan, peak meters, lifetime counters, fade state, peak meters, and DSP state.
+
+### Anti-Accumulation and Burst Safety
+
+The current stable Riff build includes additional guardrails for games that trigger very short sounds repeatedly. This specifically targets the situation where a gameplay loop fires the same SFX, noise burst, or oscillator many times per second and the engine appears to slow down because active voices or DSP state pile up.
+
+The safety model is:
+
+```txt
+Short repeated SFX -> capped per buffer and per bus
+Noise one-shots    -> finite duration by default
+Oscillator beeps   -> optional finite duration
+Voice stealing     -> enabled by default and cleaned before reuse
+Release/attack     -> micro-ramped to reduce clicks and pops
+Preset values      -> clamped/sanitized after preset application
+```
+
+Relevant runtime controls:
+
+```vb
+RiffVoiceStealingEnabled = True
+RiffMaxVoicesPerBuffer = 4
+RiffMaxVoicesPerBus = 18
+```
+
+Relevant diagnostics:
+
+```vb
+Debug.Print "Active voices:", RiffActiveVoiceCount()
+Debug.Print "SFX voices:", RiffBusVoiceCount(RiffBusSfx)
+Debug.Print "Explosion instances:", RiffBufferVoiceCount(sndExplosion, RiffBusSfx)
+```
+
+For gameplay code, prefer finite one-shots:
+
+```vb
+RiffPlay sndStep, RiffBusSfx, False, 0.35!
+RiffPlayNoise RiffWaveWhiteNoise, RiffBusSfx, 0.15!, 0!, 0.04!
+RiffPlayOscillator RiffWaveSquare, 880!, RiffBusUi, 0.18!, 0!, 0.06!
+```
+
+Use continuous noise only when you really want ambience or a looped procedural layer:
+
+```vb
+windVoice = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.04!)
+RiffVoiceSetFilterHz windVoice, 1800!, 80!
+' Later:
+RiffFadeOut windVoice, 1.5!
+```
 
 ### Audio Buses
 
@@ -279,21 +326,44 @@ Most DSP stages are skipped when their parameters are at neutral defaults. For e
 
 ### Oscillators and Noise
 
-Riff can synthesize audio without a file:
+Riff can synthesize audio without a file. Oscillators use `frequencyHz` to define pitch: low Hz is bass/low pitch, high Hz is bright/high pitch.
 
 ```vb
 Dim beep As Long
-beep = RiffPlayOscillator(RiffWaveSine, 880!, RiffBusUi, 0.25!)
-RiffFadeOut beep, 0.12!
+beep = RiffPlayOscillator(RiffWaveSine, 880!, RiffBusUi, 0.25!, 0!, 0.08!)
 ```
 
-Noise is also supported:
+`durationSec` is optional. When omitted or `0`, oscillators are continuous and must be stopped manually. For UI/game SFX, pass a short duration so the voice cleans itself automatically.
+
+```vb
+' Continuous oscillator; stop manually.
+Dim hum As Long
+hum = RiffPlayOscillator(RiffWaveSine, 55!, RiffBusSfx, 0.15!)
+RiffStop hum
+
+' Finite beep; auto-releases.
+RiffPlayOscillator RiffWaveSquare, 1320!, RiffBusUi, 0.18!, 0!, 0.05!
+```
+
+Noise is also supported. In the stable gameplay build, `RiffPlayNoise` is a short one-shot by default. This prevents procedural noise from accidentally accumulating forever when used as a fast SFX.
+
+```vb
+' Short noise hit; auto-stops after the default noise duration.
+RiffPlayNoise RiffWaveWhiteNoise, RiffBusSfx, 0.18!
+
+' Explicit short duration.
+RiffPlayNoise RiffWavePinkNoise, RiffBusSfx, 0.08!, 0!, 0.12!
+```
+
+For ambience, use the explicit loop helpers:
 
 ```vb
 Dim rain As Long
-rain = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.08!)
-RiffVoiceLoop(rain) = True
-RiffVoiceLowPass(rain) = 0.5!
+rain = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.05!)
+RiffVoiceSetFilterHz rain, 2600!, 120!
+
+' Later:
+RiffFadeOut rain, 2!
 ```
 
 Supported source types:
@@ -683,6 +753,88 @@ Public Property Get RiffMaxBuses() As Long
 ```
 
 Returns the bus count: `16`.
+
+### Runtime Voice Counters
+
+The stable gameplay build exposes lightweight counters that are useful for finding accidental accumulation during development.
+
+#### RiffActiveVoiceCount
+
+```vb
+Public Function RiffActiveVoiceCount() As Long
+```
+
+Returns the number of currently active voices across all buses and source types. This should return to `0` after finite one-shots finish and after cleanup.
+
+```vb
+Debug.Print "Active voices:", RiffActiveVoiceCount()
+```
+
+#### RiffBusVoiceCount
+
+```vb
+Public Function RiffBusVoiceCount(ByVal busID As RiffBusId) As Long
+```
+
+Returns the number of active voices currently routed to a bus.
+
+```vb
+Debug.Print "SFX active:", RiffBusVoiceCount(RiffBusSfx)
+Debug.Print "Music active:", RiffBusVoiceCount(RiffBusMusic)
+```
+
+#### RiffBufferVoiceCount
+
+```vb
+Public Function RiffBufferVoiceCount(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain) As Long
+```
+
+Returns how many active voices are currently playing a specific decoded buffer. Use this to confirm that fast repeated effects are not multiplying beyond the configured cap.
+
+```vb
+Debug.Print "Step voices:", RiffBufferVoiceCount(sndStep, RiffBusSfx)
+```
+
+### Voice Stealing and Burst Caps
+
+#### RiffVoiceStealingEnabled
+
+```vb
+Public Property Get RiffVoiceStealingEnabled() As Boolean
+Public Property Let RiffVoiceStealingEnabled(ByVal value As Boolean)
+```
+
+Controls whether Riff may reuse an existing voice when a burst would otherwise exceed the active voice pool or per-source safety caps. It is recommended to keep this enabled for games.
+
+```vb
+RiffVoiceStealingEnabled = True
+```
+
+#### RiffMaxVoicesPerBuffer
+
+```vb
+Public Property Get RiffMaxVoicesPerBuffer() As Long
+Public Property Let RiffMaxVoicesPerBuffer(ByVal value As Long)
+```
+
+Limits how many instances of the same loaded buffer can be active at once. This prevents a rapid-fire sound such as footsteps, bullets, UI clicks, or collision hits from piling up into a heavy mixer load.
+
+```vb
+RiffMaxVoicesPerBuffer = 4
+```
+
+#### RiffMaxVoicesPerBus
+
+```vb
+Public Property Get RiffMaxVoicesPerBus() As Long
+Public Property Let RiffMaxVoicesPerBus(ByVal value As Long)
+```
+
+Limits the number of active voices routed to one bus. This helps protect the SFX bus from large gameplay bursts while still allowing music and UI buses to remain responsive.
+
+```vb
+RiffMaxVoicesPerBus = 18
+```
 
 ### RiffAdaptiveQueueMs
 
@@ -1361,26 +1513,26 @@ Public Function RiffPlayOscillator( _
     ByVal frequencyHz As Single, _
     Optional ByVal busID As RiffBusId = RiffBusMain, _
     Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, _
-    Optional ByVal pan As Single = 0! _
+    Optional ByVal pan As Single = 0!, _
+    Optional ByVal durationSec As Single = 0! _
 ) As Long
 ```
 
-Starts an infinite oscillator voice. Stop it with `RiffStop`, `RiffVoiceStop`, `RiffFadeOut`, or `RiffStopAll`.
+Creates an oscillator voice. `frequencyHz` controls pitch: `220` is lower, `440` is concert A, `880` is one octave higher. When `durationSec` is `0`, the oscillator is continuous and must be stopped manually. When `durationSec` is greater than `0`, the oscillator becomes a finite one-shot and auto-releases.
 
 ```vb
-Dim beep As Long
-beep = RiffPlayOscillator(RiffWaveSine, 880!, RiffBusUi, 0.25!)
-RiffFadeOut beep, 0.12!
+' Continuous tone.
+Dim hum As Long
+hum = RiffPlayOscillator(RiffWaveSine, 110!, RiffBusSfx, 0.12!)
+
+' Finite UI beep.
+RiffPlayOscillator RiffWaveSquare, 880!, RiffBusUi, 0.22!, 0!, 0.07!
+
+' Higher confirmation sparkle.
+RiffPlayOscillator RiffWaveSine, 1760!, RiffBusUi, 0.12!, 0!, 0.045!
 ```
 
-Retro square beep:
-
-```vb
-Dim v As Long
-v = RiffPlayOscillator(RiffWaveSquare, 660!, RiffBusUi, 0.18!)
-RiffVoiceBitDepth(v) = 8!
-RiffFadeOut v, 0.08!
-```
+The stable build applies a tiny attack/release safety envelope to new/generated voices. This reduces clicks when a fast SFX starts, stops, or is stolen/reused.
 
 ### RiffPlayNoise
 
@@ -1389,37 +1541,99 @@ Public Function RiffPlayNoise( _
     Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, _
     Optional ByVal busID As RiffBusId = RiffBusMain, _
     Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, _
+    Optional ByVal pan As Single = 0!, _
+    Optional ByVal durationSec As Single = RIFF_DEFAULT_NOISE_DURATION_SEC _
+) As Long
+```
+
+Creates a procedural noise voice. Unlike earlier builds, `RiffPlayNoise` is a finite one-shot by default. This prevents accidental infinite noise voices in gameplay code.
+
+```vb
+' Short one-shot noise hit.
+RiffPlayNoise RiffWaveWhiteNoise, RiffBusSfx, 0.18!
+
+' Softer filtered dust/wind hit.
+Dim n As Long
+n = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.08!, 0!, 0.12!)
+RiffVoiceSetFilterHz n, 1800!, 120!
+```
+
+Use `durationSec:=0` only when you intentionally want continuous noise:
+
+```vb
+Dim continuous As Long
+continuous = RiffPlayNoise(RiffWavePinkNoise, RiffBusMusic, 0.04!, 0!, 0!)
+RiffFadeOut continuous, 2!
+```
+
+For readability, prefer `RiffPlayNoiseLoop` for continuous ambience.
+
+### RiffPlayNoiseOnBus
+
+```vb
+Public Function RiffPlayNoiseOnBus( _
+    ByVal busID As RiffBusId, _
+    Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, _
+    Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, _
+    Optional ByVal pan As Single = 0!, _
+    Optional ByVal durationSec As Single = RIFF_DEFAULT_NOISE_DURATION_SEC _
+) As Long
+```
+
+Bus-first helper for short noise one-shots. This exists to avoid ambiguity in call sites where the first argument should visually be the destination bus.
+
+```vb
+RiffPlayNoiseOnBus RiffBusSfx
+RiffPlayNoiseOnBus RiffBusUi, RiffWaveWhiteNoise, 0.05!, 0!, 0.025!
+```
+
+### RiffPlayNoiseLoop
+
+```vb
+Public Function RiffPlayNoiseLoop( _
+    Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, _
+    Optional ByVal busID As RiffBusId = RiffBusMain, _
+    Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, _
     Optional ByVal pan As Single = 0! _
 ) As Long
 ```
 
-Starts an infinite noise voice. Use white, pink, or brown noise depending on the texture you need.
+Creates continuous procedural noise for ambience or synthesis. Stop or fade out the returned voice manually.
+
+```vb
+Dim rain As Long
+rain = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.045!)
+RiffVoiceSetFilterHz rain, 2400!, 100!
+RiffVoiceApplyPreset rain, RiffFxRain, 0.55!
+```
+
+### RiffPlayNoiseLoopOnBus
+
+```vb
+Public Function RiffPlayNoiseLoopOnBus( _
+    ByVal busID As RiffBusId, _
+    Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, _
+    Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, _
+    Optional ByVal pan As Single = 0! _
+) As Long
+```
+
+Bus-first continuous noise helper.
 
 ```vb
 Dim wind As Long
-wind = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.06!)
-RiffVoiceLowPass(wind) = 0.4!
-RiffVoiceReverbMix(wind) = 0.2!
-```
-
-Explosion rumble layer:
-
-```vb
-Dim rumble As Long
-rumble = RiffPlayNoise(RiffWaveBrownNoise, RiffBusSfx, 0.12!)
-RiffVoiceLowPass(rumble) = 0.2!
-RiffFadeOut rumble, 0.8!
+wind = RiffPlayNoiseLoopOnBus(RiffBusMusic, RiffWavePinkNoise, 0.035!)
 ```
 
 ### Compatibility Playback Helpers
 
-These remain available for older code. New code should prefer `RiffPlay`, `RiffPlayOnce`, `RiffPlayOscillator`, and `RiffPlayNoise` with optional bus arguments.
+These remain available for older code. New code should prefer `RiffPlay`, `RiffPlayOnce`, `RiffPlayOscillator`, `RiffPlayNoise`, `RiffPlayNoiseOnBus`, and `RiffPlayNoiseLoop`.
 
 ```vb
 Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
 Public Function RiffPlayBusOnce(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
-Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
-Public Function RiffPlayNoiseBus(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = 0!) As Long
+Public Function RiffPlayNoiseBus(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = RIFF_DEFAULT_NOISE_DURATION_SEC) As Long
 ```
 
 ## Voice State and Transport
@@ -1769,6 +1983,42 @@ Sets low-pass and high-pass controls together.
 RiffVoiceSetFilter v, 0.35!, 0.05!
 ```
 
+### RiffVoiceSetFilterHz
+
+```vb
+Public Sub RiffVoiceSetFilterHz(ByVal voiceHandle As Long, ByVal lowPassHz As Single, Optional ByVal highPassHz As Single = 0!)
+```
+
+Sets low-pass and high-pass filters using real frequency values in Hz instead of normalized filter controls.
+
+```vb
+' Muffled wall/underwater style.
+RiffVoiceSetFilterHz v, 900!, 0!
+
+' Radio/telephone band.
+RiffVoiceSetFilterHz v, 3000!, 300!
+
+' Remove sub-rumble but keep most of the sound open.
+RiffVoiceSetFilterHz v, 0!, 80!
+```
+
+Parameters:
+
+| Parameter | Meaning |
+|:---|:---|
+| `lowPassHz` | Frequencies above this point are reduced. Use `0` to disable low-pass filtering. |
+| `highPassHz` | Frequencies below this point are reduced. Use `0` to disable high-pass filtering. |
+
+Common ranges:
+
+| Use | Typical Hz |
+|:---|:---|
+| Sub/rumble cleanup | high-pass `40` to `100` Hz |
+| Telephone/radio | high-pass `300` Hz, low-pass `3000` Hz |
+| Muffled wall/underwater | low-pass `600` to `1200` Hz |
+| Soft rain/wind noise | low-pass `1800` to `3500` Hz |
+| UI click/beep polish | low-pass `4000` to `8000` Hz |
+
 ### RiffVoiceApplyPreset
 
 ```vb
@@ -2098,6 +2348,12 @@ Normalized low-pass control. `1.0` is open/neutral. Lower values are more muffle
 
 ```vb
 RiffVoiceLowPass(v) = 0.35!
+```
+
+For exact cutoff-style control, prefer `RiffVoiceSetFilterHz` in new code:
+
+```vb
+RiffVoiceSetFilterHz v, 1200!, 0!
 ```
 
 #### RiffVoiceHighPass
@@ -2570,6 +2826,40 @@ RiffMasterApplyPreset RiffMasterFxGlue, 0.5!
 
 Avoid stacking heavy master coloration with many already-heavy voice presets unless that is the intended effect.
 
+### Keep Procedural Sources Finite by Default
+
+Use `RiffPlayNoise` for one-shot procedural effects and `RiffPlayNoiseLoop` only for intentional continuous ambience. This prevents accidental accumulation in gameplay loops.
+
+```vb
+' Good for SFX:
+RiffPlayNoise RiffWaveWhiteNoise, RiffBusSfx, 0.12!, 0!, 0.05!
+
+' Good for ambience:
+ambience = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.04!)
+```
+
+### Tune Burst Caps for Game Feel
+
+The default caps are conservative and safe for PowerPoint/Office hosts. For very dense action scenes, raise them carefully while watching diagnostics.
+
+```vb
+RiffMaxVoicesPerBuffer = 4
+RiffMaxVoicesPerBus = 18
+Debug.Print RiffActiveVoiceCount()
+```
+
+If the same SFX feels too aggressively limited, slightly increase `RiffMaxVoicesPerBuffer`. If gameplay stutters under heavy SFX, lower it.
+
+### Prefer Hz Filters for Sound Design
+
+Normalized low/high-pass properties are lightweight and compatible with old code, but Hz helpers are easier to reason about when designing game audio.
+
+```vb
+RiffVoiceSetFilterHz v, 3000!, 300!  ' radio/phone
+RiffVoiceSetFilterHz v, 900!, 0!     ' muffled
+RiffVoiceSetFilterHz v, 0!, 80!      ' remove sub-rumble
+```
+
 ## Troubleshooting
 
 ### `RiffOpen` returns `False`
@@ -2638,6 +2928,72 @@ RiffClose
 ```
 
 Use `RiffAutoSuspendTimer = True` for normal Office workflows.
+
+### Fast repeated SFX eventually stutter or feel like they accumulate
+
+Use the runtime counters to confirm whether voices are actually accumulating:
+
+```vb
+Debug.Print "Active:", RiffActiveVoiceCount()
+Debug.Print "SFX:", RiffBusVoiceCount(RiffBusSfx)
+Debug.Print "This buffer:", RiffBufferVoiceCount(sndHit, RiffBusSfx)
+```
+
+Expected behavior after a short burst:
+
+```txt
+Active voices should fall back toward 0 after finite sounds finish.
+Private memory should not climb continuously between test runs.
+Peak voices should not stay stuck at 32.
+```
+
+Recommended fixes:
+
+```vb
+RiffVoiceStealingEnabled = True
+RiffMaxVoicesPerBuffer = 4
+RiffMaxVoicesPerBus = 18
+```
+
+For procedural effects, avoid accidentally creating continuous sources:
+
+```vb
+' Short one-shot noise; safe for repeated gameplay triggers.
+RiffPlayNoise RiffWaveWhiteNoise, RiffBusSfx, 0.12!, 0!, 0.04!
+
+' Continuous noise; only for ambience, stop/fade manually.
+wind = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.04!)
+```
+
+### A sound starts with a small click/pop or a weird tiny artifact
+
+The stable build applies tiny safety ramps to new and released voices, but clicks can still happen if volume, filters, delay feedback, or preset changes are extreme. Prefer short finite durations and avoid forcing abrupt stop/start loops every frame.
+
+```vb
+v = RiffPlayOscillator(RiffWaveSquare, 880!, RiffBusUi, 0.18!, 0!, 0.05!)
+```
+
+For manually stopped continuous sounds, fade instead of stopping instantly:
+
+```vb
+RiffFadeOut windVoice, 0.25!
+```
+
+### A preset sounds wrong or too intense
+
+Preset amount is clamped, and the stable build sanitizes DSP values after preset application. Still, presets stack with existing voice/bus/master settings. Clear effects first when testing a preset in isolation:
+
+```vb
+RiffVoiceClearEffects v
+RiffVoiceApplyPreset v, RiffFxRadio, 0.7!
+```
+
+For bus-wide processing, remember that persistent presets affect future voices too:
+
+```vb
+RiffBusClearEffects RiffBusSfx
+RiffBusPresetEnabled(RiffBusSfx) = False
+```
 
 ### No sound from a bus
 
@@ -2712,6 +3068,38 @@ Reset the master stage:
 ```vb
 RiffMasterClearProcessors
 RiffMasterApplyPreset RiffMasterFxClean
+```
+
+## Stable Gameplay Build Notes
+
+These notes describe behavior that is important when using the current stable implementation behind the v1.0.9 documentation target.
+
+### Noise Semantics
+
+`RiffPlayNoise` is now intended for short one-shot noise SFX by default. This is different from older examples where noise was commonly started and then faded manually. The old continuous behavior is still available through `durationSec:=0`, but `RiffPlayNoiseLoop` is clearer.
+
+```vb
+RiffPlayNoise RiffWaveWhiteNoise, RiffBusSfx, 0.1!, 0!, 0.05!
+ambience = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.04!)
+```
+
+### Voice Reuse Hygiene
+
+When a voice is released, stopped, or stolen, the stable build clears lifetime counters, fade state, loop state, source metadata, and DSP state needed to prevent stale behavior from leaking into the next reused voice slot. This is especially important under heavy repeated SFX loads.
+
+### Preset Sanitation
+
+Voice and bus presets are treated as recipes, then clamped/sanitized. This prevents feedback, filter, delay, stereo width, drive, compressor, and modulation values from landing outside practical ranges after aggressive preset combinations.
+
+### Benchmark Expectations
+
+A healthy repeated-SFX benchmark should show:
+
+```txt
+Active voices after wait: 0
+Peak active voices: below the hard pool limit
+Private memory final-start: near 0 MB
+Underrun delta: low and not continuously rising
 ```
 
 ## Complete Public API Index
