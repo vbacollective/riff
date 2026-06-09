@@ -6,13 +6,13 @@
 
 <p align="center">
   <b>A high-performance, single-file audio engine for Microsoft Office.</b><br/>
-  Real-time WASAPI playback, Media Foundation decoding, Studio DSP, adaptive buffering, musical presets, and master bus processing.
+  Real-time WASAPI playback, Media Foundation decoding, Studio DSP, adaptive buffering, burst-safe playback, musical presets, master bus processing, and VBE-safe cleanup.
 </p>
 
 <p align="center">
   <img src="https://github.com/vbacollective/riff/actions/workflows/ci.yml/badge.svg" alt="CI" />
   <img src="https://github.com/vbacollective/riff/actions/workflows/release-assets.yml/badge.svg" alt="Release" />
-  <img src="https://img.shields.io/badge/version-v1.0.9-blue.svg" alt="Version" />
+  <img src="https://img.shields.io/github/v/release/vbacollective/riff" alt="Latest Version" />
   <img src="https://img.shields.io/badge/language-VBA-867DB1.svg" alt="Language" />
   <img src="https://img.shields.io/badge/platform-Windows-0078D6.svg" alt="Platform" />
   <img src="https://img.shields.io/badge/arch-32%20%26%2064--bit-green.svg" alt="Architecture" />
@@ -27,7 +27,7 @@
 
 Whether you are building interactive dashboards in Excel, immersive presentations in PowerPoint, educational tools in Word, or automation systems in Access, Riff provides a practical real-time audio layer powered by the Windows Audio Session API (WASAPI), Media Foundation, and a native timer-driven DSP loop.
 
-Riff is designed for developers who want game-like audio behavior inside Office: responsive UI sounds, background music, routed buses, persistent scene effects, master bus processing, soft limiting, fades, procedural oscillators, white/pink/brown noise, and safe cleanup when the host application closes.
+Riff is designed for developers who want game-like audio behavior inside Office: responsive UI sounds, background music, routed buses, persistent scene effects, master bus processing, soft limiting, fades, procedural oscillators, one-shot and looped white/pink/brown noise, burst-safe SFX playback, fast preset setup, and safe cleanup when the host application or the VBA editor resets.
 
 ## Key Capabilities
 
@@ -40,6 +40,12 @@ Riff is designed for developers who want game-like audio behavior inside Office:
 - **Duplicate Prevention:** `RiffPlayOnce` prevents music or repeated ambience from stacking accidentally.
 - **Adaptive Buffering:** Dynamically increases render queue safety during host stalls and returns to low latency when stable.
 - **Burst Protection:** Voice stealing, per-buffer caps, and per-bus caps reduce stutter when many SFX are triggered rapidly.
+- **Anti-Accumulation Playback:** Repeated short sounds, procedural noise, and oscillator beeps are capped and cleaned so game loops do not silently pile up voices.
+- **One-Shot Procedural Noise:** `RiffPlayNoise` is finite by default; use `RiffPlayNoiseLoop` for continuous ambience.
+- **Finite Oscillator Beeps:** `RiffPlayOscillator` accepts `durationSec` for procedural UI/game SFX that clean themselves automatically.
+- **Hz-Based Filtering:** `RiffVoiceSetFilterHz` exposes low-pass and high-pass filters using real frequency values.
+- **Lazy DSP Buffer Preparation:** Delay, reverb, chorus, and flanger ring buffers are prepared only when they are actually needed, reducing `Play` and preset setup cost.
+- **VBE-Safe Timer Cleanup:** Idle and Stop/Reset-safe cleanup reduce the chance of the VBA Editor staying stuck in `Running` mode or breaking IntelliSense.
 - **Studio DSP Pipeline:** Independent per-voice effects including Reverb, Delay, Chorus, Flanger, Compressor, EQ, Filters, Distortion, Bitcrusher, Ring Modulation, Tremolo, Auto-Pan, and Stereo Width.
 - **Musical Preset Packs:** Expanded voice presets for tape, VHS, dream pads, caves, tiny speakers, megaphones, retro game effects, wind, rain, horror drones, cinematic booms, and soft-focus scenes.
 - **Persistent Bus Effects:** Apply a preset to a whole bus so current and future voices inherit the scene style automatically.
@@ -113,6 +119,14 @@ End Sub
 > [!IMPORTANT]
 > Riff uses native callbacks and WASAPI COM interfaces. Always call `RiffClose` before resetting the VBA project, closing the document, or ending a slideshow.
 
+If you are actively developing in the VBA Editor and intentionally hit the **Stop/Reset** button during a test, the current stop-safe build is designed to kill orphaned timer callbacks automatically. If an old test build ever leaves the editor in a stuck state, call:
+
+```vb
+RiffEditorEmergencyStop
+```
+
+This is an editor recovery helper, not normal application shutdown. Production code should still use `RiffClose`.
+
 ## Basic Usage
 
 ### Load Assets Once
@@ -170,26 +184,47 @@ End Sub
 
 ### Generate a Procedural Sound
 
+Use `durationSec` for short procedural sounds. This avoids leaving a continuous oscillator running by accident.
+
 ```vb
 Public Sub PlayBeep()
-    Dim v As Long
-    v = RiffPlayOscillator(RiffWaveSine, 880, RiffBusUi, 0.25, 0)
+    RiffPlayOscillator RiffWaveSine, 880, RiffBusUi, 0.25, 0, 0.08
+End Sub
+```
 
-    If v >= 0 Then
-        RiffFadeOut v, 0.15
-    End If
+For continuous synthesis, pass `durationSec:=0` or omit it, then stop or fade the returned voice manually.
+
+```vb
+Public Sub StartLowHum()
+    Dim hum As Long
+    hum = RiffPlayOscillator(RiffWaveSine, 55, RiffBusSfx, 0.12, 0)
+    RiffFadeOut hum, 1.5
 End Sub
 ```
 
 ### Generate Noise
 
+`RiffPlayNoise` is a short one-shot by default. This is safer for game SFX because it prevents accidental infinite procedural voices.
+
+```vb
+Public Sub PlayDustHit()
+    Dim v As Long
+    v = RiffPlayNoise(RiffWaveWhiteNoise, RiffBusSfx, 0.08, 0, 0.05)
+
+    If v >= 0 Then
+        RiffVoiceSetFilterHz v, 2200, 180
+    End If
+End Sub
+```
+
+For continuous rain, wind, ambience, or drones, use `RiffPlayNoiseLoop`.
+
 ```vb
 Public Sub PlayRainLayer()
     Dim v As Long
-    v = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.08, 0)
+    v = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.08, 0)
 
     If v >= 0 Then
-        RiffVoiceLoop(v) = True
         RiffVoiceApplyPreset v, RiffFxRain, 0.65
         RiffVoiceStereoWidth(v) = 1.35
     End If
@@ -273,8 +308,9 @@ The recommended public API is intentionally compact:
 ```vb
 voice = RiffPlay(bufferHandle, busID, looped, volume, pan)
 voice = RiffPlayOnce(bufferHandle, busID, looped, volume, pan)
-voice = RiffPlayOscillator(waveType, frequencyHz, busID, volume, pan)
-voice = RiffPlayNoise(noiseType, busID, volume, pan)
+voice = RiffPlayOscillator(waveType, frequencyHz, busID, volume, pan, durationSec)
+voice = RiffPlayNoise(noiseType, busID, volume, pan, durationSec)
+voice = RiffPlayNoiseLoop(noiseType, busID, volume, pan)
 ```
 
 ### `RiffPlay`
@@ -294,18 +330,41 @@ musicVoice = RiffPlayOnce(sndMusic, RiffBusMusic, True, 0.5, 0)
 
 ### `RiffPlayOscillator`
 
+`frequencyHz` controls pitch. `durationSec` is optional: `0` means continuous, while a positive value creates a finite procedural one-shot.
+
 ```vb
+' Short retro UI beep.
+RiffPlayOscillator RiffWaveSquare, 880, RiffBusUi, 0.2, 0, 0.07
+
+' Continuous oscillator layer.
 Dim osc As Long
-osc = RiffPlayOscillator(RiffWaveSquare, 220, RiffBusSfx, 0.2, 0)
+osc = RiffPlayOscillator(RiffWaveSine, 55, RiffBusSfx, 0.12, 0)
 RiffFadeOut osc, 0.4
 ```
 
 ### `RiffPlayNoise`
 
+`RiffPlayNoise` is finite by default. Use it for dust hits, static bursts, impacts, wind puffs, and other short procedural SFX.
+
+```vb
+Dim dust As Long
+dust = RiffPlayNoise(RiffWaveWhiteNoise, RiffBusSfx, 0.12, 0, 0.04)
+RiffVoiceSetFilterHz dust, 2600, 180
+```
+
+For ambience, use the explicit loop helper:
+
 ```vb
 Dim wind As Long
-wind = RiffPlayNoise(RiffWaveBrownNoise, RiffBusSfx, 0.12, 0)
-RiffVoiceLowPass(wind) = 0.35
+wind = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.05, 0)
+RiffVoiceSetFilterHz wind, 1800, 80
+```
+
+Bus-first helpers are also available when readability matters:
+
+```vb
+RiffPlayNoiseOnBus RiffBusSfx, RiffWaveWhiteNoise, 0.08, 0, 0.03
+RiffPlayNoiseLoopOnBus RiffBusMusic, RiffWavePinkNoise, 0.04, 0
 ```
 
 ### Compatibility Wrappers
@@ -315,8 +374,11 @@ Older function names are kept for compatibility:
 ```vb
 RiffPlayBus bufferHandle, busID
 RiffPlayBusOnce bufferHandle, busID, looped
-RiffPlayOscillatorBus waveType, frequencyHz, busID
-RiffPlayNoiseBus noiseType, busID
+RiffPlayOscillatorBus waveType, frequencyHz, busID, volume, pan, durationSec
+RiffPlayNoiseBus noiseType, busID, volume, pan, durationSec
+RiffPlayNoiseOnBus busID, noiseType, volume, pan, durationSec
+RiffPlayNoiseLoop noiseType, busID, volume, pan
+RiffPlayNoiseLoopOnBus busID, noiseType, volume, pan
 ```
 
 They forward internally to the unified playback path.
@@ -374,6 +436,8 @@ RiffVoiceApplyPreset v, RiffFxWarmTape, 0.3  ' light coloration
 RiffVoiceApplyPreset v, RiffFxWarmTape, 0.7  ' stronger effect
 RiffVoiceApplyPreset v, RiffFxDry, 1.0       ' clear preset-style coloration
 ```
+
+The current performance build sanitizes preset values and prepares temporal DSP buffers lazily. Presets that do not actually use delay, reverb, chorus, or flanger no longer pay the cost of clearing large ring buffers during the `RiffVoiceApplyPreset` call.
 
 ## Persistent Bus Effects
 
@@ -478,6 +542,7 @@ RiffVoiceSetDelay v, 0.28, 0.45, 0.5
 RiffVoiceSetChorus v, 0.5, 1.2
 RiffVoiceSetFlanger v, 0.6, 0.35, 0.4
 RiffVoiceSetFilter v, 0.45, 0.05
+RiffVoiceSetFilterHz v, 3000, 300
 RiffVoiceClearEffects v
 ```
 
@@ -489,6 +554,21 @@ Use smoothing helpers to avoid clicks and sudden jumps.
 RiffVoiceVolumeTo musicVoice, 0.2, 500
 RiffVoicePanTo voice, -0.5, 150
 RiffVoicePitchTo voice, 1.2, 100
+```
+
+### Frequency-Based Filters
+
+Use `RiffVoiceSetFilterHz` when you want sound-design values that map to real audio frequencies.
+
+```vb
+' Telephone/radio band.
+RiffVoiceSetFilterHz voice, 3000, 300
+
+' Muffled wall or underwater style.
+RiffVoiceSetFilterHz voice, 900, 0
+
+' Remove sub-rumble while keeping the top end open.
+RiffVoiceSetFilterHz voice, 0, 80
 ```
 
 ## Noise and Oscillators
@@ -506,9 +586,27 @@ Riff supports both tonal oscillators and procedural noise.
 | `RiffWaveNoise` | Compatibility alias | Equivalent to white noise |
 
 ```vb
-RiffPlayOscillator RiffWaveSine, 440, RiffBusSfx, 0.2, 0
-RiffPlayNoise RiffWavePinkNoise, RiffBusSfx, 0.08, 0
+' A4 sine beep for 80 ms.
+RiffPlayOscillator RiffWaveSine, 440, RiffBusSfx, 0.2, 0, 0.08
+
+' Short pink-noise hit for 60 ms.
+RiffPlayNoise RiffWavePinkNoise, RiffBusSfx, 0.08, 0, 0.06
+
+' Continuous ambience.
+Dim rain As Long
+rain = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.05, 0)
 ```
+
+### One-Shot vs Loop Behavior
+
+The current stable build treats procedural noise as a one-shot by default. This is intentionally different from early builds, where noise behaved like an infinite generator unless manually stopped.
+
+| Task | Recommended Call |
+|:---|:---|
+| Dust burst, static tick, hit layer | `RiffPlayNoise(..., durationSec)` |
+| Rain, wind, fire, ambience bed | `RiffPlayNoiseLoop(...)` |
+| Short beep, coin, UI confirmation | `RiffPlayOscillator(..., durationSec)` |
+| Continuous synth/drone | `RiffPlayOscillator(..., durationSec:=0)` |
 
 ## WAV Fast Path
 
@@ -558,6 +656,8 @@ Stable state:
     target queue gradually returns to low latency
 ```
 
+The performance build can keep the endpoint warm with silence during rapid SFX bursts so the WASAPI buffer does not drain to zero between short sounds. The editor-safe build also auto-suspends the timer after idle time so the VBA Editor does not remain stuck in `Running` mode.
+
 ### Diagnostics
 
 ```vb
@@ -581,8 +681,8 @@ Triggering the same sound many times in a short time can overwhelm any small mix
 
 ```vb
 RiffVoiceStealingEnabled = True
-RiffMaxVoicesPerBuffer = 6
-RiffMaxVoicesPerBus = 20
+RiffMaxVoicesPerBuffer = 4
+RiffMaxVoicesPerBus = 18
 ```
 
 ### Diagnostics
@@ -597,8 +697,56 @@ Recommended values for UI-heavy Office projects:
 
 ```vb
 RiffMaxVoicesPerBuffer = 4
-RiffMaxVoicesPerBus = 16
+RiffMaxVoicesPerBus = 18
 ```
+
+## Performance and Stability Notes
+
+The current performance pass focuses on making the common gameplay path cheap while keeping the earlier anti-accumulation fixes intact.
+
+Key internal improvements include:
+
+- `RiffPlay` no longer clears large temporal ring buffers for dry one-shot voices.
+- `RiffVoiceApplyPreset` no longer eagerly clears delay/reverb/chorus/flanger buffers unless those stages are actually needed.
+- Temporal DSP buffer preparation is lazy and tied to the first render tick that needs it.
+- Voice allocation combines free-slot search, per-buffer caps, per-bus caps, and voice-steal candidates in a cheaper path.
+- Generated noise and oscillator one-shots use finite lifetimes and short release ramps.
+- Idle warm-buffer behavior reduces underruns during rapid SFX bursts.
+- Stop/Reset-safe editor cleanup kills stale timer callbacks after a VBE reset.
+
+Observed benchmark range from the stabilization/performance pass:
+
+```text
+Dry RiffPlay:          ~11–13 µs/call
+Noise one-shot:        ~13–15 µs/call
+Oscillator one-shot:   ~13–15 µs/call
+Preset/DSP setup:      ~20 µs/call
+Game-loop underruns:   0 in the final pumped benchmark
+Failed handles:        0 in the final benchmark
+```
+
+These numbers are not guaranteed across machines, Office versions, or host load, but they describe the target behavior: fast one-shot playback, no voice accumulation, stable memory, and low underrun counts during normal Office-hosted game loops.
+
+## VBA Editor Safety
+
+Riff uses a native timer callback to drive the render loop. That gives Office projects real-time audio behavior, but it also means the VBA Editor must not be left with an orphaned callback after a reset.
+
+The current stop-safe build includes additional cleanup for both idle and editor reset cases:
+
+- when idle, the timer can auto-suspend to release the VBE;
+- when the VBE Stop/Reset button is clicked, stale timer callbacks attempt to kill themselves;
+- `RiffEditorEmergencyStop` is available as a manual recovery helper for development sessions.
+
+Recommended development workflow:
+
+```vb
+Public Sub DevAudioReset()
+    RiffEditorEmergencyStop
+    RiffClose
+End Sub
+```
+
+Use this only while developing. Normal applications should call `RiffClose` from their shutdown path.
 
 ## Feature Summary
 
@@ -606,17 +754,17 @@ RiffMaxVoicesPerBus = 16
 |:---|:---|
 | **Core** | Single `.bas`, 32 voices, 64 buffers, 16 buses, x86/x64 support |
 | **I/O** | Media Foundation decoding, in-memory loading, WAV fast path, WAV export |
-| **Playback** | Unified `RiffPlay`, `RiffPlayOnce`, seeking, looping, fades, stop/reset behavior |
+| **Playback** | Unified `RiffPlay`, `RiffPlayOnce`, finite oscillator/noise one-shots, seeking, looping, fades, stop/reset behavior |
 | **Routing** | Bus volume, mute, solo, fade, peak meters, persistent bus presets, master volume |
-| **Stability** | Adaptive buffering, burst protection, voice stealing, cleanup safeguards |
+| **Stability** | Adaptive buffering, burst protection, voice stealing, idle timer cleanup, Stop/Reset-safe editor cleanup |
 | **Presets** | Core FX presets, musical preset packs, persistent bus effects, master presets |
 | **Master Processing** | Soft clip, low-pass, high-pass, 3-band EQ, compressor, drive, stereo width, output gain |
-| **Synthesis** | BLEP sine/square/saw, white noise, pink noise, brown noise |
+| **Synthesis** | BLEP sine/square/saw, finite oscillator beeps, one-shot and looped white/pink/brown noise |
 | **Dynamics** | Compressor, soft clipping, distortion, bitcrusher |
 | **Spatial** | Reverb, delay, stereo width, pan, auto-pan |
 | **Modulation** | Chorus, flanger, tremolo, ring modulation |
-| **Filters** | Biquad low-pass, high-pass, 3-band EQ |
-| **Diagnostics** | Underruns, render errors, clipped samples, buffer state, active voices |
+| **Filters** | Biquad low-pass, high-pass, Hz-based filter helper, 3-band EQ |
+| **Diagnostics** | Underruns, render errors, clipped samples, buffer state, active voice, bus voice, and buffer voice counters |
 | **Export** | Loaded buffer export and oscillator render to PCM WAV |
 
 ## v1.0.9 Highlights
@@ -627,6 +775,12 @@ RiffMaxVoicesPerBus = 16
 - Added master presets for glue, warm, bright, dark, radio, cinematic, night, and soft-limiter mixes.
 - Added manual master controls for filters, EQ, compression, drive, stereo width, output gain, and soft clipping.
 - Improved scene-level workflows for underwater, cave, dream, horror, retro, radio, and cinematic states.
+- Added gameplay-stability refinements for repeated SFX, procedural one-shots, and voice reuse.
+- Added finite `durationSec` support for generated oscillator and noise playback.
+- Added explicit `RiffPlayNoiseLoop` helpers for continuous procedural ambience.
+- Added `RiffVoiceSetFilterHz` for frequency-based filter setup.
+- Added editor-safe timer cleanup and `RiffEditorEmergencyStop` for development recovery.
+- Improved `RiffPlay` and preset setup performance through lazy temporal-buffer preparation.
 - Preserved the unified playback API and compatibility wrappers from v1.0.8.
 - Preserved adaptive buffering, burst safety, noise generation, WAV fast path, and diagnostics.
 
@@ -637,6 +791,7 @@ RiffMaxVoicesPerBus = 16
 - [**Effect Cookbook**](docs/EFFECT_COOKBOOK.md) – Ready-to-use recipes for voice presets, bus scenes, master processing, ambience, retro effects, and more.
 - [**Troubleshooting**](docs/TROUBLESHOOTING.md) – Fixes for initialization, device, stutter, cleanup, and host-specific issues.
 - [**Examples**](examples/README.md) – Practical demos and integration patterns.
+- [**Benchmarks**](benchmarks/) – Optional local stress tests for burst playback, game-loop playback, memory, underruns, and VBE timer behavior.
 
 ## Roadmap
 
@@ -656,9 +811,14 @@ RiffMaxVoicesPerBus = 16
 - [x] Master bus processors.
 - [x] Master processor presets.
 - [x] White, pink, and brown noise.
+- [x] One-shot and looped procedural noise helpers.
 - [x] BLEP oscillators.
+- [x] Finite oscillator duration support.
+- [x] Hz-based voice filter helper.
 - [x] Adaptive buffering.
 - [x] Burst-safe voice management.
+- [x] Lazy temporal-buffer preparation for faster `Play` and preset setup.
+- [x] VBE-safe idle and Stop/Reset timer cleanup.
 - [x] x86/x64 native thunk driver.
 - [x] Offline WAV export.
 - [x] Diagnostics and render counters.
@@ -679,12 +839,17 @@ For best performance in Office:
 - Prefer WAV for short SFX and UI sounds.
 - Preload assets at startup with `RiffLoad`.
 - Avoid decoding MP3/OGG during interaction-heavy moments.
-- Use `RiffPlayOnce` for music and ambience.
+- Use `RiffPlayOnce` for music and ambience loaded from buffers.
+- Use `RiffPlayNoiseLoop` for continuous procedural ambience instead of looping a default `RiffPlayNoise` one-shot.
+- Use `durationSec` for short oscillator beeps and procedural noise hits.
 - Use bus volume/fades instead of changing many voices one by one.
 - Use persistent bus presets for scene-wide effects.
 - Use master processors lightly for final polish rather than heavy per-sample coloration on every voice.
 - Keep effect-heavy processing for important voices only.
 - Use `RiffMaxVoicesPerBuffer` to prevent repeated button clicks from stacking too many copies.
+- Use `RiffVoiceSetFilterHz` when frequency-based filtering is clearer than normalized filter values.
+- Keep `RiffAutoSuspendTimer` enabled for editor stability unless you intentionally need a warm timer during heavy gameplay bursts.
+- Use `RiffEditorEmergencyStop` only as a development recovery helper if an old session leaves the VBE stuck.
 - Always call `RiffClose` on exit.
 
 > [!NOTE]
