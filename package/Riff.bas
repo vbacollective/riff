@@ -6,7 +6,7 @@ Attribute VB_Name = "Riff"
 ' * Studio DSP Pipeline featuring Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad EQ, Bitcrusher,
 ' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, Peak Meters, musical preset packs, and master bus processors.
 ' * @author UesleiDev
-' * @version 1.1.0
+' * @version 1.1.1
 ' */
 
 Option Explicit
@@ -654,6 +654,7 @@ Private Type RiffVoice
     CompEnv As Single
     
     RingWritePos As Long
+    RingPrepared As Boolean
     
     Looping As Boolean
     loopStart As Double
@@ -805,6 +806,9 @@ Private Const RIFF_RENDER_PERIOD_MS As Long = 10
 
 '/** @description Number of idle timer ticks before the render timer suspends itself to release the VBE. */
 Private Const RIFF_IDLE_TIMER_STOP_TICKS As Long = 50
+
+'/** @description Idle warm-silence ticks used when AutoSuspendTimer is False. Keeps fast SFX warm without leaving the VBE permanently Running. */
+Private Const RIFF_GAME_IDLE_TIMER_STOP_TICKS As Long = 20
 
 '/** @description Maximum audio chunk written per timer tick in milliseconds. Allows recovery after delayed Office/VBE ticks. */
 Private Const RIFF_MAX_WRITE_MS As Long = 180
@@ -1706,6 +1710,26 @@ Public Sub RiffClose()
     
     rCtx.Initialized = False
     RiffSetLastError RiffErrorNone
+End Sub
+
+'/**
+' * @function RiffEditorEmergencyStop
+' * @brief Forces the render timer guard off after an interrupted debug session.
+' * @remarks Normally not needed. It exists as a manual VBE recovery helper if the
+' *          project was reset while a timer callback was still pending.
+' */
+Public Sub RiffEditorEmergencyStop()
+    rCtx.MagicCookie = 0
+    If rCtx.TimerID <> 0 Then
+        KillTimer 0, rCtx.TimerID
+        rCtx.TimerID = 0
+    End If
+    If rCtx.TimerResolutionActive Then
+        timeEndPeriod RIFF_TIMER_RESOLUTION_MS
+        rCtx.TimerResolutionActive = False
+    End If
+    rCtx.TimerCallbackActive = False
+    rCtx.IdleTimerTicks = 0
 End Sub
 
 
@@ -3843,46 +3867,91 @@ End Function
 ' */
 Private Function InternalGetFreeVoice(Optional ByVal bufferHandle As Long = -1, Optional ByVal busID As RiffBusId = RiffBusMain) As Long
     Dim i As Long
+    Dim firstFree As Long
+    Dim bufferCount As Long
+    Dim busCount As Long
+    Dim bufferSteal As Long
+    Dim busSteal As Long
+    Dim globalSteal As Long
+    Dim bufferSerial As Long
+    Dim busSerial As Long
+    Dim globalSerial As Long
+
     InternalGetFreeVoice = -1
-    
-    If rCtx.VoiceStealingEnabled Then
-        If bufferHandle >= 0 Then
-            If rCtx.MaxVoicesPerBuffer > RIFF_VOICE_CAP_DISABLED Then
-                If RiffCountVoicesForBuffer(bufferHandle, busID) >= rCtx.MaxVoicesPerBuffer Then
-                    InternalGetFreeVoice = RiffFindStealVoiceForBuffer(bufferHandle, busID)
-                    If InternalGetFreeVoice >= 0 Then
-                        RiffReleaseVoice InternalGetFreeVoice
-                        Exit Function
+    firstFree = -1
+    bufferSteal = -1
+    busSteal = -1
+    globalSteal = -1
+    bufferSerial = 2147483647
+    busSerial = 2147483647
+    globalSerial = 2147483647
+
+    For i = 0 To RIFF_MAX_VOICE_INDEX
+        If rVoices(i).Active And rVoices(i).Playing Then
+            If rVoices(i).busID = busID Then
+                busCount = busCount + 1
+
+                If bufferHandle >= 0 Then
+                    If Not rVoices(i).IsOscillator Then
+                        If rVoices(i).BufferIndex = bufferHandle Then
+                            bufferCount = bufferCount + 1
+                            If Not rVoices(i).Looping Then
+                                If rVoices(i).StartSerial < bufferSerial Then
+                                    bufferSerial = rVoices(i).StartSerial
+                                    bufferSteal = i
+                                End If
+                            End If
+                        End If
+                    End If
+                End If
+
+                If Not rVoices(i).Looping Then
+                    If rVoices(i).StartSerial < busSerial Then
+                        busSerial = rVoices(i).StartSerial
+                        busSteal = i
                     End If
                 End If
             End If
+
+            If Not rVoices(i).Looping Then
+                If rVoices(i).StartSerial < globalSerial Then
+                    globalSerial = rVoices(i).StartSerial
+                    globalSteal = i
+                End If
+            End If
+        ElseIf firstFree = -1 Then
+            firstFree = i
         End If
-        
-        If rCtx.MaxVoicesPerBus > RIFF_VOICE_CAP_DISABLED Then
-            If RiffCountVoicesForBus(busID) >= rCtx.MaxVoicesPerBus Then
-                InternalGetFreeVoice = RiffFindStealVoiceForBus(busID)
-                If InternalGetFreeVoice >= 0 Then
-                    RiffReleaseVoice InternalGetFreeVoice
+    Next i
+
+    If rCtx.VoiceStealingEnabled Then
+        If bufferHandle >= 0 Then
+            If rCtx.MaxVoicesPerBuffer > RIFF_VOICE_CAP_DISABLED Then
+                If bufferCount >= rCtx.MaxVoicesPerBuffer And bufferSteal >= 0 Then
+                    RiffReleaseVoice bufferSteal
+                    InternalGetFreeVoice = bufferSteal
                     Exit Function
                 End If
             End If
         End If
-    End If
-    
-    For i = 0 To RIFF_MAX_VOICE_INDEX
-        If Not rVoices(i).Active Then
-            InternalGetFreeVoice = i
-            Exit Function
+
+        If rCtx.MaxVoicesPerBus > RIFF_VOICE_CAP_DISABLED Then
+            If busCount >= rCtx.MaxVoicesPerBus And busSteal >= 0 Then
+                RiffReleaseVoice busSteal
+                InternalGetFreeVoice = busSteal
+                Exit Function
+            End If
         End If
-    Next i
-    
-    If Not rCtx.VoiceStealingEnabled Then
+    End If
+
+    If firstFree >= 0 Then
+        InternalGetFreeVoice = firstFree
         Exit Function
     End If
-    
-    InternalGetFreeVoice = RiffFindGlobalStealVoice()
-    If InternalGetFreeVoice >= 0 Then
-        RiffReleaseVoice InternalGetFreeVoice
+
+    If rCtx.VoiceStealingEnabled And globalSteal >= 0 Then
+        RiffReleaseVoice globalSteal
+        InternalGetFreeVoice = globalSteal
     End If
 End Function
 
@@ -3901,6 +3970,7 @@ Private Sub RiffReleaseVoice(ByVal voiceHandle As Long)
     rVoices(voiceHandle).FadeFramesCurrent = 0
     rVoices(voiceHandle).LifeFramesTotal = 0
     rVoices(voiceHandle).LifeFramesCurrent = 0
+    rVoices(voiceHandle).RingPrepared = False
 End Sub
 
 '/**
@@ -4129,7 +4199,6 @@ Private Sub InternalResetVoiceDSP(ByVal slot As Long)
     rVoices(slot).pan = 0!
     rVoices(slot).Paused = False
     rVoices(slot).busID = RiffBusMain
-    rVoices(slot).noiseSeed = RiffMakeNoiseSeed(slot)
     rVoices(slot).NoisePinkB0 = 0!
     rVoices(slot).NoisePinkB1 = 0!
     rVoices(slot).NoisePinkB2 = 0!
@@ -4229,6 +4298,7 @@ Private Sub InternalResetVoiceDSP(ByVal slot As Long)
     rVoices(slot).DelayFeedback = 0!
     rVoices(slot).DelayMix = 0!
     rVoices(slot).RingWritePos = 0
+    rVoices(slot).RingPrepared = False
 
     rVoices(slot).Looping = False
     rVoices(slot).loopStart = 0#
@@ -4237,8 +4307,28 @@ Private Sub InternalResetVoiceDSP(ByVal slot As Long)
     rVoices(slot).FadeFramesCurrent = 0
     rVoices(slot).LifeFramesTotal = 0
     rVoices(slot).LifeFramesCurrent = 0
+End Sub
 
-    RtlZeroMemory VarPtr(rRingBuf(slot * RIFF_RING_SAMPLES_PER_VOICE)), RIFF_RING_SAMPLES_PER_VOICE * RIFF_SINGLE_BYTES
+'/**
+' * @function RiffPrepareVoiceRingBuffer
+' * @brief Clears the per-voice time-effect ring only when delay, chorus, flanger, or reverb is actually enabled.
+' */
+Private Sub RiffPrepareVoiceRingBuffer(ByVal voiceHandle As Long)
+    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then Exit Sub
+    If rVoices(voiceHandle).RingPrepared Then Exit Sub
+    rVoices(voiceHandle).RingWritePos = 0
+    RtlZeroMemory VarPtr(rRingBuf(voiceHandle * RIFF_RING_SAMPLES_PER_VOICE)), RIFF_RING_SAMPLES_PER_VOICE * RIFF_SINGLE_BYTES
+    rVoices(voiceHandle).RingPrepared = True
+End Sub
+
+'/**
+' * @function RiffMarkVoiceRingDirty
+' * @brief Marks the per-voice time-effect ring for lazy clearing on the next render tick.
+' * @param voiceHandle The active voice.
+' */
+Private Sub RiffMarkVoiceRingDirty(ByVal voiceHandle As Long)
+    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then Exit Sub
+    rVoices(voiceHandle).RingPrepared = False
 End Sub
 
 '/**
@@ -4592,6 +4682,7 @@ Public Sub RiffVoiceSetReverb(ByVal voiceHandle As Long, ByVal mix As Single, By
 
     rVoices(voiceHandle).ReverbMix = RiffClampUnit(mix)
     rVoices(voiceHandle).ReverbTime = RiffClampUnit(roomTime)
+    If rVoices(voiceHandle).ReverbMix > 0! Then RiffMarkVoiceRingDirty voiceHandle
 End Sub
 
 '/**
@@ -4615,6 +4706,7 @@ Public Sub RiffVoiceSetDelay(ByVal voiceHandle As Long, ByVal delayTime As Singl
     rVoices(voiceHandle).delayTime = delayTime
     rVoices(voiceHandle).DelayFeedback = feedback
     rVoices(voiceHandle).DelayMix = RiffClampUnit(mix)
+    If rVoices(voiceHandle).DelayMix > 0! And rVoices(voiceHandle).delayTime > 0! Then RiffMarkVoiceRingDirty voiceHandle
 End Sub
 
 '/**
@@ -4634,6 +4726,7 @@ Public Sub RiffVoiceSetChorus(ByVal voiceHandle As Long, ByVal depth As Single, 
 
     rVoices(voiceHandle).ChorusDepth = RiffClampUnit(depth)
     rVoices(voiceHandle).ChorusRate = rate
+    If rVoices(voiceHandle).ChorusDepth > 0! Then RiffMarkVoiceRingDirty voiceHandle
 End Sub
 
 '/**
@@ -4657,6 +4750,7 @@ Public Sub RiffVoiceSetFlanger(ByVal voiceHandle As Long, ByVal depth As Single,
     rVoices(voiceHandle).FlangerDepth = RiffClampUnit(depth)
     rVoices(voiceHandle).FlangerRate = rate
     rVoices(voiceHandle).FlangerFeedback = feedback
+    If rVoices(voiceHandle).FlangerDepth > 0! Then RiffMarkVoiceRingDirty voiceHandle
 End Sub
 
 '/**
@@ -5060,7 +5154,10 @@ Private Sub InternalClearVoiceEffects(ByVal voiceHandle As Long)
     rVoices(voiceHandle).DelayFeedback = 0!
     rVoices(voiceHandle).DelayMix = 0!
 
-    RtlZeroMemory VarPtr(rRingBuf(voiceHandle * RIFF_RING_SAMPLES_PER_VOICE)), RIFF_RING_SAMPLES_PER_VOICE * RIFF_SINGLE_BYTES
+    ' Do not clear the large time-effect ring here. Clearing the ring on every
+    ' preset application makes burst SFX expensive. Mark it stale instead; the
+    ' first delay/reverb/chorus/flanger enable will clear it lazily.
+    rVoices(voiceHandle).RingPrepared = False
 End Sub
 
 '/**
@@ -5456,6 +5553,7 @@ Public Property Let RiffVoiceFlangerDepth(ByVal voiceHandle As Long, ByVal value
         value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).FlangerDepth = value
+    If value > 0! Then RiffMarkVoiceRingDirty voiceHandle
 End Property
 
 '/**
@@ -5660,6 +5758,7 @@ Public Property Let RiffVoiceChorusDepth(ByVal voiceHandle As Long, ByVal value 
         value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).ChorusDepth = value
+    If value > 0! Then RiffMarkVoiceRingDirty voiceHandle
 End Property
 
 '/**
@@ -5706,6 +5805,7 @@ Public Property Let RiffVoiceReverbMix(ByVal voiceHandle As Long, ByVal value As
         value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).ReverbMix = value
+    If value > 0! Then RiffMarkVoiceRingDirty voiceHandle
 End Property
 
 '/**
@@ -5798,6 +5898,7 @@ Public Property Let RiffVoiceDelayMix(ByVal voiceHandle As Long, ByVal value As 
         value = RIFF_UNITY_GAIN
     End If
     rVoices(voiceHandle).DelayMix = value
+    If value > 0! And rVoices(voiceHandle).delayTime > 0! Then RiffMarkVoiceRingDirty voiceHandle
 End Property
 
 
@@ -6823,11 +6924,29 @@ Private Sub RiffTimerCallback(ByVal hWnd As LongPtr, ByVal uMsg As Long, ByVal i
 #Else
 Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEvent As Long, ByVal dwTime As Long)
 #End If
-    If rCtx.MagicCookie <> RIFF_MAGIC_COOKIE Then Exit Sub
-    If rCtx.TimerCallbackActive Then Exit Sub
-    If rCtx.TimerID <> 0 Then
-        If idEvent <> rCtx.TimerID Then Exit Sub
+    ' VBE Stop-button safety: when the user clicks the blue Stop/Reset square,
+    ' VBA globals can be reset before RiffClose has a chance to kill the Win32 timer.
+    ' The OS may still invoke this callback with the old timer id. In that stale
+    ' state, always kill the incoming timer id instead of just exiting, otherwise
+    ' the VBE can remain visually stuck between Running and idle and IntelliSense
+    ' may continue to fail until the host is restarted.
+    If rCtx.MagicCookie <> RIFF_MAGIC_COOKIE Then
+        If idEvent <> 0 Then KillTimer 0, idEvent
+        timeEndPeriod RIFF_TIMER_RESOLUTION_MS
+        Exit Sub
     End If
+
+    If rCtx.TimerID = 0 Then
+        If idEvent <> 0 Then KillTimer 0, idEvent
+        Exit Sub
+    End If
+
+    If idEvent <> rCtx.TimerID Then
+        If idEvent <> 0 Then KillTimer 0, idEvent
+        Exit Sub
+    End If
+
+    If rCtx.TimerCallbackActive Then Exit Sub
 
     rCtx.TimerCallbackActive = True
     
@@ -6937,6 +7056,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
     Dim sampleCount32 As Long
     Dim sampleCount16 As Long
     Dim sourceSampleCount As Long
+    Dim validSourceSampleCount As Long
     
     #If VBA7 Then
         Dim pData As LongPtr
@@ -6946,7 +7066,10 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
         Dim ptr As Long
     #End If
 
-    If Not RiffEngineHasActivePlayback() Then
+    Dim hasActivePlayback As Boolean
+    hasActivePlayback = RiffEngineHasActivePlayback()
+
+    If Not hasActivePlayback Then
         rCtx.MasterPeakL = rCtx.MasterPeakL * RIFF_MASTER_IDLE_PEAK_DECAY
         rCtx.MasterPeakR = rCtx.MasterPeakR * RIFF_MASTER_IDLE_PEAK_DECAY
 
@@ -6955,12 +7078,20 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
             If rCtx.IdleTimerTicks >= RIFF_IDLE_TIMER_STOP_TICKS Then
                 RiffStopRenderTimer
             End If
-        Else
-            rCtx.IdleTimerTicks = 0
-        End If
 
-        rCtx.TimerCallbackActive = False
-        Exit Sub
+            rCtx.TimerCallbackActive = False
+            Exit Sub
+        Else
+            ' Keep the WASAPI endpoint warm briefly for game loops, but do not keep
+            ' the VBA project permanently in Running state after playback becomes idle.
+            ' This preserves low-latency bursts while allowing VBE IntelliSense to recover.
+            rCtx.IdleTimerTicks = rCtx.IdleTimerTicks + 1
+            If rCtx.IdleTimerTicks >= RIFF_GAME_IDLE_TIMER_STOP_TICKS Then
+                RiffStopRenderTimer
+                rCtx.TimerCallbackActive = False
+                Exit Sub
+            End If
+        End If
     End If
     
     hr = vCall(rCtx.AudioClient, VTI_AUDIO_CLIENT_GET_CURRENT_PADDING, VarPtr(padding))
@@ -6979,7 +7110,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
         Exit Sub
     End If
 
-    If rCtx.RenderTickCount > 3 Then
+    If hasActivePlayback And rCtx.RenderTickCount > 3 Then
         If padding <= ((rCtx.sampleRate * RIFF_UNDERRUN_PADDING_MS) \ RIFF_MS_PER_SEC) Then
             RiffAdaptiveNotifyUnderrun
             If rCtx.AdaptiveTargetQueueMs < RIFF_QUEUE_PANIC_MS Then
@@ -7059,6 +7190,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     framesNeeded = Int(framesAvailable * ptch) + RIFF_WAV_EXPORT_CHANNELS
                     bytesNeeded = framesNeeded * align
                     sourceSampleCount = bytesNeeded \ 4
+                    validSourceSampleCount = sourceSampleCount
                     
                     If Not rVoices(i).IsOscillator Then
                         ptr = rCtx.Buffers(rVoices(i).BufferIndex).BufferPtr
@@ -7071,10 +7203,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                         
                         If isMixFloat32 Then
                             RiffEnsureSingleScratch rSrcArr32, rSrcArr32Cap, sourceSampleCount
-                            RiffClearSingleScratch rSrcArr32, sourceSampleCount
                         Else
                             RiffEnsureLongScratch rSrcArrI32, rSrcArrI32Cap, sourceSampleCount
-                            RiffClearLongScratch rSrcArrI32, sourceSampleCount
                         End If
 
                         If bytesNeeded <= bytesAvail Then
@@ -7091,6 +7221,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                     RtlMoveMemory VarPtr(rSrcArrI32(0)), ByVal (ptr + readPos), bytesAvail
                                 End If
                             End If
+                            If Not loopSnd Then validSourceSampleCount = bytesAvail \ 4
                             If loopSnd Then
                                 remBytes = bytesNeeded - bytesAvail
                                 Dim loopBytes32 As Long
@@ -7158,6 +7289,14 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     dSamples = Int(dTime * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                     dWrite = rVoices(i).RingWritePos
                     dBase = i * RIFF_RING_SAMPLES_PER_VOICE
+                    If Not rVoices(i).RingPrepared Then
+                        If (rMix > 0!) Or (dMix > 0! And dSamples > 0) Or (cDepth > 0!) Or (flgDepth > 0!) Then
+                            rVoices(i).RingWritePos = 0
+                            dWrite = 0
+                            RtlZeroMemory VarPtr(rRingBuf(dBase)), RIFF_RING_SAMPLES_PER_VOICE * RIFF_SINGLE_BYTES
+                            rVoices(i).RingPrepared = True
+                        End If
+                    End If
                     fadeState = rVoices(i).fadeState
                     fadeCur = rVoices(i).FadeFramesCurrent
                     fadeTot = rVoices(i).FadeFramesTotal
@@ -7184,6 +7323,15 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     Dim baseVol As Single
                     currentVoiceBus = rVoices(i).busID
                     baseVol = rVoices(i).volume * rCtx.MasterVolume * RiffBusMixVolume(currentVoiceBus)
+                    
+                    Dim panBase32 As Single
+                    Dim distActive32 As Boolean
+                    Dim filterActive32 As Boolean
+                    Dim timeFxActive32 As Boolean
+                    panBase32 = rVoices(i).pan
+                    distActive32 = (dist <> RIFF_DEFAULT_DISTORTION)
+                    filterActive32 = (lp <> RIFF_DEFAULT_FILTER_CONTROL Or hp <> 0! Or eqB <> RIFF_UNITY_GAIN Or eqM <> RIFF_UNITY_GAIN Or eqT <> RIFF_UNITY_GAIN)
+                    timeFxActive32 = (flgDepth > 0! Or cDepth > 0! Or (dMix > 0! And dSamples > 0) Or rMix > 0!)
                     
                     If nChannels = RIFF_WAV_EXPORT_CHANNELS Then
                         For frame = 0 To framesAvailable - 1
@@ -7241,20 +7389,20 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 sID = sBase32 * RIFF_WAV_EXPORT_CHANNELS
                                 sFrac32 = CSng(srcIdx - CDbl(sBase32))
                                 If isMixFloat32 Then
-                                    If sID + 3 < sourceSampleCount Then
+                                    If sID + 3 < validSourceSampleCount Then
                                         fL = rSrcArr32(sID) + ((rSrcArr32(sID + 2) - rSrcArr32(sID)) * sFrac32)
                                         fR = rSrcArr32(sID + 1) + ((rSrcArr32(sID + 3) - rSrcArr32(sID + 1)) * sFrac32)
-                                    ElseIf sID + 1 < sourceSampleCount Then
+                                    ElseIf sID + 1 < validSourceSampleCount Then
                                         fL = rSrcArr32(sID)
                                         fR = rSrcArr32(sID + 1)
                                     Else
                                         fL = 0!
                                         fR = 0!
                                     End If
-                                ElseIf sID + 3 < sourceSampleCount Then
+                                ElseIf sID + 3 < validSourceSampleCount Then
                                     fL = CSng((CDbl(rSrcArrI32(sID)) + ((CDbl(rSrcArrI32(sID + 2)) - CDbl(rSrcArrI32(sID))) * CDbl(sFrac32))) / RIFF_PCM32_SCALE)
                                     fR = CSng((CDbl(rSrcArrI32(sID + 1)) + ((CDbl(rSrcArrI32(sID + 3)) - CDbl(rSrcArrI32(sID + 1))) * CDbl(sFrac32))) / RIFF_PCM32_SCALE)
-                                ElseIf sID + 1 < sourceSampleCount Then
+                                ElseIf sID + 1 < validSourceSampleCount Then
                                     fL = CSng(CDbl(rSrcArrI32(sID)) / RIFF_PCM32_SCALE)
                                     fR = CSng(CDbl(rSrcArrI32(sID + 1)) / RIFF_PCM32_SCALE)
                                 Else
@@ -7280,21 +7428,25 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 fR = Fix(fR * bdSteps) / bdSteps
                             End If
                             
-                            fL = fL * dist
-                            If fL > 1! Then
-                                fL = 1!
-                            ElseIf fL < -1! Then
-                                fL = -1!
+                            If distActive32 Then
+                                fL = fL * dist
+                                If fL > 1! Then
+                                    fL = 1!
+                                ElseIf fL < -1! Then
+                                    fL = -1!
+                                End If
+                                
+                                fR = fR * dist
+                                If fR > 1! Then
+                                    fR = 1!
+                                ElseIf fR < -1! Then
+                                    fR = -1!
+                                End If
                             End If
                             
-                            fR = fR * dist
-                            If fR > 1! Then
-                                fR = 1!
-                            ElseIf fR < -1! Then
-                                fR = -1!
+                            If filterActive32 Then
+                                RiffProcessVoiceFilters i, fL, fR, lp, hp, eqB, eqM, eqT
                             End If
-                            
-                            RiffProcessVoiceFilters i, fL, fR, lp, hp, eqB, eqM, eqT
                             
                             If rmMix > 0! Then
                                 Dim rmOsc As Single
@@ -7323,12 +7475,13 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                                 fR = midS - sideS * sWidth
                             End If
                             
-                            Dim bufInL As Single
-                            Dim bufInR As Single
-                            bufInL = fL
-                            bufInR = fR
-                            
-                            If flgDepth > 0! Then
+                            If timeFxActive32 Then
+                                Dim bufInL As Single
+                                Dim bufInR As Single
+                                bufInL = fL
+                                bufInR = fR
+                                
+                                If flgDepth > 0! Then
                                 Dim fDel As Long
                                 Dim fRd As Long
                                 Dim flgL As Single
@@ -7389,10 +7542,11 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             fL = RiffSanitizeSample(fL)
                             fR = RiffSanitizeSample(fR)
 
-                            rRingBuf(dBase + dWrite) = bufInL
-                            rRingBuf(dBase + dWrite + 1) = bufInR
-                            dWrite = dWrite + RIFF_WAV_EXPORT_CHANNELS
-                            If dWrite >= RIFF_RING_SAMPLES_PER_VOICE Then dWrite = 0
+                                rRingBuf(dBase + dWrite) = bufInL
+                                rRingBuf(dBase + dWrite + 1) = bufInR
+                                dWrite = dWrite + RIFF_WAV_EXPORT_CHANNELS
+                                If dWrite >= RIFF_RING_SAMPLES_PER_VOICE Then dWrite = 0
+                            End If
                             
                             If cmpRatio > 1! Then
                                 Dim pkL As Single
@@ -7419,7 +7573,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             End If
                             
                             Dim curPan As Single
-                            curPan = rVoices(i).pan
+                            curPan = panBase32
                             If apDepth > 0! Then
                                 curPan = curPan + (Sin(apPhase) * apDepth)
                                 If curPan > 1! Then
@@ -7535,6 +7689,7 @@ NextVoice32:
                     framesNeeded = Int(framesAvailable * ptch) + RIFF_WAV_EXPORT_CHANNELS
                     bytesNeeded = framesNeeded * align
                     sourceSampleCount = bytesNeeded \ 2
+                    validSourceSampleCount = sourceSampleCount
                     
                     If Not rVoices(i).IsOscillator Then
                         ptr = rCtx.Buffers(rVoices(i).BufferIndex).BufferPtr
@@ -7546,7 +7701,6 @@ NextVoice32:
                         If bytesAvail < 0 Then bytesAvail = 0
                         
                         RiffEnsureIntegerScratch rSrcArr16, rSrcArr16Cap, sourceSampleCount
-                        RiffClearIntegerScratch rSrcArr16, sourceSampleCount
 
                         If bytesNeeded <= bytesAvail Then
                             RtlMoveMemoryToInteger rSrcArr16(0), ByVal (ptr + readPos), bytesNeeded
@@ -7554,6 +7708,7 @@ NextVoice32:
                             If bytesAvail > 0 Then
                                 RtlMoveMemoryToInteger rSrcArr16(0), ByVal (ptr + readPos), bytesAvail
                             End If
+                            If Not loopSnd Then validSourceSampleCount = bytesAvail \ 2
                             If loopSnd Then
                                 remBytes = bytesNeeded - bytesAvail
                                 Dim loopBytes16 As Long
@@ -7617,6 +7772,14 @@ NextVoice32:
                     dSamples = Int(dTime * rCtx.sampleRate) * RIFF_WAV_EXPORT_CHANNELS
                     dWrite = rVoices(i).RingWritePos
                     dBase = i * RIFF_RING_SAMPLES_PER_VOICE
+                    If Not rVoices(i).RingPrepared Then
+                        If (rMix > 0!) Or (dMix > 0! And dSamples > 0) Or (cDepth > 0!) Or (flgDepth > 0!) Then
+                            rVoices(i).RingWritePos = 0
+                            dWrite = 0
+                            RtlZeroMemory VarPtr(rRingBuf(dBase)), RIFF_RING_SAMPLES_PER_VOICE * RIFF_SINGLE_BYTES
+                            rVoices(i).RingPrepared = True
+                        End If
+                    End If
                     fadeState = rVoices(i).fadeState
                     fadeCur = rVoices(i).FadeFramesCurrent
                     fadeTot = rVoices(i).FadeFramesTotal
@@ -7643,6 +7806,15 @@ NextVoice32:
                     Dim bVol16 As Single
                     cVoiceBus16 = rVoices(i).busID
                     bVol16 = rVoices(i).volume * rCtx.MasterVolume * RiffBusMixVolume(cVoiceBus16)
+                    
+                    Dim panBase16 As Single
+                    Dim distActive16 As Boolean
+                    Dim filterActive16 As Boolean
+                    Dim timeFxActive16 As Boolean
+                    panBase16 = rVoices(i).pan
+                    distActive16 = (dist <> RIFF_DEFAULT_DISTORTION)
+                    filterActive16 = (lp <> RIFF_DEFAULT_FILTER_CONTROL Or hp <> 0! Or eqB <> RIFF_UNITY_GAIN Or eqM <> RIFF_UNITY_GAIN Or eqT <> RIFF_UNITY_GAIN)
+                    timeFxActive16 = (flgDepth > 0! Or cDepth > 0! Or (dMix > 0! And dSamples > 0) Or rMix > 0!)
 
                     If nChannels = RIFF_WAV_EXPORT_CHANNELS Then
                         For frame = 0 To framesAvailable - 1
@@ -7728,21 +7900,25 @@ NextVoice32:
                                 fR = Fix(fR * bdSteps) / bdSteps
                             End If
                             
-                            fL = fL * dist
-                            If fL > 1! Then
-                                fL = 1!
-                            ElseIf fL < -1! Then
-                                fL = -1!
+                            If distActive16 Then
+                                fL = fL * dist
+                                If fL > 1! Then
+                                    fL = 1!
+                                ElseIf fL < -1! Then
+                                    fL = -1!
+                                End If
+                                
+                                fR = fR * dist
+                                If fR > 1! Then
+                                    fR = 1!
+                                ElseIf fR < -1! Then
+                                    fR = -1!
+                                End If
                             End If
                             
-                            fR = fR * dist
-                            If fR > 1! Then
-                                fR = 1!
-                            ElseIf fR < -1! Then
-                                fR = -1!
+                            If filterActive16 Then
+                                RiffProcessVoiceFilters i, fL, fR, lp, hp, eqB, eqM, eqT
                             End If
-                            
-                            RiffProcessVoiceFilters i, fL, fR, lp, hp, eqB, eqM, eqT
                             
                             If rmMix > 0! Then
                                 Dim rmOsc16 As Single
@@ -7771,12 +7947,13 @@ NextVoice32:
                                 fR = m16 - sd16 * sWidth
                             End If
                             
-                            Dim bufInL16 As Single
-                            Dim bufInR16 As Single
-                            bufInL16 = fL
-                            bufInR16 = fR
-                            
-                            If flgDepth > 0! Then
+                            If timeFxActive16 Then
+                                Dim bufInL16 As Single
+                                Dim bufInR16 As Single
+                                bufInL16 = fL
+                                bufInR16 = fR
+                                
+                                If flgDepth > 0! Then
                                 Dim fDel16 As Long
                                 Dim fRd16 As Long
                                 Dim flgL16 As Single
@@ -7837,10 +8014,11 @@ NextVoice32:
                             fL = RiffSanitizeSample(fL)
                             fR = RiffSanitizeSample(fR)
 
-                            rRingBuf(dBase + dWrite) = bufInL16
-                            rRingBuf(dBase + dWrite + 1) = bufInR16
-                            dWrite = dWrite + RIFF_WAV_EXPORT_CHANNELS
-                            If dWrite >= RIFF_RING_SAMPLES_PER_VOICE Then dWrite = 0
+                                rRingBuf(dBase + dWrite) = bufInL16
+                                rRingBuf(dBase + dWrite + 1) = bufInR16
+                                dWrite = dWrite + RIFF_WAV_EXPORT_CHANNELS
+                                If dWrite >= RIFF_RING_SAMPLES_PER_VOICE Then dWrite = 0
+                            End If
                             
                             If cmpRatio > 1! Then
                                 Dim pkL16 As Single
@@ -7867,7 +8045,7 @@ NextVoice32:
                             End If
                             
                             Dim cPan16 As Single
-                            cPan16 = rVoices(i).pan
+                            cPan16 = panBase16
                             If apDepth > 0! Then
                                 cPan16 = cPan16 + (Sin(apPhase) * apDepth)
                                 If cPan16 > 1! Then
@@ -7964,7 +8142,14 @@ NextVoice16:
             End If
         End If
     Else
-        rCtx.IdleTimerTicks = 0
+        If RiffEngineHasActivePlayback() Then
+            rCtx.IdleTimerTicks = 0
+        Else
+            rCtx.IdleTimerTicks = rCtx.IdleTimerTicks + 1
+            If rCtx.IdleTimerTicks >= RIFF_GAME_IDLE_TIMER_STOP_TICKS Then
+                RiffStopRenderTimer
+            End If
+        End If
     End If
 
     rCtx.TimerCallbackActive = False
