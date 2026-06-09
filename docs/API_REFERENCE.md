@@ -2,7 +2,7 @@
 
 **Riff.bas** is a high-performance VBA audio engine for Windows Office hosts. It uses Media Foundation for decoding, WASAPI shared-mode output for playback, and a real-time DSP pipeline written directly in VBA with a small native timer thunk. It supports x86 and x64 VBA, static audio buffers, polyphonic voices, audio buses, synthetic oscillators, white/pink/brown noise, WAV export, peak meters, adaptive buffering, musical preset packs, master bus processors, and a full per-voice effects chain.
 
-This reference includes the current stability/performance pass: anti-accumulation voice caps, finite procedural one-shots, Hz-based filter helpers, lazy temporal-buffer preparation, faster `RiffPlay`/preset setup, warm-silence underrun protection, and the VBE-safe idle timer that prevents IntelliSense from being held in a permanent running state.
+This reference includes the current stability/performance pass: anti-accumulation voice caps, finite procedural one-shots, Hz-based filter helpers, lazy temporal-buffer preparation, faster `RiffPlay`/preset setup, warm-silence underrun protection, the VBE-safe idle timer that prevents IntelliSense from being held in a permanent running state, and stop/reset-safe editor cleanup for manual VBE interruptions.
 
 ```vb
 voice = RiffPlay(bufferHandle, RiffBusSfx, False, 0.9, 0!)
@@ -24,6 +24,7 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!, 0.12!)
   - [Adaptive Buffering](#adaptive-buffering)
   - [Timer and Host Behavior](#timer-and-host-behavior)
   - [VBE-Safe Idle Timer](#vbe-safe-idle-timer)
+  - [Stop/Reset-Safe Editor Cleanup](#stopreset-safe-editor-cleanup)
   - [Performance Model](#performance-model)
   - [DSP Pipeline](#dsp-pipeline)
   - [Oscillators and Noise](#oscillators-and-noise)
@@ -338,7 +339,28 @@ Public Sub AudioInitForOfficeTool()
 End Sub
 ```
 
-If IntelliSense ever appears stuck after a manual break/reset during development, call `RiffClose` once to force all timers, voices, buffers, and COM state to be released.
+If IntelliSense ever appears stuck after a manual break/reset during development, the current stop-safe build can also use `RiffEditorEmergencyStop` to kill leftover editor timers/callbacks without requiring a full asset unload.
+
+### Stop/Reset-Safe Editor Cleanup
+
+The VBE Stop/Reset button is a special case because it can reset VBA variables while an old Windows timer callback is still pending. In affected builds, this could leave a stale timer calling back into a reset project, which made the VBE title bar flicker and kept IntelliSense disabled until the user paused/stopped the project again.
+
+The stop-safe build protects against this in two layers:
+
+```txt
+Normal idle after audio  -> VBE-safe idle policy stops the timer automatically
+Manual VBE Stop/Reset   -> stale timer callback self-kills its received timer id
+Unknown old timer id    -> callback treats it as orphaned and kills it
+Emergency editor cleanup -> RiffEditorEmergencyStop kills/suspends editor-side timer state
+```
+
+This means a manual click on the VBE Stop/Reset button should no longer leave Riff in a half-running editor state. For normal application shutdown, still prefer `RiffClose`; for a development-only emergency cleanup, use `RiffEditorEmergencyStop`.
+
+```vb
+Public Sub DevAudioEmergencyStop()
+    RiffEditorEmergencyStop
+End Sub
+```
 
 ### Performance Model
 
@@ -719,6 +741,32 @@ Private Sub Workbook_BeforeClose(Cancel As Boolean)
 End Sub
 ```
 
+### RiffEditorEmergencyStop
+
+```vb
+Public Sub RiffEditorEmergencyStop()
+```
+
+Development/emergency cleanup helper for the VBA editor. It is intended for the rare case where a manual VBE Stop/Reset or an older test build leaves a stale render timer/callback alive after the project has been interrupted.
+
+Unlike `RiffClose`, this helper is primarily editor-focused: it force-stops the render timer path and clears the state that can keep the VBE visually stuck in `Running` mode. Use it as a recovery tool while developing, not as the normal shutdown path for a finished workbook or presentation.
+
+```vb
+Public Sub AudioEmergencyResetForEditor()
+    RiffEditorEmergencyStop
+End Sub
+```
+
+Recommended normal shutdown still remains:
+
+```vb
+Public Sub AudioShutdown()
+    RiffClose
+End Sub
+```
+
+Use `RiffEditorEmergencyStop` when the editor itself is the problem: IntelliSense remains disabled, the title bar keeps flickering, or a previous manual Stop/Reset left Riff in a stale timer state.
+
 ### RiffIsInitialized
 
 ```vb
@@ -777,7 +825,7 @@ RiffAutoSuspendTimer = True
 
 When `True`, Riff aggressively suspends the timer after idle periods, which is the safest mode for normal Office tools, demos, and editing workflows.
 
-When `False`, Riff keeps the audio path warm for rapid repeated playback, which is useful for games with lots of short SFX. In the VBE-safe performance build, this no longer means the timer stays alive forever: after a short warm-idle period with no active voices, Riff still stops the timer automatically so the VBE can return to a normal editable state and IntelliSense can recover.
+When `False`, Riff keeps the audio path warm for rapid repeated playback, which is useful for games with lots of short SFX. In the VBE-safe performance build, this no longer means the timer stays alive forever: after a short warm-idle period with no active voices, Riff still stops the timer automatically so the VBE can return to a normal editable state and IntelliSense can recover. In the stop-safe build, stale timer callbacks caused by the VBE Stop/Reset button are also self-terminated so the editor is not left flickering in a half-running state.
 
 ```vb
 ' Game-style usage: responsive bursts, still VBE-safe after idle.
@@ -2953,10 +3001,16 @@ Public Sub AudioDevReset()
     RiffSuspend
 End Sub
 
+Public Sub AudioEditorEmergencyStop()
+    RiffEditorEmergencyStop
+End Sub
+
 Public Sub AudioFullShutdown()
     RiffClose
 End Sub
 ```
+
+Use `RiffEditorEmergencyStop` only when the VBE/editor is stuck after a manual Stop/Reset or an interrupted test run. Use `RiffClose` for real shutdown and release of audio resources.
 
 For gameplay tests, `RiffAutoSuspendTimer = False` is acceptable because the current build keeps audio warm only briefly while idle. For macro tools, examples, and code snippets that users may run from the VBE, prefer `True`.
 
@@ -3062,7 +3116,14 @@ If underruns increase, reduce expensive UI work, avoid busy-wait loops, preload 
 
 This usually means a timer/callback is still active and the VBA project is being kept in a running state. In affected builds, this could make IntelliSense stop working or make the VBE title bar flicker between normal and running states.
 
-The VBE-safe performance build reduces this by stopping the render timer automatically after a short idle period, even when `RiffAutoSuspendTimer = False` was used for game-style warm playback.
+There are two related cases:
+
+```txt
+Idle timer case       -> audio finished, but timer stayed alive too long
+Manual Stop/Reset case -> VBE reset variables while an old timer callback was pending
+```
+
+The VBE-safe performance build reduces the first case by stopping the render timer automatically after a short idle period, even when `RiffAutoSuspendTimer = False` was used for game-style warm playback. The stop-safe build also handles the second case by having stale timer callbacks kill their received timer id instead of continuing to wake the editor.
 
 For immediate recovery during development, call:
 
@@ -3071,7 +3132,13 @@ RiffStopAll
 RiffSuspend
 ```
 
-For full cleanup:
+If the editor is still visibly stuck, or if this happened after clicking the VBE Stop/Reset button, use the editor emergency helper:
+
+```vb
+RiffEditorEmergencyStop
+```
+
+For full cleanup and resource release:
 
 ```vb
 RiffClose
@@ -3087,7 +3154,7 @@ RiffAutoSuspendTimer = True
 RiffAutoSuspendTimer = False
 ```
 
-If IntelliSense is still stuck after a manual break or host-level interruption, run `RiffClose` once and then start the engine again with `RiffOpen`.
+If IntelliSense is still stuck after a manual break or host-level interruption, run `RiffEditorEmergencyStop` first. If you want a full engine restart, then run `RiffClose` and start again with `RiffOpen`.
 
 ### Fast repeated SFX eventually stutter or feel like they accumulate
 
@@ -3298,6 +3365,7 @@ Public Enum RiffErrorCode
 ```vb
 Public Function RiffOpen() As Boolean
 Public Sub RiffClose()
+Public Sub RiffEditorEmergencyStop()
 Public Property Get RiffIsInitialized() As Boolean
 Public Property Get RiffAutoSuspendTimer() As Boolean
 Public Property Let RiffAutoSuspendTimer(ByVal value As Boolean)
