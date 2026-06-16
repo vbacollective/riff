@@ -1,6 +1,6 @@
 # Riff Architecture
 
-Riff is a single-file VBA audio engine for Windows Office hosts. It combines Media Foundation decoding, WASAPI shared-mode output, a native timer thunk, a real-time DSP mixer, per-voice effects, persistent bus presets, and optional master bus processing while remaining contained inside one `.bas` module.
+Riff is a single-file VBA audio engine for Windows Office hosts. It combines Media Foundation decoding, WASAPI shared-mode output, a native timer thunk, a real-time DSP mixer, per-voice effects, persistent bus presets, optional master bus processing, dynamically growing audio pools, and editor-safe development guards while remaining contained inside one `.bas` module.
 
 ## Table of Contents
 
@@ -12,6 +12,8 @@ Riff is a single-file VBA audio engine for Windows Office hosts. It combines Med
   - [RiffBuffer Pool](#riffbuffer-pool)
   - [RiffVoice Pool](#riffvoice-pool)
   - [RiffBus State](#riffbus-state)
+  - [Dynamic Pool Growth](#dynamic-pool-growth)
+  - [Capacity Reservation](#capacity-reservation)
   - [Master Processor State](#master-processor-state)
   - [Ring Buffer](#ring-buffer)
 - [Initialization Sequence](#initialization-sequence)
@@ -28,11 +30,13 @@ Riff is a single-file VBA audio engine for Windows Office hosts. It combines Med
 - [Playback Allocation](#playback-allocation)
   - [Unified Playback Entry Point](#unified-playback-entry-point)
   - [Voice Allocation](#voice-allocation)
+  - [Pool Growth During Playback](#pool-growth-during-playback)
   - [Voice Stealing](#voice-stealing)
   - [Burst Caps](#burst-caps)
   - [RiffPlayOnce](#riffplayonce)
 - [DSP Timer Callback](#dsp-timer-callback)
   - [Callback Guards](#callback-guards)
+  - [Editor-Safe Development Mode](#editor-safe-development-mode)
   - [Adaptive Buffering](#adaptive-buffering)
   - [WASAPI Buffer Acquisition](#wasapi-buffer-acquisition)
   - [Voice Iteration](#voice-iteration)
@@ -107,7 +111,7 @@ graph TD
     style F fill:#ddd,stroke:#333,stroke-width:2px
 ```
 
-The public API remains small and handle-based. The user loads a buffer, starts a voice, routes it to a bus, and optionally applies presets or DSP parameters. Internally, Riff performs real-time mixing into the WASAPI render buffer.
+The public API remains small and handle-based. The user loads a buffer, starts a voice, routes it to a bus, and optionally applies presets or DSP parameters. Internally, Riff performs real-time mixing into the WASAPI render buffer. Current NEXT builds also treat buffers, voices, and bus storage as expandable `SafeArray` pools rather than small permanent limits, while preserving the same numeric handle style.
 
 ## Design Goals
 
@@ -120,7 +124,8 @@ Riff is built around a few strict goals:
 | Office compatibility | Pure VBA API surface, x86/x64 declarations, safe cleanup paths. |
 | Game-like audio | Polyphonic voices, buses, fades, looping, noise, oscillators, presets. |
 | Practical performance | Native timer thunk, scratch buffers, direct memory copies, fast WAV path. |
-| Safe host behavior | `EbMode` guard, `MagicCookie`, timer suspend/wake, explicit shutdown. |
+| Safe host behavior | `EbMode` guard, `MagicCookie`, timer suspend/wake, explicit shutdown, manual editor-safe pause/resume. |
+| Scalable projects | Dynamic `SafeArray` pools for buffers, voices, and buses instead of small hardcoded capacities. |
 | Musical workflow | Preset packs, persistent bus effects, master processing, scene recipes. |
 
 The engine is not a replacement for a native C/Rust audio thread. It is a highly optimized real-time audio system hosted inside Office/VBA.
@@ -159,27 +164,42 @@ Typical categories inside the context:
 | WASAPI pointers | device enumerator, device, audio client, render client, mix format |
 | Timer | thunk pointer, timer id, auto-suspend state |
 | Master | master volume, master peaks, soft clip, master processor state |
-| Buses | 16 bus states |
-| Buffers | 64 buffer slots |
+| Buses | dynamic bus states, initialized with the standard 16 built-in buses |
+| Buffers | dynamic decoded buffer slots, initialized with 64 slots |
 | Diagnostics | underruns, render errors, clipped samples, last padding/written frames |
 
 The `MagicCookie` is a defensive guard. It is set during `RiffOpen` and cleared early in `RiffClose`. Timer callbacks check it before touching engine state.
 
 ### RiffBuffer Pool
 
-Riff uses a fixed pool of 64 decoded audio buffers. Each slot stores:
+Riff uses a dynamic pool of decoded audio buffers. Older builds used a fixed 64-slot pool; the NEXT 1.2.1 architecture keeps 64 as the initial capacity for compatibility, then grows the pool automatically when loading more assets.
+
+Each slot stores:
 
 | Field | Purpose |
 |:---|:---|
 | `Active` | slot contains valid decoded PCM |
 | `BufferPtr` | pointer to `VirtualAlloc` memory |
 | `BufferLen` | decoded PCM size in bytes |
+| `FrameCount` / duration metadata | playback length and transport calculations |
+| format metadata | sample rate, channel/layout information when needed by the current build |
 
-The buffer pool avoids allocating VBA objects per sound. PCM data is stored in native memory, and the mixer reads from it using byte offsets.
+The buffer pool still avoids allocating VBA objects per sound. PCM data is stored in native memory, and the mixer reads from it using byte offsets. The important change is that "no free buffer" is no longer a normal hard ceiling at 64. When the current array is full, Riff attempts to grow the `SafeArray`, initialize the new slots, and return a valid handle from the expanded capacity.
+
+Buffer handles remain plain numeric indexes. Existing projects that store handles in `Long` variables keep working:
+
+```txt
+old behavior: valid handles were normally 0..63
+new behavior: valid handles are 0..RiffMaxBuffers-1, where capacity can grow
+```
+
+`RiffMaxBuffers` reports the current capacity, not an absolute engine limit.
 
 ### RiffVoice Pool
 
-Riff uses a fixed pool of 32 voices. Each `RiffVoice` contains playback state and its complete DSP state.
+Riff uses a dynamic pool of voices. Older builds used a fixed 32-voice pool; the NEXT 1.2.1 architecture keeps 32 as the initial capacity, then grows the pool when the project needs more simultaneous playback instances.
+
+Each `RiffVoice` contains playback state and its complete DSP state.
 
 Major categories:
 
@@ -195,7 +215,7 @@ Major categories:
 | Noise | per-voice random/noise filter state |
 | Ring buffer | write pointer and tap state |
 
-The fixed voice pool keeps iteration simple and predictable:
+The voice pool is still array-based because that is faster and simpler than object allocation in the render path. The difference is that the array capacity can now expand through `SafeArray` growth.
 
 ```vb
 For i = 0 To RiffMaxVoices - 1
@@ -205,9 +225,13 @@ For i = 0 To RiffMaxVoices - 1
 Next i
 ```
 
+`RiffMaxVoices` reports the current voice capacity. It starts at the legacy default, but it can grow when Riff allocates more voices or when the user reserves capacity explicitly.
+
 ### RiffBus State
 
-Each of the 16 buses stores group-level mixer state:
+Riff starts with the standard 16 bus layout (`Main`, `Sfx`, `Music`, `Voice`, `Ui`, and `Aux1` through `Aux11`). In NEXT 1.2.1 the internal bus state is stored in a dynamic array as well. The built-in bus enum remains stable, while the internal architecture can reserve more bus state if a project build exposes additional custom buses later.
+
+Each bus stores group-level mixer state:
 
 | State | Purpose |
 |:---|:---|
@@ -221,6 +245,55 @@ Each of the 16 buses stores group-level mixer state:
 | Persistent preset amount | preset intensity |
 
 The persistent bus preset fields are a v1.0.9 addition. They make scene-wide effects practical in slide-based or UI-heavy projects because new voices automatically inherit the current scene coloration.
+
+### Dynamic Pool Growth
+
+The NEXT 1.2.1 architecture removes the old idea that buffers and voices are permanently limited by small compile-time constants. The engine still begins with practical defaults so old projects behave the same at startup, but those defaults are now capacities, not final limits.
+
+```txt
+Initial buffer capacity -> 64 slots
+Initial voice capacity  -> 32 slots
+Initial bus capacity    -> 16 built-in buses
+Growth strategy         -> ReDim Preserve / SafeArray expansion
+Handle model            -> numeric index remains unchanged
+```
+
+The main design rule is simple: growth must happen outside the inner render hot path whenever possible. Loading more assets can grow the buffer array. Creating more voices can grow the voice array. The actual DSP callback should only iterate the current capacity and avoid resizing while it is actively mixing.
+
+To support that, Riff uses internal guards around pool growth. A resize is treated as a structural mutation of the engine state. The callback checks those guards and avoids touching partially resized arrays.
+
+This gives the project a more flexible memory model while keeping the old fast array iteration model:
+
+```txt
+small project -> pays only for initial arrays
+large project -> can grow as needed
+existing code -> still stores Long handles
+```
+
+There is still no such thing as "infinite" audio in a literal sense. The practical limit becomes available memory, Office bitness, decoded PCM size, and CPU cost of active voices/effects.
+
+### Capacity Reservation
+
+The public reservation helpers let a project request a larger pool before gameplay starts:
+
+```vb
+RiffReserveBuffers 500
+RiffReserveVoices 128
+RiffReserveBuses 32
+```
+
+This is useful for large PowerPoint games, visual novels, RPG menus, or asset-heavy projects where the author already knows the approximate amount of audio needed.
+
+Reservation is not required. It is an optimization and stability tool:
+
+| Pattern | Behavior |
+|:---|:---|
+| No reservation | Riff grows automatically when needed. |
+| Early reservation | Riff grows once during setup, avoiding later `ReDim Preserve` during gameplay. |
+| Over-reservation | Uses more VBA array memory, but does not decode audio by itself. |
+| Active decoded buffers | Still consume native PCM memory through `VirtualAlloc`. |
+
+For best results, reserve during initialization before starting the main audio loop or gameplay scene.
 
 ### Master Processor State
 
@@ -254,10 +327,12 @@ The design is a contiguous 1D layout divided into per-voice regions:
 voice 0 region -> rRingBuf(0 ... N-1)
 voice 1 region -> rRingBuf(N ... 2N-1)
 ...
-voice 31 region
+voice RiffMaxVoices-1 region
 ```
 
 A 1D layout is intentional. It allows clearing one voice's region with a single memory operation and avoids confusion caused by VBA's multi-dimensional array layout.
+
+With dynamic voices, the ring buffer must track the current voice capacity. When the voice pool grows, the temporal-effect storage may also need to grow so each voice still has an isolated region. Riff keeps temporal-effect preparation lazy: dry SFX and simple filtered sounds should not pay the full cost of clearing or preparing delay/reverb/chorus/flanger memory unless those effects are actually used.
 
 The ring buffer is used by:
 
@@ -273,7 +348,7 @@ The ring buffer is used by:
 ```mermaid
 graph TD
     A["RiffOpen"]
-    B["Initialize context defaults<br/>magic cookie, buses, master state"]
+    B["Initialize context defaults<br/>magic cookie, dynamic pools, buses, master state"]
     C["Compile timer thunk<br/>VirtualAlloc executable memory"]
     D["MFStartup<br/>Media Foundation runtime"]
     E["Initialize WASAPI<br/>device, audio client, render client"]
@@ -348,8 +423,10 @@ Soft clip = enabled
 Bus volumes = 1.0
 Bus mute/solo = false
 Bus persistent presets = disabled
-Voice pool = inactive
-Buffer pool = inactive
+Voice pool = inactive, with initial dynamic capacity
+Buffer pool = inactive, with initial dynamic capacity
+Editor-safe mode = disabled by default
+Editor timer suspension flag = false
 Diagnostics = zeroed
 ```
 
@@ -386,6 +463,8 @@ graph TD
 ```
 
 This preserves compatibility while improving common WAV asset loading.
+
+In NEXT 1.2.1, the load path also checks buffer capacity dynamically. If every current buffer slot is active, Riff attempts to grow the buffer pool before returning `RiffErrorNoFreeBuffer`. That error now represents "growth failed or allocation is impossible", not simply "slot 64 was reached".
 
 ### WAV Fast Path
 
@@ -491,7 +570,7 @@ Compatibility wrappers such as `RiffPlayBus` forward into the unified path.
 
 ### Voice Allocation
 
-The normal allocator scans the 32 voice slots for an inactive voice.
+The normal allocator scans the current voice capacity for an inactive voice.
 
 ```vb
 For i = 0 To RiffMaxVoices - 1
@@ -503,9 +582,36 @@ For i = 0 To RiffMaxVoices - 1
 Next i
 ```
 
+Because `RiffMaxVoices` is now capacity-based, this loop can cover more than the original 32 slots after the pool grows or after `RiffReserveVoices` is called.
+
+### Pool Growth During Playback
+
+When no inactive voice slot is available, the allocator now has an additional option before reporting failure: it can grow the voice pool.
+
+Conceptually:
+
+```txt
+Try inactive slot
+-> apply per-buffer/per-bus caps
+-> if allowed, try safe voice stealing
+-> if still no slot, grow voice pool
+-> initialize new slot and return handle
+```
+
+The exact order can be tuned by the implementation, but the architectural goal is to avoid the old hard stop at 32 voices while still preserving burst protection. Growth is useful for legitimate large scenes; caps and stealing are still useful to prevent accidental audio spam.
+
+The important distinction is:
+
+```txt
+capacity limit  -> dynamic and expandable
+safety cap      -> optional gameplay protection
+```
+
+A safety cap value of `0` means that specific cap is disabled. This allows projects to choose between strict anti-accumulation behavior and "let the engine grow" behavior.
+
 ### Voice Stealing
 
-When all voices are active, Riff can optionally steal a safe voice. This is controlled by:
+When all current voices are active, Riff can optionally steal a safe voice. This is controlled by:
 
 ```vb
 RiffVoiceStealingEnabled = True
@@ -529,7 +635,14 @@ RiffMaxVoicesPerBuffer = 4
 RiffMaxVoicesPerBus = 16
 ```
 
-Per-buffer caps stop rapid button clicks from stacking too many copies of the same sample. Per-bus caps keep a category from dominating the mixer.
+In NEXT 1.2.1, these caps are safety rules, not the same thing as engine capacity. A value of `0` disables that specific cap:
+
+```vb
+RiffMaxVoicesPerBuffer = 0
+RiffMaxVoicesPerBus = 0
+```
+
+Per-buffer caps stop rapid button clicks from stacking too many copies of the same sample. Per-bus caps keep a category from dominating the mixer. Disabling them is useful when a project intentionally wants the dynamic pool to grow freely, but gameplay projects usually still benefit from some cap to prevent accidental audio spam.
 
 ### RiffPlayOnce
 
@@ -561,6 +674,37 @@ Shutdown in progress
 ```
 
 These guards reduce the chance of crashes during Office shutdown, VBE reset, breakpoint states, or stale timer calls.
+
+### Editor-Safe Development Mode
+
+NEXT 1.2.1 adds an explicit architecture layer for the dangerous development scenario where audio is running while the user edits code in the VBE.
+
+The underlying risk is not normal playback. The risky combination is:
+
+```txt
+native timer callback is active
++ VBA project is being edited/recompiled by the VBE
++ module-level arrays/pointers can be reset or moved
++ callback tries to read/write old state
+```
+
+That can cause crashes, stale callbacks, or in worst cases project corruption because Office/VBE was not designed to be a real-time audio host with native callbacks mutating state while source code is changing.
+
+The safe path is manual and intentional:
+
+```vb
+RiffPrepareForVbeEdit
+' edit code in the VBE
+RiffResumeAfterVbeEdit
+```
+
+Architecturally, `RiffPrepareForVbeEdit` should stop or suspend the render timer path before editing begins, while preserving loaded state where possible. `RiffResumeAfterVbeEdit` restores the timer/render path after the edit.
+
+`RiffEditorSafeMode` exists as an automatic guard, but it is disabled by default in NEXT 1.2.1 because aggressive automatic focus detection can pause audio while the developer is simply running tests from the VBE. The manual API is safer and more predictable during development.
+
+`RiffEditorTimerSuspended` exposes whether the editor guard currently has the timer suspended.
+
+This layer does not make the VBE a real-time-safe environment. It gives projects a controlled way to avoid the most dangerous callback/edit overlap.
 
 ### Adaptive Buffering
 
@@ -607,7 +751,9 @@ graph TD
 
 ### Voice Iteration
 
-The mixer iterates through the fixed voice pool. For each active, playing, non-paused voice, it pulls frequently used fields into local variables before the inner loop. This is important because module-level UDT field access is slower inside tight VBA loops.
+The mixer iterates through the current voice pool capacity. For each active, playing, non-paused voice, it pulls frequently used fields into local variables before the inner loop. This is important because module-level UDT field access is slower inside tight VBA loops.
+
+The callback should not resize the pool while it is iterating. Pool growth is treated as structural work performed by allocation/loading paths and protected by internal resize guards.
 
 ### Source Reading and Pitch Shifting
 
@@ -968,19 +1114,22 @@ The source uses conditional compilation to keep the same `.bas` working on both 
 
 ## Memory Layout
 
-Approximate fixed allocations:
+Approximate allocations:
 
 ```txt
-RiffContext       module-level UDT
-RiffVoice pool    32 voice UDTs
-RiffBuffer pool   64 buffer slots
-Ring buffer       large Single() array shared by time effects
-Scratch arrays    reused render/decode buffers
-Thunk memory      executable VirtualAlloc page
-Loaded buffers    VirtualAlloc PCM blocks
+RiffContext        module-level UDT
+RiffVoice pool     dynamic SafeArray, starts at 32 voice UDTs
+RiffBuffer pool    dynamic SafeArray, starts at 64 buffer slots
+RiffBus pool       dynamic SafeArray, starts with 16 built-in bus states
+Ring buffer        dynamic/lazy Single() storage shared by time effects
+Scratch arrays     reused render/decode buffers
+Thunk memory       executable VirtualAlloc page
+Loaded buffers     VirtualAlloc PCM blocks
 ```
 
-The largest fixed allocation is usually the per-voice ring buffer. The largest variable allocation is decoded audio data.
+The largest structural allocation is usually the per-voice ring buffer when many voices use temporal effects. The largest variable allocation is decoded audio data.
+
+Dynamic capacity changes move the architecture away from small hardcoded limits, but they do not make memory free. On Office 32-bit, address space can still become the real limit before RAM does. On both 32-bit and 64-bit Office, decoded long music files can consume much more memory than the handle arrays themselves.
 
 ## Shutdown Sequence
 
@@ -995,7 +1144,7 @@ graph TD
     E["Stop WASAPI client"]
     F["Deactivate voices"]
     G["Unload buffers"]
-    H["Erase ring/scratch buffers"]
+    H["Erase dynamic pools, ring/scratch buffers, editor guard state"]
     I["Release WASAPI COM interfaces"]
     J["MFShutdown"]
     K["Free thunk memory"]
@@ -1006,6 +1155,8 @@ graph TD
 
 Clearing `MagicCookie` before releasing resources is intentional. If a stale timer callback fires during shutdown, it exits before touching partially released state.
 
+The editor-safe cleanup path follows the same principle: stop/suspend the timer first, clear callback validity, then allow arrays, buffers, or project state to be modified.
+
 ## Known Architectural Boundaries
 
 Riff is intentionally ambitious for a pure VBA engine, but it still runs inside Office. Important boundaries:
@@ -1014,8 +1165,9 @@ Riff is intentionally ambitious for a pure VBA engine, but it still runs inside 
 |:---|:---|
 | Office is not a real-time host | Severe host stalls can still affect timing. |
 | Audio render runs through VBA callback path | Safer than raw VBA threads, but not equivalent to a native audio thread. |
+| Editing code while audio timer is active is unsafe | Use `RiffPrepareForVbeEdit` before VBE edits and `RiffResumeAfterVbeEdit` after. |
 | Media Foundation decode is synchronous | Large MP3/OGG files can still take time to load. |
 | Per-voice DSP costs CPU | Many voices with heavy effects can become expensive. |
 | Shared-mode WASAPI adds system mixing latency | Good compatibility, not exclusive-mode ultra-low latency. |
 
-The current design favors maximum deployability and practical power in Office. A future optional native backend could improve decoding speed or render isolation, but the v1.0.9 architecture remains fully usable as a single-file `.bas` module.
+The current design favors maximum deployability and practical power in Office. A future optional native backend could improve decoding speed or render isolation, but the NEXT 1.2.1 architecture remains fully usable as a single-file `.bas` module while removing the most painful small fixed pool limits.
