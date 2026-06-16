@@ -6,38 +6,32 @@ Attribute VB_Name = "Riff"
 ' * Studio DSP Pipeline featuring Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad EQ, Bitcrusher,
 ' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, Peak Meters, musical preset packs, and master bus processors.
 ' * @author UesleiDev
-' * @version 1.1.1
+' * @version 1.1.2
 ' */
 
 Option Explicit
 Option Private Module
 
-'/** @description Total static audio buffer slots exposed by the engine. */
-Private Const RIFF_BUFFER_COUNT As Long = 64
+'/** @description Initial static audio buffer slots. The pool grows automatically when all slots are used. */
+Private Const RIFF_INITIAL_BUFFER_CAPACITY As Long = 64
 
-'/** @description Highest valid static audio buffer handle. */
-Private Const RIFF_MAX_BUFFER_INDEX As Long = RIFF_BUFFER_COUNT - 1
+'/** @description Initial polyphonic voice slots. The pool grows automatically when all slots are used. */
+Private Const RIFF_INITIAL_VOICE_CAPACITY As Long = 32
 
-'/** @description Total polyphonic voice slots exposed by the engine. */
-Private Const RIFF_VOICE_COUNT As Long = 32
-
-'/** @description Highest valid polyphonic voice handle. */
-Private Const RIFF_MAX_VOICE_INDEX As Long = RIFF_VOICE_COUNT - 1
+'/** @description Minimum extra slots reserved when a dynamic pool needs to grow. */
+Private Const RIFF_POOL_GROWTH_MIN As Long = 16
 
 '/** @description Default maximum simultaneous instances of the same static buffer. Use 0 to disable. */
-Private Const RIFF_DEFAULT_MAX_VOICES_PER_BUFFER As Long = 4
+Private Const RIFF_DEFAULT_MAX_VOICES_PER_BUFFER As Long = 0
 
 '/** @description Default maximum simultaneous voices routed to the same bus. Use 0 to disable. */
-Private Const RIFF_DEFAULT_MAX_VOICES_PER_BUS As Long = 18
+Private Const RIFF_DEFAULT_MAX_VOICES_PER_BUS As Long = 0
 
 '/** @description Voice cap value that disables a cap. */
 Private Const RIFF_VOICE_CAP_DISABLED As Long = 0
 
-'/** @description Total audio bus slots exposed by the engine. */
-Private Const RIFF_BUS_COUNT As Long = 16
-
-'/** @description Highest valid audio bus index. */
-Private Const RIFF_MAX_BUS_INDEX As Long = RIFF_BUS_COUNT - 1
+'/** @description Initial audio bus slots. Built-in bus IDs still use 0..15, and custom IDs can grow the pool. */
+Private Const RIFF_INITIAL_BUS_CAPACITY As Long = 16
 
 
 '/** @description Default master processor low-pass control. */
@@ -133,6 +127,15 @@ End Type
     
     '/** @description Kills the multimedia timer. */
     Private Declare PtrSafe Function KillTimer Lib "user32" (ByVal hWnd As LongPtr, ByVal nIDEvent As LongPtr) As Long
+
+    '/** @description Gets the foreground window for VBE edit-safety detection. */
+    Private Declare PtrSafe Function GetForegroundWindow Lib "user32" () As LongPtr
+
+    '/** @description Gets the root owner window for foreground class checks. */
+    Private Declare PtrSafe Function GetAncestor Lib "user32" (ByVal hWnd As LongPtr, ByVal gaFlags As Long) As LongPtr
+
+    '/** @description Reads a native window class name. */
+    Private Declare PtrSafe Function GetClassNameW Lib "user32" (ByVal hWnd As LongPtr, ByVal lpClassName As LongPtr, ByVal nMaxCount As Long) As Long
     
     '/** @description Frees memory allocated by COM. */
     Private Declare PtrSafe Function CoTaskMemFree Lib "ole32" (ByVal pv As LongPtr) As Long
@@ -253,9 +256,10 @@ End Type
         MaxVoicesPerBuffer As Long
         MaxVoicesPerBus As Long
         VoiceStealingEnabled As Boolean
+        EditorSafeMode As Boolean
+        EditorSuspendedTimer As Boolean
+        PoolMutationActive As Boolean
         HasSoloBus As Boolean
-        Buffers(0 To RIFF_MAX_BUFFER_INDEX) As RiffBuffer
-        Buses(0 To RIFF_MAX_BUS_INDEX) As RiffBus
     End Type
 #Else
     '/** @description Allocates physical memory pages. */
@@ -296,6 +300,15 @@ End Type
     
     '/** @description Kills the multimedia timer. */
     Private Declare Function KillTimer Lib "user32" (ByVal hWnd As Long, ByVal nIDEvent As Long) As Long
+
+    '/** @description Gets the foreground window for VBE edit-safety detection. */
+    Private Declare Function GetForegroundWindow Lib "user32" () As Long
+
+    '/** @description Gets the root owner window for foreground class checks. */
+    Private Declare Function GetAncestor Lib "user32" (ByVal hWnd As Long, ByVal gaFlags As Long) As Long
+
+    '/** @description Reads a native window class name. */
+    Private Declare Function GetClassNameW Lib "user32" (ByVal hWnd As Long, ByVal lpClassName As Long, ByVal nMaxCount As Long) As Long
     
     '/** @description Frees memory allocated by COM. */
     Private Declare Function CoTaskMemFree Lib "ole32" (ByVal pv As Long) As Long
@@ -416,9 +429,10 @@ End Type
         MaxVoicesPerBuffer As Long
         MaxVoicesPerBus As Long
         VoiceStealingEnabled As Boolean
+        EditorSafeMode As Boolean
+        EditorSuspendedTimer As Boolean
+        PoolMutationActive As Boolean
         HasSoloBus As Boolean
-        Buffers(0 To RIFF_MAX_BUFFER_INDEX) As RiffBuffer
-        Buses(0 To RIFF_MAX_BUS_INDEX) As RiffBus
     End Type
 #End If
 
@@ -1088,8 +1102,8 @@ Private Const RIFF_OSCILLATOR_MAX_DT As Double = 0.5
 Private Const RIFF_OSCILLATOR_BLEP_LEVEL As Single = 0.65!
 
 '/** @description Safety limits for synthesized/noise voice bursts. */
-Private Const RIFF_DEFAULT_MAX_OSCILLATOR_VOICES As Long = 8
-Private Const RIFF_DEFAULT_MAX_NOISE_VOICES As Long = 4
+Private Const RIFF_DEFAULT_MAX_OSCILLATOR_VOICES As Long = 0
+Private Const RIFF_DEFAULT_MAX_NOISE_VOICES As Long = 0
 
 '/** @description Small default attack ramp that prevents clicks/pops on short repeated sounds. */
 Private Const RIFF_DEFAULT_ATTACK_FRAMES As Long = 96
@@ -1178,6 +1192,15 @@ Private Const RIFF_THUNK32_CALLBACK_OFFSET As Long = 62
 '/** @description VBE EbMode export ordinal used by generated timer thunks. */
 Private Const RIFF_VBE_EBMODE_ORDINAL As Long = 1
 
+'/** @description Root VBE window class used to suspend timers while the developer edits code. */
+Private Const RIFF_VBE_WINDOW_CLASS As String = "wndclass_desked_gsk"
+
+'/** @description Win32 GetAncestor flag that resolves a child/control to the root window. */
+Private Const RIFF_GA_ROOT As Long = 2
+
+'/** @description Temporary class-name buffer size for foreground-window checks. */
+Private Const RIFF_WINDOW_CLASS_BUFFER_CHARS As Long = 256
+
 '/** @description WASAPI COM class/interface GUIDs. */
 Private Const RIFF_GUID_MM_DEVICE_ENUMERATOR_CLASS As String = "{A95664D2-9614-4F35-A746-DE8DB63617E6}"
 Private Const RIFF_GUID_AUDIO_RENDER_CLIENT As String = "{F294ACFC-3146-4483-A7BF-ADDCA7C260E2}"
@@ -1188,8 +1211,23 @@ Private rCtx As RiffContext
 '/** @description Last public API failure reported by RiffLastError. */
 Private rLastError As RiffErrorCode
 
-'/** @description Pool of 32 polyphonic voices for audio playback. */
-Private rVoices(0 To RIFF_MAX_VOICE_INDEX) As RiffVoice
+'/** @description Dynamic pool of loaded static audio buffers. */
+Private rBuffers() As RiffBuffer
+
+'/** @description Dynamic pool of mixer buses. */
+Private rBuses() As RiffBus
+
+'/** @description Dynamic pool of polyphonic voices for audio playback. */
+Private rVoices() As RiffVoice
+
+'/** @description Current allocated buffer slot capacity. */
+Private rBufferCapacity As Long
+
+'/** @description Current allocated voice slot capacity. */
+Private rVoiceCapacity As Long
+
+'/** @description Current allocated bus slot capacity. */
+Private rBusCapacity As Long
 
 '/**
 ' * @description Contiguous global ring buffer array for spatial effects.
@@ -1239,11 +1277,194 @@ Private Function RiffRequireInitialized() As Boolean
 End Function
 
 '/**
+' * @function RiffLastBufferIndex
+' * @brief Returns the highest allocated dynamic buffer slot.
+' * @return {Long} Highest valid allocated buffer handle, or -1 before allocation.
+' */
+Private Function RiffLastBufferIndex() As Long
+    RiffLastBufferIndex = rBufferCapacity - 1
+End Function
+
+'/**
+' * @function RiffLastVoiceIndex
+' * @brief Returns the highest allocated dynamic voice slot.
+' * @return {Long} Highest valid allocated voice handle, or -1 before allocation.
+' */
+Private Function RiffLastVoiceIndex() As Long
+    RiffLastVoiceIndex = rVoiceCapacity - 1
+End Function
+
+'/**
+' * @function RiffLastBusIndex
+' * @brief Returns the highest allocated dynamic bus slot.
+' * @return {Long} Highest valid allocated bus ID, or -1 before allocation.
+' */
+Private Function RiffLastBusIndex() As Long
+    RiffLastBusIndex = rBusCapacity - 1
+End Function
+
+'/**
+' * @function RiffNextPoolCapacity
+' * @brief Calculates a smart SafeArray growth target without reallocating on every new handle.
+' * @param currentCapacity Current allocated slot count.
+' * @param requiredCapacity Minimum slot count required by the caller.
+' * @return {Long} New capacity target.
+' */
+Private Function RiffNextPoolCapacity(ByVal currentCapacity As Long, ByVal requiredCapacity As Long) As Long
+    Dim nextCapacity As Long
+    Dim growBy As Long
+
+    nextCapacity = currentCapacity
+    If nextCapacity < 1 Then
+        nextCapacity = requiredCapacity
+    End If
+    If nextCapacity < RIFF_POOL_GROWTH_MIN Then
+        nextCapacity = RIFF_POOL_GROWTH_MIN
+    End If
+
+    Do While nextCapacity < requiredCapacity
+        growBy = nextCapacity \ 2
+        If growBy < RIFF_POOL_GROWTH_MIN Then growBy = RIFF_POOL_GROWTH_MIN
+        nextCapacity = nextCapacity + growBy
+    Loop
+
+    RiffNextPoolCapacity = nextCapacity
+End Function
+
+'/**
+' * @function RiffEnsureBufferCapacity
+' * @brief Ensures the dynamic buffer SafeArray can store at least the requested slot count.
+' * @param requiredCapacity Minimum number of buffer slots to reserve.
+' * @return {Boolean} True when the pool is large enough.
+' */
+Private Function RiffEnsureBufferCapacity(ByVal requiredCapacity As Long) As Boolean
+    Dim newCapacity As Long
+
+    If requiredCapacity < RIFF_INITIAL_BUFFER_CAPACITY Then requiredCapacity = RIFF_INITIAL_BUFFER_CAPACITY
+    If rBufferCapacity >= requiredCapacity Then
+        RiffEnsureBufferCapacity = True
+        Exit Function
+    End If
+
+    newCapacity = RiffNextPoolCapacity(rBufferCapacity, requiredCapacity)
+    rCtx.PoolMutationActive = True
+    If rBufferCapacity = 0 Then
+        ReDim rBuffers(0 To newCapacity - 1)
+    Else
+        ReDim Preserve rBuffers(0 To newCapacity - 1)
+    End If
+    rBufferCapacity = newCapacity
+    rCtx.PoolMutationActive = False
+    RiffEnsureBufferCapacity = True
+End Function
+
+'/**
+' * @function RiffEnsureVoiceCapacity
+' * @brief Ensures the dynamic voice SafeArray and its contiguous effect ring buffer are large enough.
+' * @param requiredCapacity Minimum number of voice slots to reserve.
+' * @return {Boolean} True when the pool is large enough.
+' */
+Private Function RiffEnsureVoiceCapacity(ByVal requiredCapacity As Long) As Boolean
+    Dim newCapacity As Long
+
+    If requiredCapacity < RIFF_INITIAL_VOICE_CAPACITY Then requiredCapacity = RIFF_INITIAL_VOICE_CAPACITY
+    If rVoiceCapacity >= requiredCapacity Then
+        RiffEnsureVoiceCapacity = True
+        Exit Function
+    End If
+
+    newCapacity = RiffNextPoolCapacity(rVoiceCapacity, requiredCapacity)
+    rCtx.PoolMutationActive = True
+    If rVoiceCapacity = 0 Then
+        ReDim rVoices(0 To newCapacity - 1)
+        ReDim rRingBuf(0 To (newCapacity * RIFF_RING_SAMPLES_PER_VOICE) + 1)
+    Else
+        ReDim Preserve rVoices(0 To newCapacity - 1)
+        ReDim Preserve rRingBuf(0 To (newCapacity * RIFF_RING_SAMPLES_PER_VOICE) + 1)
+    End If
+    rVoiceCapacity = newCapacity
+    rCtx.PoolMutationActive = False
+    RiffEnsureVoiceCapacity = True
+End Function
+
+'/**
+' * @function RiffEnsureBusCapacity
+' * @brief Ensures the mixer bus SafeArray can address the requested custom bus IDs.
+' * @param requiredCapacity Minimum number of bus slots to reserve.
+' * @return {Boolean} True when the pool is large enough.
+' */
+Private Function RiffEnsureBusCapacity(ByVal requiredCapacity As Long) As Boolean
+    Dim oldCapacity As Long
+    Dim newCapacity As Long
+    Dim i As Long
+
+    If requiredCapacity < RIFF_INITIAL_BUS_CAPACITY Then requiredCapacity = RIFF_INITIAL_BUS_CAPACITY
+    If rBusCapacity >= requiredCapacity Then
+        RiffEnsureBusCapacity = True
+        Exit Function
+    End If
+
+    oldCapacity = rBusCapacity
+    newCapacity = RiffNextPoolCapacity(rBusCapacity, requiredCapacity)
+    rCtx.PoolMutationActive = True
+    If rBusCapacity = 0 Then
+        ReDim rBuses(0 To newCapacity - 1)
+    Else
+        ReDim Preserve rBuses(0 To newCapacity - 1)
+    End If
+    rBusCapacity = newCapacity
+    rCtx.PoolMutationActive = False
+
+    For i = oldCapacity To newCapacity - 1
+        RiffResetBusState i
+    Next i
+
+    RiffEnsureBusCapacity = True
+End Function
+
+'/**
+' * @function RiffEnsureEnginePools
+' * @brief Creates the default dynamic pools used by the engine on startup.
+' * @return {Boolean} True when all pools are allocated.
+' */
+Private Function RiffEnsureEnginePools() As Boolean
+    If Not RiffEnsureBufferCapacity(RIFF_INITIAL_BUFFER_CAPACITY) Then Exit Function
+    If Not RiffEnsureVoiceCapacity(RIFF_INITIAL_VOICE_CAPACITY) Then Exit Function
+    If Not RiffEnsureBusCapacity(RIFF_INITIAL_BUS_CAPACITY) Then Exit Function
+
+    RiffEnsureEnginePools = True
+End Function
+
+'/**
+' * @function RiffAcquireFreeBufferSlot
+' * @brief Finds an inactive buffer slot or grows the dynamic buffer pool when it is full.
+' * @return {Long} Buffer slot handle, or -1 if the pool could not be grown.
+' */
+Private Function RiffAcquireFreeBufferSlot() As Long
+    Dim i As Long
+    Dim oldCapacity As Long
+
+    RiffAcquireFreeBufferSlot = -1
+
+    For i = 0 To RiffLastBufferIndex()
+        If Not rBuffers(i).Active Then
+            RiffAcquireFreeBufferSlot = i
+            Exit Function
+        End If
+    Next i
+
+    oldCapacity = rBufferCapacity
+    If RiffEnsureBufferCapacity(rBufferCapacity + 1) Then
+        RiffAcquireFreeBufferSlot = oldCapacity
+    End If
+End Function
+
+'/**
 ' * @function RiffIsValidBufferHandle
 ' * @brief Validates a static buffer handle range.
 ' */
 Private Function RiffIsValidBufferHandle(ByVal bufferHandle As Long) As Boolean
-    RiffIsValidBufferHandle = (bufferHandle >= 0 And bufferHandle <= RIFF_MAX_BUFFER_INDEX)
+    RiffIsValidBufferHandle = (bufferHandle >= 0 And bufferHandle <= RiffLastBufferIndex())
 End Function
 
 '/**
@@ -1251,7 +1472,7 @@ End Function
 ' * @brief Validates a voice handle range.
 ' */
 Private Function RiffIsValidVoiceHandle(ByVal voiceHandle As Long) As Boolean
-    RiffIsValidVoiceHandle = (voiceHandle >= 0 And voiceHandle <= RIFF_MAX_VOICE_INDEX)
+    RiffIsValidVoiceHandle = (voiceHandle >= 0 And voiceHandle <= RiffLastVoiceIndex())
 End Function
 
 '/**
@@ -1310,22 +1531,22 @@ End Function
 ' * @param busID The target bus index.
 ' */
 Private Sub RiffResetBusState(ByVal busID As Long)
-    If busID < 0 Or busID > RIFF_MAX_BUS_INDEX Then
+    If busID < 0 Or busID > RiffLastBusIndex() Then
         Exit Sub
     End If
 
-    rCtx.Buses(busID).volume = RIFF_UNITY_GAIN
-    rCtx.Buses(busID).targetVolume = RIFF_UNITY_GAIN
-    rCtx.Buses(busID).FadeStartVolume = RIFF_UNITY_GAIN
-    rCtx.Buses(busID).FadeFramesCurrent = 0
-    rCtx.Buses(busID).FadeFramesTotal = 0
-    rCtx.Buses(busID).PeakL = 0!
-    rCtx.Buses(busID).PeakR = 0!
-    rCtx.Buses(busID).Muted = False
-    rCtx.Buses(busID).Solo = False
-    rCtx.Buses(busID).FxEnabled = False
-    rCtx.Buses(busID).FxPreset = CLng(RiffFxDry)
-    rCtx.Buses(busID).FxAmount = 0!
+    rBuses(busID).volume = RIFF_UNITY_GAIN
+    rBuses(busID).targetVolume = RIFF_UNITY_GAIN
+    rBuses(busID).FadeStartVolume = RIFF_UNITY_GAIN
+    rBuses(busID).FadeFramesCurrent = 0
+    rBuses(busID).FadeFramesTotal = 0
+    rBuses(busID).PeakL = 0!
+    rBuses(busID).PeakR = 0!
+    rBuses(busID).Muted = False
+    rBuses(busID).Solo = False
+    rBuses(busID).FxEnabled = False
+    rBuses(busID).FxPreset = CLng(RiffFxDry)
+    rBuses(busID).FxAmount = 0!
 End Sub
 
 '/**
@@ -1336,8 +1557,8 @@ Private Sub RiffRefreshSoloState()
     Dim i As Long
 
     rCtx.HasSoloBus = False
-    For i = 0 To RIFF_MAX_BUS_INDEX
-        If rCtx.Buses(i).Solo Then
+    For i = 0 To RiffLastBusIndex()
+        If rBuses(i).Solo Then
             rCtx.HasSoloBus = True
             Exit Sub
         End If
@@ -1357,22 +1578,22 @@ Private Sub RiffTickBusFades(ByVal renderedFrames As Long)
         Exit Sub
     End If
 
-    For i = 0 To RIFF_MAX_BUS_INDEX
-        If rCtx.Buses(i).FadeFramesTotal > 0 Then
-            rCtx.Buses(i).FadeFramesCurrent = rCtx.Buses(i).FadeFramesCurrent + renderedFrames
-            If rCtx.Buses(i).FadeFramesCurrent >= rCtx.Buses(i).FadeFramesTotal Then
-                rCtx.Buses(i).volume = rCtx.Buses(i).targetVolume
-                rCtx.Buses(i).FadeFramesCurrent = 0
-                rCtx.Buses(i).FadeFramesTotal = 0
-                rCtx.Buses(i).FadeStartVolume = rCtx.Buses(i).volume
+    For i = 0 To RiffLastBusIndex()
+        If rBuses(i).FadeFramesTotal > 0 Then
+            rBuses(i).FadeFramesCurrent = rBuses(i).FadeFramesCurrent + renderedFrames
+            If rBuses(i).FadeFramesCurrent >= rBuses(i).FadeFramesTotal Then
+                rBuses(i).volume = rBuses(i).targetVolume
+                rBuses(i).FadeFramesCurrent = 0
+                rBuses(i).FadeFramesTotal = 0
+                rBuses(i).FadeStartVolume = rBuses(i).volume
             Else
-                t = CSng(rCtx.Buses(i).FadeFramesCurrent) / CSng(rCtx.Buses(i).FadeFramesTotal)
-                rCtx.Buses(i).volume = rCtx.Buses(i).FadeStartVolume + ((rCtx.Buses(i).targetVolume - rCtx.Buses(i).FadeStartVolume) * t)
+                t = CSng(rBuses(i).FadeFramesCurrent) / CSng(rBuses(i).FadeFramesTotal)
+                rBuses(i).volume = rBuses(i).FadeStartVolume + ((rBuses(i).targetVolume - rBuses(i).FadeStartVolume) * t)
             End If
         End If
 
-        rCtx.Buses(i).PeakL = rCtx.Buses(i).PeakL * RIFF_ACTIVE_PEAK_DECAY
-        rCtx.Buses(i).PeakR = rCtx.Buses(i).PeakR * RIFF_ACTIVE_PEAK_DECAY
+        rBuses(i).PeakL = rBuses(i).PeakL * RIFF_ACTIVE_PEAK_DECAY
+        rBuses(i).PeakR = rBuses(i).PeakR * RIFF_ACTIVE_PEAK_DECAY
     Next i
 End Sub
 
@@ -1383,17 +1604,17 @@ End Sub
 ' * @return {Single} Effective gain for this render pass.
 ' */
 Private Function RiffBusMixVolume(ByVal busID As RiffBusId) As Single
-    If busID < RiffBusMain Or busID > RIFF_MAX_BUS_INDEX Then
+    If busID < RiffBusMain Or busID > RiffLastBusIndex() Then
         RiffBusMixVolume = 0!
         Exit Function
     End If
 
-    If rCtx.Buses(busID).Muted Then
+    If rBuses(busID).Muted Then
         RiffBusMixVolume = 0!
-    ElseIf rCtx.HasSoloBus And Not rCtx.Buses(busID).Solo Then
+    ElseIf rCtx.HasSoloBus And Not rBuses(busID).Solo Then
         RiffBusMixVolume = 0!
     Else
-        RiffBusMixVolume = rCtx.Buses(busID).volume
+        RiffBusMixVolume = rBuses(busID).volume
     End If
 End Function
 
@@ -1405,9 +1626,13 @@ Private Function RiffClampBusId(ByVal busID As RiffBusId) As RiffBusId
     If busID < RiffBusMain Then
         RiffSetLastError RiffErrorInvalidBus
         RiffClampBusId = RiffBusMain
-    ElseIf busID > RIFF_MAX_BUS_INDEX Then
-        RiffSetLastError RiffErrorInvalidBus
-        RiffClampBusId = RIFF_MAX_BUS_INDEX
+    ElseIf busID > RiffLastBusIndex() Then
+        If RiffEnsureBusCapacity(CLng(busID) + 1) Then
+            RiffClampBusId = busID
+        Else
+            RiffSetLastError RiffErrorInvalidBus
+            RiffClampBusId = RiffBusMain
+        End If
     Else
         RiffClampBusId = busID
     End If
@@ -1633,9 +1858,17 @@ Public Function RiffOpen() As Boolean
     rCtx.MaxVoicesPerBuffer = RIFF_DEFAULT_MAX_VOICES_PER_BUFFER
     rCtx.MaxVoicesPerBus = RIFF_DEFAULT_MAX_VOICES_PER_BUS
     rCtx.VoiceStealingEnabled = True
+    rCtx.EditorSafeMode = False
+    rCtx.EditorSuspendedTimer = False
+    rCtx.PoolMutationActive = False
+
+    If Not RiffEnsureEnginePools() Then
+        RiffSetLastError RiffErrorMemoryAllocation
+        Exit Function
+    End If
 
     Dim i As Long
-    For i = 0 To RIFF_MAX_BUS_INDEX
+    For i = 0 To RiffLastBusIndex()
         RiffResetBusState i
     Next i
     rCtx.HasSoloBus = False
@@ -1659,8 +1892,6 @@ Public Function RiffOpen() As Boolean
         Exit Function
     End If
 
-    ReDim rRingBuf(0 To (RIFF_VOICE_COUNT * RIFF_RING_SAMPLES_PER_VOICE) + 1)
-
     rCtx.Initialized = True
     RiffOpen = True
 End Function
@@ -1680,17 +1911,23 @@ Public Sub RiffClose()
     RiffStopRenderTimer
     
     Dim i As Long
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         rVoices(i).Active = False
     Next i
 
-    For i = 0 To RIFF_MAX_BUFFER_INDEX
-        If rCtx.Buffers(i).Active Then
+    For i = 0 To RiffLastBufferIndex()
+        If rBuffers(i).Active Then
             RiffUnload i
         End If
     Next i
     
     Erase rRingBuf
+    Erase rVoices
+    Erase rBuffers
+    Erase rBuses
+    rVoiceCapacity = 0
+    rBufferCapacity = 0
+    rBusCapacity = 0
     Erase rMixArr32
     Erase rMixInt32
     Erase rSrcArr32
@@ -1729,6 +1966,8 @@ Public Sub RiffEditorEmergencyStop()
         rCtx.TimerResolutionActive = False
     End If
     rCtx.TimerCallbackActive = False
+    rCtx.EditorSuspendedTimer = False
+    rCtx.PoolMutationActive = False
     rCtx.IdleTimerTicks = 0
 End Sub
 
@@ -1767,12 +2006,99 @@ Public Sub RiffSuspend()
 End Sub
 
 '/**
+' * @function RiffPrepareForVbeEdit
+' * @brief Stops the render timer before editing VBA code while Riff is initialized.
+' * @remarks Use this before changing live code in the VBE. It keeps loaded buffers and WASAPI resources alive.
+' */
+Public Sub RiffPrepareForVbeEdit()
+    If Not rCtx.Initialized Then Exit Sub
+
+    rCtx.EditorSuspendedTimer = True
+    RiffStopRenderTimer
+End Sub
+
+'/**
+' * @function RiffResumeAfterVbeEdit
+' * @brief Restarts the render timer after a manual VBE edit pause.
+' * @return {Boolean} True when the timer is running or was started successfully.
+' */
+Public Function RiffResumeAfterVbeEdit() As Boolean
+    If Not rCtx.Initialized Then
+        RiffSetLastError RiffErrorNotInitialized
+        Exit Function
+    End If
+
+    RiffResumeAfterVbeEdit = RiffEnsureRenderTimer()
+End Function
+
+'/**
 ' * @function RiffWake
 ' * @brief Restarts the render timer when the engine is initialized and playback needs to continue.
 ' * @return {Boolean} True when the timer is running or was started successfully.
 ' */
 Public Function RiffWake() As Boolean
     RiffWake = RiffEnsureRenderTimer()
+    If RiffWake Then rCtx.EditorSuspendedTimer = False
+End Function
+
+'/**
+' * @property RiffEditorSafeMode
+' * @brief Gets whether the optional VBE foreground guard is enabled.
+' * @return {Boolean} True when the optional VBE edit protection is enabled.
+' */
+Public Property Get RiffEditorSafeMode() As Boolean
+    RiffEditorSafeMode = rCtx.EditorSafeMode
+End Property
+
+'/**
+' * @property RiffEditorSafeMode
+' * @brief Enables or disables optional timer suspension while the VBE is foreground.
+' * @param value True to stop the render timer when the VBE receives focus. Disabled by default so normal VBE playback tests still produce audio.
+' */
+Public Property Let RiffEditorSafeMode(ByVal value As Boolean)
+    rCtx.EditorSafeMode = value
+End Property
+
+'/**
+' * @property RiffEditorTimerSuspended
+' * @brief Returns whether the editor guard stopped the render timer to protect the project.
+' * @return {Boolean} True when playback was suspended by the VBE guard.
+' */
+Public Property Get RiffEditorTimerSuspended() As Boolean
+    RiffEditorTimerSuspended = rCtx.EditorSuspendedTimer
+End Property
+
+'/**
+' * @function RiffReserveBuffers
+' * @brief Pre-allocates buffer handles so large projects can load many assets without repeated SafeArray growth.
+' * @param capacity Desired minimum number of buffer slots.
+' * @return {Boolean} True when the buffer pool has at least that capacity.
+' */
+Public Function RiffReserveBuffers(ByVal capacity As Long) As Boolean
+    If capacity < RIFF_INITIAL_BUFFER_CAPACITY Then capacity = RIFF_INITIAL_BUFFER_CAPACITY
+    RiffReserveBuffers = RiffEnsureBufferCapacity(capacity)
+End Function
+
+'/**
+' * @function RiffReserveVoices
+' * @brief Pre-allocates voice handles and their contiguous effect ring memory for heavy burst playback.
+' * @param capacity Desired minimum number of simultaneous voice slots.
+' * @return {Boolean} True when the voice pool has at least that capacity.
+' */
+Public Function RiffReserveVoices(ByVal capacity As Long) As Boolean
+    If capacity < RIFF_INITIAL_VOICE_CAPACITY Then capacity = RIFF_INITIAL_VOICE_CAPACITY
+    RiffReserveVoices = RiffEnsureVoiceCapacity(capacity)
+End Function
+
+'/**
+' * @function RiffReserveBuses
+' * @brief Pre-allocates custom mixer bus IDs above the built-in bus enum.
+' * @param capacity Desired minimum number of bus slots.
+' * @return {Boolean} True when the bus pool has at least that capacity.
+' */
+Public Function RiffReserveBuses(ByVal capacity As Long) As Boolean
+    If capacity < RIFF_INITIAL_BUS_CAPACITY Then capacity = RIFF_INITIAL_BUS_CAPACITY
+    RiffReserveBuses = RiffEnsureBusCapacity(capacity)
 End Function
 
 '/**
@@ -1780,7 +2106,7 @@ End Function
 ' * @brief Returns the maximum number of simultaneous voice slots.
 ' */
 Public Property Get RiffMaxVoices() As Long
-    RiffMaxVoices = RIFF_VOICE_COUNT
+    RiffMaxVoices = rVoiceCapacity
 End Property
 
 '/**
@@ -1788,7 +2114,7 @@ End Property
 ' * @brief Returns the maximum number of static audio buffer slots.
 ' */
 Public Property Get RiffMaxBuffers() As Long
-    RiffMaxBuffers = RIFF_BUFFER_COUNT
+    RiffMaxBuffers = rBufferCapacity
 End Property
 
 '/**
@@ -1796,7 +2122,7 @@ End Property
 ' * @brief Returns the maximum number of audio bus slots.
 ' */
 Public Property Get RiffMaxBuses() As Long
-    RiffMaxBuses = RIFF_BUS_COUNT
+    RiffMaxBuses = rBusCapacity
 End Property
 
 '/**
@@ -1833,7 +2159,6 @@ End Property
 ' */
 Public Property Let RiffMaxVoicesPerBuffer(ByVal value As Long)
     If value < RIFF_VOICE_CAP_DISABLED Then value = RIFF_VOICE_CAP_DISABLED
-    If value > RIFF_VOICE_COUNT Then value = RIFF_VOICE_COUNT
     rCtx.MaxVoicesPerBuffer = value
 End Property
 
@@ -1853,7 +2178,6 @@ End Property
 ' */
 Public Property Let RiffMaxVoicesPerBus(ByVal value As Long)
     If value < RIFF_VOICE_CAP_DISABLED Then value = RIFF_VOICE_CAP_DISABLED
-    If value > RIFF_VOICE_COUNT Then value = RIFF_VOICE_COUNT
     rCtx.MaxVoicesPerBus = value
 End Property
 
@@ -1864,7 +2188,7 @@ End Property
 ' */
 Public Function RiffActiveVoiceCount() As Long
     Dim i As Long
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
             RiffActiveVoiceCount = RiffActiveVoiceCount + 1
         End If
@@ -1932,7 +2256,7 @@ Public Property Get RiffBusVolume(ByVal busID As RiffBusId) As Single
     End If
 
     busID = RiffClampBusId(busID)
-    RiffBusVolume = rCtx.Buses(busID).volume
+    RiffBusVolume = rBuses(busID).volume
 End Property
 
 '/**
@@ -1949,11 +2273,11 @@ Public Property Let RiffBusVolume(ByVal busID As RiffBusId, ByVal value As Singl
     busID = RiffClampBusId(busID)
     value = RiffClampBusVolume(value)
     
-    rCtx.Buses(busID).volume = value
-    rCtx.Buses(busID).targetVolume = value
-    rCtx.Buses(busID).FadeStartVolume = value
-    rCtx.Buses(busID).FadeFramesCurrent = 0
-    rCtx.Buses(busID).FadeFramesTotal = 0
+    rBuses(busID).volume = value
+    rBuses(busID).targetVolume = value
+    rBuses(busID).FadeStartVolume = value
+    rBuses(busID).FadeFramesCurrent = 0
+    rBuses(busID).FadeFramesTotal = 0
 End Property
 
 '/**
@@ -1967,7 +2291,7 @@ Public Property Get RiffBusMuted(ByVal busID As RiffBusId) As Boolean
     End If
 
     busID = RiffClampBusId(busID)
-    RiffBusMuted = rCtx.Buses(busID).Muted
+    RiffBusMuted = rBuses(busID).Muted
 End Property
 
 '/**
@@ -1982,7 +2306,7 @@ Public Property Let RiffBusMuted(ByVal busID As RiffBusId, ByVal value As Boolea
     End If
 
     busID = RiffClampBusId(busID)
-    rCtx.Buses(busID).Muted = value
+    rBuses(busID).Muted = value
 End Property
 
 '/**
@@ -1996,7 +2320,7 @@ Public Property Get RiffBusSolo(ByVal busID As RiffBusId) As Boolean
     End If
 
     busID = RiffClampBusId(busID)
-    RiffBusSolo = rCtx.Buses(busID).Solo
+    RiffBusSolo = rBuses(busID).Solo
 End Property
 
 '/**
@@ -2011,7 +2335,7 @@ Public Property Let RiffBusSolo(ByVal busID As RiffBusId, ByVal value As Boolean
     End If
 
     busID = RiffClampBusId(busID)
-    rCtx.Buses(busID).Solo = value
+    rBuses(busID).Solo = value
     RiffRefreshSoloState
 End Property
 
@@ -2031,20 +2355,20 @@ Public Sub RiffBusFadeTo(ByVal busID As RiffBusId, ByVal targetVolume As Single,
     targetVolume = RiffClampBusVolume(targetVolume)
 
     If durationMs <= 0 Or rCtx.sampleRate <= 0 Then
-        rCtx.Buses(busID).volume = targetVolume
-        rCtx.Buses(busID).targetVolume = targetVolume
-        rCtx.Buses(busID).FadeStartVolume = targetVolume
-        rCtx.Buses(busID).FadeFramesCurrent = 0
-        rCtx.Buses(busID).FadeFramesTotal = 0
+        rBuses(busID).volume = targetVolume
+        rBuses(busID).targetVolume = targetVolume
+        rBuses(busID).FadeStartVolume = targetVolume
+        rBuses(busID).FadeFramesCurrent = 0
+        rBuses(busID).FadeFramesTotal = 0
         Exit Sub
     End If
 
-    rCtx.Buses(busID).FadeStartVolume = rCtx.Buses(busID).volume
-    rCtx.Buses(busID).targetVolume = targetVolume
-    rCtx.Buses(busID).FadeFramesCurrent = 0
-    rCtx.Buses(busID).FadeFramesTotal = CLng((CDbl(durationMs) * CDbl(rCtx.sampleRate)) / CDbl(RIFF_MS_PER_SEC))
-    If rCtx.Buses(busID).FadeFramesTotal < 1 Then
-        rCtx.Buses(busID).FadeFramesTotal = 1
+    rBuses(busID).FadeStartVolume = rBuses(busID).volume
+    rBuses(busID).targetVolume = targetVolume
+    rBuses(busID).FadeFramesCurrent = 0
+    rBuses(busID).FadeFramesTotal = CLng((CDbl(durationMs) * CDbl(rCtx.sampleRate)) / CDbl(RIFF_MS_PER_SEC))
+    If rBuses(busID).FadeFramesTotal < 1 Then
+        rBuses(busID).FadeFramesTotal = 1
     End If
 End Sub
 
@@ -2063,8 +2387,8 @@ Public Sub RiffBusGetPeak(ByVal busID As RiffBusId, ByRef peakLeft As Single, By
     End If
 
     busID = RiffClampBusId(busID)
-    peakLeft = rCtx.Buses(busID).PeakL
-    peakRight = rCtx.Buses(busID).PeakR
+    peakLeft = rBuses(busID).PeakL
+    peakRight = rBuses(busID).PeakR
 End Sub
 
 '/**
@@ -2108,13 +2432,13 @@ Public Sub RiffBusApplyPreset(ByVal busID As RiffBusId, ByVal preset As RiffEffe
 
     If persistent Then
         If amount <= 0! Or preset = RiffFxDry Then
-            rCtx.Buses(busID).FxEnabled = False
-            rCtx.Buses(busID).FxPreset = CLng(RiffFxDry)
-            rCtx.Buses(busID).FxAmount = 0!
+            rBuses(busID).FxEnabled = False
+            rBuses(busID).FxPreset = CLng(RiffFxDry)
+            rBuses(busID).FxAmount = 0!
         Else
-            rCtx.Buses(busID).FxEnabled = True
-            rCtx.Buses(busID).FxPreset = CLng(preset)
-            rCtx.Buses(busID).FxAmount = amount
+            rBuses(busID).FxEnabled = True
+            rBuses(busID).FxPreset = CLng(preset)
+            rBuses(busID).FxAmount = amount
         End If
     End If
 
@@ -2122,7 +2446,7 @@ Public Sub RiffBusApplyPreset(ByVal busID As RiffBusId, ByVal preset As RiffEffe
         Exit Sub
     End If
 
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active Then
             If rVoices(i).busID = busID Then
                 If amount <= 0! Or preset = RiffFxDry Then
@@ -2151,12 +2475,12 @@ Public Sub RiffBusClearEffects(ByVal busID As RiffBusId, Optional ByVal clearPer
     busID = RiffClampBusId(busID)
 
     If clearPersistent Then
-        rCtx.Buses(busID).FxEnabled = False
-        rCtx.Buses(busID).FxPreset = CLng(RiffFxDry)
-        rCtx.Buses(busID).FxAmount = 0!
+        rBuses(busID).FxEnabled = False
+        rBuses(busID).FxPreset = CLng(RiffFxDry)
+        rBuses(busID).FxAmount = 0!
     End If
 
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active Then
             If rVoices(i).busID = busID Then
                 InternalClearVoiceEffects i
@@ -2176,7 +2500,7 @@ Public Property Get RiffBusPresetEnabled(ByVal busID As RiffBusId) As Boolean
     End If
 
     busID = RiffClampBusId(busID)
-    RiffBusPresetEnabled = rCtx.Buses(busID).FxEnabled
+    RiffBusPresetEnabled = rBuses(busID).FxEnabled
 End Property
 Public Property Let RiffBusPresetEnabled(ByVal busID As RiffBusId, ByVal value As Boolean)
     If Not RiffRequireInitialized() Then
@@ -2184,10 +2508,10 @@ Public Property Let RiffBusPresetEnabled(ByVal busID As RiffBusId, ByVal value A
     End If
 
     busID = RiffClampBusId(busID)
-    rCtx.Buses(busID).FxEnabled = value
+    rBuses(busID).FxEnabled = value
     If Not value Then
-        rCtx.Buses(busID).FxPreset = CLng(RiffFxDry)
-        rCtx.Buses(busID).FxAmount = 0!
+        rBuses(busID).FxPreset = CLng(RiffFxDry)
+        rBuses(busID).FxAmount = 0!
     End If
 End Property
 
@@ -2203,7 +2527,7 @@ Public Property Get RiffBusPreset(ByVal busID As RiffBusId) As RiffEffectPreset
     End If
 
     busID = RiffClampBusId(busID)
-    RiffBusPreset = rCtx.Buses(busID).FxPreset
+    RiffBusPreset = rBuses(busID).FxPreset
 End Property
 
 '/**
@@ -2217,7 +2541,7 @@ Public Property Get RiffBusPresetAmount(ByVal busID As RiffBusId) As Single
     End If
 
     busID = RiffClampBusId(busID)
-    RiffBusPresetAmount = rCtx.Buses(busID).FxAmount
+    RiffBusPresetAmount = rBuses(busID).FxAmount
 End Property
 
 
@@ -2464,7 +2788,7 @@ End Sub
 ' * @brief Decodes an audio file from disk into memory for zero-latency playback.
 ' * @description PCM WAV files use a direct RIFF parser fast path before falling back to Media Foundation.
 ' * @param filePath Full path to the audio file (WAV, MP3, etc.).
-' * @return {Long} Buffer handle (0-63), or -1 if failed.
+' * @return {Long} Buffer handle, or -1 if failed.
 ' */
 Public Function RiffLoad(ByVal filePath As String) As Long
     RiffLoad = -1
@@ -2475,18 +2799,9 @@ Public Function RiffLoad(ByVal filePath As String) As Long
     End If
     
     Dim slot As Long
-    Dim i As Long
-    slot = -1
-    
-    For i = 0 To RIFF_MAX_BUFFER_INDEX
-        If Not rCtx.Buffers(i).Active Then
-            slot = i
-            Exit For
-        End If
-    Next i
-    
-    If slot = -1 Then
-        RiffSetLastError RiffErrorNoFreeBuffer
+    slot = RiffAcquireFreeBufferSlot()
+    If slot < 0 Then
+        RiffSetLastError RiffErrorMemoryAllocation
         Exit Function
     End If
 
@@ -2538,7 +2853,7 @@ End Function
 ' * @function RiffLoadFromMemory
 ' * @brief Decodes audio data directly from a Byte Array without requiring disk I/O.
 ' * @param audioData Byte array containing the binary audio file.
-' * @return {Long} Buffer handle (0-63), or -1 if failed.
+' * @return {Long} Buffer handle, or -1 if failed.
 ' */
 Public Function RiffLoadFromMemory(ByRef audioData() As Byte) As Long
     RiffLoadFromMemory = -1
@@ -2549,18 +2864,9 @@ Public Function RiffLoadFromMemory(ByRef audioData() As Byte) As Long
     End If
     
     Dim slot As Long
-    Dim i As Long
-    slot = -1
-    
-    For i = 0 To RIFF_MAX_BUFFER_INDEX
-        If Not rCtx.Buffers(i).Active Then
-            slot = i
-            Exit For
-        End If
-    Next i
-    
-    If slot = -1 Then
-        RiffSetLastError RiffErrorNoFreeBuffer
+    slot = RiffAcquireFreeBufferSlot()
+    If slot < 0 Then
+        RiffSetLastError RiffErrorMemoryAllocation
         Exit Function
     End If
     
@@ -2845,9 +3151,9 @@ Private Function RiffTryLoadWavFast(ByVal filePath As String, ByVal slot As Long
         RiffConvertWavToMixBuffer wavBytes, dataOffset, srcFrames, srcChannels, srcSampleRate, srcBlockAlign, srcBits, srcIsFloat, pOut, outFrames, mixChannels, mixSampleRate, mixBlockAlign, mixBits, mixIsFloat
     End If
 
-    rCtx.Buffers(slot).BufferPtr = pOut
-    rCtx.Buffers(slot).BufferLen = outBytes
-    rCtx.Buffers(slot).Active = True
+    rBuffers(slot).BufferPtr = pOut
+    rBuffers(slot).BufferLen = outBytes
+    rBuffers(slot).Active = True
 
     RiffSetLastError RiffErrorNone
     RiffTryLoadWavFast = slot
@@ -3215,12 +3521,12 @@ Private Function CoreProcessSourceReader(ByVal pReader As Long, ByVal slot As Lo
     FastVCall0 pReader, VTI_IUNKNOWN_RELEASE
     
     If totalSize > 0 Then
-        rCtx.Buffers(slot).BufferPtr = VirtualAlloc(0, totalSize, MEM_COMMIT Or MEM_RESERVE, PAGE_READWRITE)
+        rBuffers(slot).BufferPtr = VirtualAlloc(0, totalSize, MEM_COMMIT Or MEM_RESERVE, PAGE_READWRITE)
         
-        If rCtx.Buffers(slot).BufferPtr <> 0 Then
-            RtlMoveMemory ByVal rCtx.Buffers(slot).BufferPtr, ByVal tempPtr, totalSize
-            rCtx.Buffers(slot).BufferLen = totalSize
-            rCtx.Buffers(slot).Active = True
+        If rBuffers(slot).BufferPtr <> 0 Then
+            RtlMoveMemory ByVal rBuffers(slot).BufferPtr, ByVal tempPtr, totalSize
+            rBuffers(slot).BufferLen = totalSize
+            rBuffers(slot).Active = True
             CoreProcessSourceReader = slot
         Else
             RiffSetLastError RiffErrorMemoryAllocation
@@ -3243,24 +3549,24 @@ Public Sub RiffUnload(ByVal bufferHandle As Long)
     If Not RiffRequireBufferHandle(bufferHandle) Then
         Exit Sub
     End If
-    If Not rCtx.Buffers(bufferHandle).Active Then
+    If Not rBuffers(bufferHandle).Active Then
         RiffSetLastError RiffErrorInvalidBuffer
         Exit Sub
     End If
     
     Dim i As Long
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).BufferIndex = bufferHandle Then
             rVoices(i).Active = False
         End If
     Next i
     
-    If rCtx.Buffers(bufferHandle).BufferPtr <> 0 Then
-        VirtualFree rCtx.Buffers(bufferHandle).BufferPtr, 0, MEM_RELEASE
-        rCtx.Buffers(bufferHandle).BufferPtr = 0
+    If rBuffers(bufferHandle).BufferPtr <> 0 Then
+        VirtualFree rBuffers(bufferHandle).BufferPtr, 0, MEM_RELEASE
+        rBuffers(bufferHandle).BufferPtr = 0
     End If
     
-    rCtx.Buffers(bufferHandle).Active = False
+    rBuffers(bufferHandle).Active = False
 End Sub
 
 '/**
@@ -3272,12 +3578,12 @@ Public Property Get RiffBufferDurationSec(ByVal bufferHandle As Long) As Single
     If Not RiffRequireBufferHandle(bufferHandle) Then
         Exit Property
     End If
-    If Not rCtx.Buffers(bufferHandle).Active Or rCtx.AvgBytesPerSec = 0 Then
+    If Not rBuffers(bufferHandle).Active Or rCtx.AvgBytesPerSec = 0 Then
         RiffSetLastError RiffErrorInvalidBuffer
         Exit Property
     End If
     
-    RiffBufferDurationSec = CSng(rCtx.Buffers(bufferHandle).BufferLen) / CSng(rCtx.AvgBytesPerSec)
+    RiffBufferDurationSec = CSng(rBuffers(bufferHandle).BufferLen) / CSng(rCtx.AvgBytesPerSec)
 
 End Property
 
@@ -3294,7 +3600,7 @@ Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath A
     If Not RiffRequireBufferHandle(bufferHandle) Then
         Exit Function
     End If
-    If Not rCtx.Buffers(bufferHandle).Active Then
+    If Not rBuffers(bufferHandle).Active Then
         RiffSetLastError RiffErrorInvalidBuffer
         Exit Function
     End If
@@ -3328,7 +3634,7 @@ Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath A
         Exit Function
     End If
 
-    frames = rCtx.Buffers(bufferHandle).BufferLen \ CLng(nBlockAlign)
+    frames = rBuffers(bufferHandle).BufferLen \ CLng(nBlockAlign)
     If frames <= 0 Then
         RiffSetLastError RiffErrorInvalidBuffer
         Exit Function
@@ -3339,9 +3645,9 @@ Public Function RiffExportBufferWav(ByVal bufferHandle As Long, ByVal filePath A
     ReDim outBytes(0 To dataBytes - 1)
 
     For frame = 0 To frames - 1
-        sL = RiffReadInterleavedSample(rCtx.Buffers(bufferHandle).BufferPtr, frame, 0, nChannels, nBlockAlign, wBits, isFloat)
+        sL = RiffReadInterleavedSample(rBuffers(bufferHandle).BufferPtr, frame, 0, nChannels, nBlockAlign, wBits, isFloat)
         If nChannels > 1 Then
-            sR = RiffReadInterleavedSample(rCtx.Buffers(bufferHandle).BufferPtr, frame, 1, nChannels, nBlockAlign, wBits, isFloat)
+            sR = RiffReadInterleavedSample(rBuffers(bufferHandle).BufferPtr, frame, 1, nChannels, nBlockAlign, wBits, isFloat)
         Else
             sR = sL
         End If
@@ -3591,7 +3897,7 @@ End Function
 ' * @param looped Optional loop flag applied before activation.
 ' * @param volume Optional voice volume multiplier.
 ' * @param pan Optional stereo pan from -1 left to 1 right.
-' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
+' * @return {Long} Voice handle, or -1 if allocation failed.
 ' */
 Public Function RiffPlay(ByVal bufferHandle As Long, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
     RiffPlay = InternalPlayBuffer(bufferHandle, busID, looped, volume, pan)
@@ -3604,7 +3910,7 @@ End Function
 ' * @param busID Mixer bus that receives the voice.
 ' * @param volume Optional voice volume multiplier.
 ' * @param pan Optional stereo pan from -1 left to 1 right.
-' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
+' * @return {Long} Voice handle, or -1 if allocation failed.
 ' */
 Public Function RiffPlayBus(ByVal bufferHandle As Long, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
     RiffPlayBus = InternalPlayBuffer(bufferHandle, busID, False, volume, pan)
@@ -3645,7 +3951,7 @@ Private Function InternalPlayBuffer(ByVal bufferHandle As Long, ByVal busID As R
     If Not RiffRequireBufferHandle(bufferHandle) Then
         Exit Function
     End If
-    If Not rCtx.Buffers(bufferHandle).Active Then
+    If Not rBuffers(bufferHandle).Active Then
         RiffSetLastError RiffErrorInvalidBuffer
         Exit Function
     End If
@@ -3668,7 +3974,7 @@ Private Function InternalPlayBuffer(ByVal bufferHandle As Long, ByVal busID As R
     rVoices(voiceSlot).BufferIndex = bufferHandle
     rVoices(voiceSlot).Position = 0#
     rVoices(voiceSlot).loopStart = 0#
-    rVoices(voiceSlot).loopEnd = CDbl(rCtx.Buffers(bufferHandle).BufferLen)
+    rVoices(voiceSlot).loopEnd = CDbl(rBuffers(bufferHandle).BufferLen)
     rVoices(voiceSlot).Looping = looped
     rVoices(voiceSlot).busID = busID
     rVoices(voiceSlot).volume = volume
@@ -3702,7 +4008,7 @@ End Function
 ' * @param volume Optional voice volume multiplier.
 ' * @param pan Optional stereo pan from -1 left to 1 right.
 ' * @param durationSec Optional finite lifetime in seconds. Use 0 for continuous oscillator playback.
-' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
+' * @return {Long} Voice handle, or -1 if allocation failed.
 ' */
 Public Function RiffPlayOscillator(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = 0!) As Long
     RiffPlayOscillator = InternalPlayOscillator(waveType, frequencyHz, busID, volume, pan, durationSec)
@@ -3717,7 +4023,7 @@ End Function
 ' * @param volume Optional voice volume multiplier.
 ' * @param pan Optional stereo pan from -1 left to 1 right.
 ' * @param durationSec Optional finite lifetime in seconds. Use 0 for continuous oscillator playback.
-' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
+' * @return {Long} Voice handle, or -1 if allocation failed.
 ' */
 Public Function RiffPlayOscillatorBus(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = 0!) As Long
     RiffPlayOscillatorBus = InternalPlayOscillator(waveType, frequencyHz, busID, volume, pan, durationSec)
@@ -3731,7 +4037,7 @@ End Function
 ' * @param volume Optional voice volume multiplier.
 ' * @param pan Optional stereo pan from -1 left to 1 right.
 ' * @param durationSec Optional finite lifetime in seconds. Use 0 for continuous noise.
-' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
+' * @return {Long} Voice handle, or -1 if allocation failed.
 ' */
 Public Function RiffPlayNoise(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = RIFF_DEFAULT_NOISE_DURATION_SEC) As Long
     Select Case noiseType
@@ -3751,7 +4057,7 @@ End Function
 ' * @param volume Optional voice volume multiplier.
 ' * @param pan Optional stereo pan from -1 left to 1 right.
 ' * @param durationSec Optional finite lifetime in seconds. Use 0 for continuous noise.
-' * @return {Long} Voice handle (0-31), or -1 if all voices are occupied.
+' * @return {Long} Voice handle, or -1 if allocation failed.
 ' */
 Public Function RiffPlayNoiseBus(Optional ByVal noiseType As RiffWaveType = RiffWaveWhiteNoise, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!, Optional ByVal durationSec As Single = RIFF_DEFAULT_NOISE_DURATION_SEC) As Long
     RiffPlayNoiseBus = RiffPlayNoise(noiseType, busID, volume, pan, durationSec)
@@ -3886,7 +4192,7 @@ Private Function InternalGetFreeVoice(Optional ByVal bufferHandle As Long = -1, 
     busSerial = 2147483647
     globalSerial = 2147483647
 
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
             If rVoices(i).busID = busID Then
                 busCount = busCount + 1
@@ -3949,6 +4255,12 @@ Private Function InternalGetFreeVoice(Optional ByVal bufferHandle As Long = -1, 
         Exit Function
     End If
 
+    firstFree = rVoiceCapacity
+    If RiffEnsureVoiceCapacity(rVoiceCapacity + 1) Then
+        InternalGetFreeVoice = firstFree
+        Exit Function
+    End If
+
     If rCtx.VoiceStealingEnabled And globalSteal >= 0 Then
         RiffReleaseVoice globalSteal
         InternalGetFreeVoice = globalSteal
@@ -3961,7 +4273,7 @@ End Function
 ' * @param voiceHandle Voice slot to release.
 ' */
 Private Sub RiffReleaseVoice(ByVal voiceHandle As Long)
-    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then Exit Sub
+    If voiceHandle < 0 Or voiceHandle > RiffLastVoiceIndex() Then Exit Sub
     rVoices(voiceHandle).Playing = False
     rVoices(voiceHandle).Active = False
     rVoices(voiceHandle).Paused = False
@@ -3978,7 +4290,7 @@ End Sub
 ' * @brief Arms a tiny click-free attack ramp for newly allocated or stolen voices.
 ' */
 Private Sub RiffStartVoiceAttack(ByVal voiceHandle As Long)
-    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then Exit Sub
+    If voiceHandle < 0 Or voiceHandle > RiffLastVoiceIndex() Then Exit Sub
     rVoices(voiceHandle).fadeState = 1
     rVoices(voiceHandle).FadeFramesTotal = RIFF_DEFAULT_ATTACK_FRAMES
     rVoices(voiceHandle).FadeFramesCurrent = 0
@@ -3989,7 +4301,7 @@ End Sub
 ' * @brief Sets a finite lifetime for one-shot generated voices without affecting continuous oscillators.
 ' */
 Private Sub RiffSetGeneratedVoiceLifetime(ByVal voiceHandle As Long, ByVal durationSec As Single)
-    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then Exit Sub
+    If voiceHandle < 0 Or voiceHandle > RiffLastVoiceIndex() Then Exit Sub
 
     rVoices(voiceHandle).LifeFramesTotal = 0
     rVoices(voiceHandle).LifeFramesCurrent = 0
@@ -4009,7 +4321,7 @@ End Sub
 ' */
 Private Function RiffCountVoicesForOscillator(ByVal waveType As RiffWaveType, ByVal busID As RiffBusId) As Long
     Dim i As Long
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
             If rVoices(i).IsOscillator Then
                 If rVoices(i).OscType = waveType And rVoices(i).busID = busID Then
@@ -4031,7 +4343,7 @@ Private Function RiffFindStealVoiceForOscillator(ByVal waveType As RiffWaveType,
     RiffFindStealVoiceForOscillator = -1
     bestSerial = 2147483647
 
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
             If rVoices(i).IsOscillator Then
                 If rVoices(i).OscType = waveType And rVoices(i).busID = busID Then
@@ -4082,7 +4394,7 @@ End Function
 ' */
 Private Function RiffCountVoicesForBuffer(ByVal bufferHandle As Long, ByVal busID As RiffBusId) As Long
     Dim i As Long
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
             If Not rVoices(i).IsOscillator Then
                 If rVoices(i).BufferIndex = bufferHandle And rVoices(i).busID = busID Then
@@ -4101,7 +4413,7 @@ End Function
 ' */
 Private Function RiffCountVoicesForBus(ByVal busID As RiffBusId) As Long
     Dim i As Long
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
             If rVoices(i).busID = busID Then
                 RiffCountVoicesForBus = RiffCountVoicesForBus + 1
@@ -4123,7 +4435,7 @@ Private Function RiffFindStealVoiceForBuffer(ByVal bufferHandle As Long, ByVal b
     RiffFindStealVoiceForBuffer = -1
     bestSerial = 2147483647
     
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
             If Not rVoices(i).IsOscillator Then
                 If rVoices(i).BufferIndex = bufferHandle And rVoices(i).busID = busID Then
@@ -4151,7 +4463,7 @@ Private Function RiffFindStealVoiceForBus(ByVal busID As RiffBusId) As Long
     RiffFindStealVoiceForBus = -1
     bestSerial = 2147483647
     
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
             If rVoices(i).busID = busID Then
                 If Not rVoices(i).Looping Then
@@ -4176,7 +4488,7 @@ Private Function RiffFindGlobalStealVoice() As Long
     RiffFindGlobalStealVoice = -1
     bestSerial = 2147483647
     
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
             If Not rVoices(i).Looping Then
                 If rVoices(i).StartSerial < bestSerial Then
@@ -4314,7 +4626,7 @@ End Sub
 ' * @brief Clears the per-voice time-effect ring only when delay, chorus, flanger, or reverb is actually enabled.
 ' */
 Private Sub RiffPrepareVoiceRingBuffer(ByVal voiceHandle As Long)
-    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then Exit Sub
+    If voiceHandle < 0 Or voiceHandle > RiffLastVoiceIndex() Then Exit Sub
     If rVoices(voiceHandle).RingPrepared Then Exit Sub
     rVoices(voiceHandle).RingWritePos = 0
     RtlZeroMemory VarPtr(rRingBuf(voiceHandle * RIFF_RING_SAMPLES_PER_VOICE)), RIFF_RING_SAMPLES_PER_VOICE * RIFF_SINGLE_BYTES
@@ -4327,7 +4639,7 @@ End Sub
 ' * @param voiceHandle The active voice.
 ' */
 Private Sub RiffMarkVoiceRingDirty(ByVal voiceHandle As Long)
-    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then Exit Sub
+    If voiceHandle < 0 Or voiceHandle > RiffLastVoiceIndex() Then Exit Sub
     rVoices(voiceHandle).RingPrepared = False
 End Sub
 
@@ -4399,7 +4711,7 @@ Public Sub RiffStopAll()
     End If
 
     Dim i As Long
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         rVoices(i).Playing = False
         rVoices(i).Active = False
     Next i
@@ -4475,17 +4787,17 @@ Public Sub RiffSetLoopRegionSec(ByVal voiceHandle As Long, ByVal startSec As Sin
     
     Dim bufHandle As Long
     bufHandle = rVoices(voiceHandle).BufferIndex
-    If bufHandle < 0 Or bufHandle > RIFF_MAX_BUFFER_INDEX Then
+    If bufHandle < 0 Or bufHandle > RiffLastBufferIndex() Then
         RiffSetLastError RiffErrorInvalidBuffer
         Exit Sub
     End If
-    If Not rCtx.Buffers(bufHandle).Active Then
+    If Not rBuffers(bufHandle).Active Then
         RiffSetLastError RiffErrorInvalidBuffer
         Exit Sub
     End If
     
-    If eByte > rCtx.Buffers(bufHandle).BufferLen Then
-        eByte = rCtx.Buffers(bufHandle).BufferLen
+    If eByte > rBuffers(bufHandle).BufferLen Then
+        eByte = rBuffers(bufHandle).BufferLen
     End If
     
     Dim nBlockAlign As Integer
@@ -4560,11 +4872,11 @@ Public Function RiffFindPlayingVoice(ByVal bufferHandle As Long, Optional ByVal 
     If busID < -1 Then
         RiffSetLastError RiffErrorInvalidBus
         Exit Function
-    ElseIf busID > RIFF_MAX_BUS_INDEX Then
+    ElseIf busID > RiffLastBusIndex() Then
         busID = CLng(RiffClampBusId(busID))
     End If
 
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active Then
             If rVoices(i).Playing Then
                 If Not rVoices(i).IsOscillator Then
@@ -4802,7 +5114,7 @@ End Sub
 ' * @brief Hardens preset output so no preset can leave invalid DSP values behind.
 ' */
 Private Sub InternalClampVoiceEffectState(ByVal voiceHandle As Long)
-    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then Exit Sub
+    If voiceHandle < 0 Or voiceHandle > RiffLastVoiceIndex() Then Exit Sub
 
     If rVoices(voiceHandle).Distortion < RIFF_DEFAULT_DISTORTION Then rVoices(voiceHandle).Distortion = RIFF_DEFAULT_DISTORTION
     If rVoices(voiceHandle).lowPass < RIFF_MIN_LOWPASS_CONTROL Then rVoices(voiceHandle).lowPass = RIFF_MIN_LOWPASS_CONTROL
@@ -5052,17 +5364,17 @@ End Function
 ' * @param busID Source bus preset slot.
 ' */
 Private Sub InternalApplyBusEffectsToVoice(ByVal voiceHandle As Long, ByVal busID As RiffBusId)
-    If voiceHandle < 0 Or voiceHandle > RIFF_MAX_VOICE_INDEX Then
+    If voiceHandle < 0 Or voiceHandle > RiffLastVoiceIndex() Then
         Exit Sub
     End If
-    If busID < 0 Or busID > RIFF_MAX_BUS_INDEX Then
+    If busID < 0 Or busID > RiffLastBusIndex() Then
         Exit Sub
     End If
-    If Not rCtx.Buses(busID).FxEnabled Then
+    If Not rBuses(busID).FxEnabled Then
         Exit Sub
     End If
 
-    RiffVoiceApplyPreset voiceHandle, rCtx.Buses(busID).FxPreset, rCtx.Buses(busID).FxAmount
+    RiffVoiceApplyPreset voiceHandle, rBuses(busID).FxPreset, rBuses(busID).FxAmount
 End Sub
 
 '/**
@@ -5208,15 +5520,15 @@ Public Property Let RiffVoicePositionSec(ByVal voiceHandle As Long, ByVal value 
     
     Dim bufHandle As Long
     bufHandle = rVoices(voiceHandle).BufferIndex
-    If bufHandle < 0 Or bufHandle > RIFF_MAX_BUFFER_INDEX Then
+    If bufHandle < 0 Or bufHandle > RiffLastBufferIndex() Then
         Exit Property
     End If
-    If Not rCtx.Buffers(bufHandle).Active Then
+    If Not rBuffers(bufHandle).Active Then
         Exit Property
     End If
     
-    If posBytes >= rCtx.Buffers(bufHandle).BufferLen Then
-        posBytes = rCtx.Buffers(bufHandle).BufferLen - 1
+    If posBytes >= rBuffers(bufHandle).BufferLen Then
+        posBytes = rBuffers(bufHandle).BufferLen - 1
     End If
     
     rVoices(voiceHandle).Position = posBytes
@@ -6411,15 +6723,15 @@ End Function
 Private Function RiffEngineHasActivePlayback() As Boolean
     Dim i As Long
 
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing And Not rVoices(i).Paused Then
             If rVoices(i).IsOscillator Then
                 RiffEngineHasActivePlayback = True
                 Exit Function
             End If
 
-            If rVoices(i).BufferIndex >= 0 And rVoices(i).BufferIndex <= RIFF_MAX_BUFFER_INDEX Then
-                If rCtx.Buffers(rVoices(i).BufferIndex).Active Then
+            If rVoices(i).BufferIndex >= 0 And rVoices(i).BufferIndex <= RiffLastBufferIndex() Then
+                If rBuffers(rVoices(i).BufferIndex).Active Then
                     RiffEngineHasActivePlayback = True
                     Exit Function
                 End If
@@ -6686,6 +6998,84 @@ Private Sub RiffProcessFreeverb(ByVal voiceIndex As Long, ByVal baseIndex As Lon
 End Sub
 
 '/**
+' * @function RiffForegroundRootWindow
+' * @brief Returns the root foreground window for editor-safety checks.
+' * @return {Long/LongPtr} Root foreground window handle, or 0.
+' */
+#If VBA7 Then
+Private Function RiffForegroundRootWindow() As LongPtr
+    Dim hWnd As LongPtr
+    hWnd = GetForegroundWindow()
+    If hWnd = 0 Then Exit Function
+
+    RiffForegroundRootWindow = GetAncestor(hWnd, RIFF_GA_ROOT)
+    If RiffForegroundRootWindow = 0 Then RiffForegroundRootWindow = hWnd
+End Function
+#Else
+Private Function RiffForegroundRootWindow() As Long
+    Dim hWnd As Long
+    hWnd = GetForegroundWindow()
+    If hWnd = 0 Then Exit Function
+
+    RiffForegroundRootWindow = GetAncestor(hWnd, RIFF_GA_ROOT)
+    If RiffForegroundRootWindow = 0 Then RiffForegroundRootWindow = hWnd
+End Function
+#End If
+
+'/**
+' * @function RiffWindowClassName
+' * @brief Reads a Win32 class name from a window handle.
+' * @param hWnd Window handle to inspect.
+' * @return {String} Native class name, or an empty string.
+' */
+#If VBA7 Then
+Private Function RiffWindowClassName(ByVal hWnd As LongPtr) As String
+#Else
+Private Function RiffWindowClassName(ByVal hWnd As Long) As String
+#End If
+    Dim className As String
+    Dim classLen As Long
+
+    If hWnd = 0 Then Exit Function
+
+    className = String$(RIFF_WINDOW_CLASS_BUFFER_CHARS, vbNullChar)
+    classLen = GetClassNameW(hWnd, StrPtr(className), RIFF_WINDOW_CLASS_BUFFER_CHARS)
+    If classLen <= 0 Then Exit Function
+
+    RiffWindowClassName = Left$(className, classLen)
+End Function
+
+'/**
+' * @function RiffIsVbeForeground
+' * @brief Detects whether the Visual Basic Editor is currently the foreground root window.
+' * @return {Boolean} True when the developer is focused on the VBE.
+' */
+Private Function RiffIsVbeForeground() As Boolean
+    RiffIsVbeForeground = (LCase$(RiffWindowClassName(RiffForegroundRootWindow())) = RIFF_VBE_WINDOW_CLASS)
+End Function
+
+'/**
+' * @function RiffEditorGuardShouldSuspend
+' * @brief Decides whether the render timer should suspend before the VBE starts editing live code.
+' * @return {Boolean} True when the callback must stop immediately.
+' */
+Private Function RiffEditorGuardShouldSuspend() As Boolean
+    If Not rCtx.EditorSafeMode Then Exit Function
+    If Not rCtx.Initialized Then Exit Function
+
+    RiffEditorGuardShouldSuspend = RiffIsVbeForeground()
+End Function
+
+'/**
+' * @function RiffEditorGuardStopTimer
+' * @brief Stops the render timer from inside a callback before the engine touches mutable VBA state.
+' */
+Private Sub RiffEditorGuardStopTimer()
+    rCtx.EditorSuspendedTimer = True
+    RiffStopRenderTimer
+End Sub
+
+'/**
 ' * @function RiffEnsureRenderTimer
 ' * @brief Starts the render timer only when it is not already running.
 ' * @return {Boolean} True if the timer is available.
@@ -6723,6 +7113,7 @@ Private Function RiffEnsureRenderTimer() As Boolean
     End If
 
     rCtx.IdleTimerTicks = 0
+    rCtx.EditorSuspendedTimer = False
     RiffEnsureRenderTimer = True
 End Function
 
@@ -6752,7 +7143,7 @@ End Sub
 Private Function RiffHasActiveVoices() As Boolean
     Dim i As Long
 
-    For i = 0 To RIFF_MAX_VOICE_INDEX
+    For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
             RiffHasActiveVoices = True
             Exit Function
@@ -6768,7 +7159,7 @@ End Function
 Private Sub RiffAdaptiveRaiseForVoiceBurst()
     Dim activeCount As Long
     activeCount = RiffActiveVoiceCount()
-    If activeCount >= (RIFF_VOICE_COUNT \ 2) Then
+    If rVoiceCapacity > 0 And activeCount >= (rVoiceCapacity \ 2) Then
         If rCtx.AdaptiveTargetQueueMs < RIFF_QUEUE_SAFE_MS Then
             rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_SAFE_MS
             rCtx.AdaptiveStableTicks = 0
@@ -6943,6 +7334,13 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
 
     If idEvent <> rCtx.TimerID Then
         If idEvent <> 0 Then KillTimer 0, idEvent
+        Exit Sub
+    End If
+
+    If rCtx.PoolMutationActive Then Exit Sub
+
+    If RiffEditorGuardShouldSuspend() Then
+        RiffEditorGuardStopTimer
         Exit Sub
     End If
 
@@ -7162,7 +7560,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
         RiffEnsureSingleScratch rMixArr32, rMixArr32Cap, sampleCount32
         RiffClearSingleScratch rMixArr32, sampleCount32
         
-        For i = 0 To RIFF_MAX_VOICE_INDEX
+        For i = 0 To RiffLastVoiceIndex()
             If rVoices(i).Active And rVoices(i).Playing Then
                 
                 If rVoices(i).Paused Then
@@ -7175,7 +7573,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                 If rVoices(i).IsOscillator Then
                     isSourceValid = True
                 ElseIf rVoices(i).BufferIndex >= 0 Then
-                    If rCtx.Buffers(rVoices(i).BufferIndex).Active Then
+                    If rBuffers(rVoices(i).BufferIndex).Active Then
                         isSourceValid = True
                     End If
                 End If
@@ -7193,7 +7591,7 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     validSourceSampleCount = sourceSampleCount
                     
                     If Not rVoices(i).IsOscillator Then
-                        ptr = rCtx.Buffers(rVoices(i).BufferIndex).BufferPtr
+                        ptr = rBuffers(rVoices(i).BufferIndex).BufferPtr
                         readPos = (CLng(pos) \ align) * align
                         
                         If readPos < 0 Then readPos = 0
@@ -7612,8 +8010,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     If currentVoicePeakL > rVoices(i).PeakL Then rVoices(i).PeakL = currentVoicePeakL
                     If currentVoicePeakR > rVoices(i).PeakR Then rVoices(i).PeakR = currentVoicePeakR
                     
-                    If currentVoicePeakL > rCtx.Buses(currentVoiceBus).PeakL Then rCtx.Buses(currentVoiceBus).PeakL = currentVoicePeakL
-                    If currentVoicePeakR > rCtx.Buses(currentVoiceBus).PeakR Then rCtx.Buses(currentVoiceBus).PeakR = currentVoicePeakR
+                    If currentVoicePeakL > rBuses(currentVoiceBus).PeakL Then rBuses(currentVoiceBus).PeakL = currentVoicePeakL
+                    If currentVoicePeakR > rBuses(currentVoiceBus).PeakR Then rBuses(currentVoiceBus).PeakR = currentVoicePeakR
                     
                     rVoices(i).Position = pos
                     rVoices(i).TremoloPhase = trmPhase
@@ -7661,7 +8059,7 @@ NextVoice32:
         RiffEnsureIntegerScratch rMixArr16, rMixArr16Cap, sampleCount16
         RiffClearIntegerScratch rMixArr16, sampleCount16
         
-        For i = 0 To RIFF_MAX_VOICE_INDEX
+        For i = 0 To RiffLastVoiceIndex()
             If rVoices(i).Active And rVoices(i).Playing Then
                 
                 If rVoices(i).Paused Then
@@ -7674,7 +8072,7 @@ NextVoice32:
                 If rVoices(i).IsOscillator Then
                     isSourceValid16 = True
                 ElseIf rVoices(i).BufferIndex >= 0 Then
-                    If rCtx.Buffers(rVoices(i).BufferIndex).Active Then
+                    If rBuffers(rVoices(i).BufferIndex).Active Then
                         isSourceValid16 = True
                     End If
                 End If
@@ -7692,7 +8090,7 @@ NextVoice32:
                     validSourceSampleCount = sourceSampleCount
                     
                     If Not rVoices(i).IsOscillator Then
-                        ptr = rCtx.Buffers(rVoices(i).BufferIndex).BufferPtr
+                        ptr = rBuffers(rVoices(i).BufferIndex).BufferPtr
                         readPos = (CLng(pos) \ align) * align
                         
                         If readPos < 0 Then readPos = 0
@@ -8099,8 +8497,8 @@ NextVoice32:
                     If cVoicePeakL16 > rVoices(i).PeakL Then rVoices(i).PeakL = cVoicePeakL16
                     If cVoicePeakR16 > rVoices(i).PeakR Then rVoices(i).PeakR = cVoicePeakR16
                     
-                    If cVoicePeakL16 > rCtx.Buses(cVoiceBus16).PeakL Then rCtx.Buses(cVoiceBus16).PeakL = cVoicePeakL16
-                    If cVoicePeakR16 > rCtx.Buses(cVoiceBus16).PeakR Then rCtx.Buses(cVoiceBus16).PeakR = cVoicePeakR16
+                    If cVoicePeakL16 > rBuses(cVoiceBus16).PeakL Then rBuses(cVoiceBus16).PeakL = cVoicePeakL16
+                    If cVoicePeakR16 > rBuses(cVoiceBus16).PeakR Then rBuses(cVoiceBus16).PeakR = cVoicePeakR16
                     
                     rVoices(i).Position = pos
                     rVoices(i).TremoloPhase = trmPhase
