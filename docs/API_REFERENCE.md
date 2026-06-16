@@ -1,8 +1,8 @@
 # Riff API Reference
 
-**Riff.bas** is a high-performance VBA audio engine for Windows Office hosts. It uses Media Foundation for decoding, WASAPI shared-mode output for playback, and a real-time DSP pipeline written directly in VBA with a small native timer thunk. It supports x86 and x64 VBA, static audio buffers, polyphonic voices, audio buses, synthetic oscillators, white/pink/brown noise, WAV export, peak meters, adaptive buffering, musical preset packs, master bus processors, and a full per-voice effects chain.
+**Riff.bas** is a high-performance VBA audio engine for Windows Office hosts. It uses Media Foundation for decoding, WASAPI shared-mode output for playback, and a real-time DSP pipeline written directly in VBA with a small native timer thunk. It supports x86 and x64 VBA, SafeArray-backed dynamic audio buffers, polyphonic voices, expandable audio buses, synthetic oscillators, white/pink/brown noise, WAV export, peak meters, adaptive buffering, musical preset packs, master bus processors, and a full per-voice effects chain.
 
-This reference includes the current stability/performance pass: anti-accumulation voice caps, finite procedural one-shots, Hz-based filter helpers, lazy temporal-buffer preparation, faster `RiffPlay`/preset setup, warm-silence underrun protection, the VBE-safe idle timer that prevents IntelliSense from being held in a permanent running state, and stop/reset-safe editor cleanup for manual VBE interruptions.
+This reference includes the current stability/performance pass: dynamic buffer/voice/bus pools, manual pre-reservation APIs for large projects, anti-accumulation voice caps, finite procedural one-shots, Hz-based filter helpers, lazy temporal-buffer preparation, faster `RiffPlay`/preset setup, warm-silence underrun protection, the VBE-safe idle timer that prevents IntelliSense from being held in a permanent running state, optional VBE foreground protection, and stop/reset-safe editor cleanup for manual VBE interruptions.
 
 ```vb
 voice = RiffPlay(bufferHandle, RiffBusSfx, False, 0.9, 0!)
@@ -19,12 +19,14 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!, 0.12!)
   - [Engine Lifecycle](#engine-lifecycle)
   - [Buffer Pool](#buffer-pool)
   - [Voice Pool](#voice-pool)
+  - [Dynamic Resource Pools](#dynamic-resource-pools)
   - [Anti-Accumulation and Burst Safety](#anti-accumulation-and-burst-safety)
   - [Audio Buses](#audio-buses)
   - [Adaptive Buffering](#adaptive-buffering)
   - [Timer and Host Behavior](#timer-and-host-behavior)
   - [VBE-Safe Idle Timer](#vbe-safe-idle-timer)
   - [Stop/Reset-Safe Editor Cleanup](#stopreset-safe-editor-cleanup)
+  - [VBE Edit Protection for Live Code Changes](#vbe-edit-protection-for-live-code-changes)
   - [Performance Model](#performance-model)
   - [DSP Pipeline](#dsp-pipeline)
   - [Oscillators and Noise](#oscillators-and-noise)
@@ -38,6 +40,7 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!, 0.12!)
   - [RiffErrorCode](#rifferrorcode)
 - [Initialization and Teardown](#initialization-and-teardown)
 - [Diagnostics](#diagnostics)
+  - [Dynamic Pool Reservation API](#dynamic-pool-reservation-api)
   - [Runtime Voice Counters](#runtime-voice-counters)
 - [Global Settings](#global-settings)
 - [Master Bus Processors](#master-bus-processors)
@@ -132,7 +135,7 @@ End Sub
 
 ### Buffer Pool
 
-Riff stores decoded audio in a fixed pool of **64 buffers**. A buffer handle is an integer from `0` to `63`. Loading returns `-1` on failure.
+Riff stores decoded audio in a dynamic SafeArray-backed buffer pool. The engine starts with **64 buffer slots** for compatibility and speed, but the pool can grow automatically when more assets are loaded. A buffer handle is still a numeric integer, and loading returns `-1` on failure.
 
 ```vb
 Dim explosion As Long
@@ -143,11 +146,11 @@ If explosion = -1 Then
 End If
 ```
 
-Loading is synchronous. Decode files during setup, not during frame-by-frame gameplay or UI animation.
+Loading is synchronous. Decode files during setup, not during frame-by-frame gameplay or UI animation. For very large projects, call `RiffReserveBuffers` during initialization so the buffer pool is prepared before the first big asset batch is loaded.
 
 ### Voice Pool
 
-Riff supports **32 active voices**. A voice handle is an integer from `0` to `31`. Playback functions return `-1` when no voice slot is available.
+Riff starts with **32 active voice slots** for compatibility and low startup cost, but the voice pool can grow dynamically when more simultaneous voices are needed. A voice handle is still a numeric integer. Playback functions return `-1` only when the engine cannot allocate or grow a usable voice slot.
 
 ```vb
 Dim v As Long
@@ -161,6 +164,41 @@ End If
 
 Each voice has its own source position, loop state, volume, pitch, pan, peak meters, lifetime counters, fade state, peak meters, and DSP state.
 
+
+### Dynamic Resource Pools
+
+Riff NEXT 1.2.1 removes the old hardcoded practical limits for buffers and voices. Internally, the main pools are SafeArray-backed and grow on demand:
+
+```txt
+Buffers -> start at 64, grow when more loaded assets are needed
+Voices  -> start at 32, grow when more simultaneous playback slots are needed
+Buses   -> start at 16 built-in buses, can be reserved/grown for custom routing
+```
+
+The public handles remain simple `Long` values. This means old projects do not need to change how they store buffer handles, voice handles, or bus IDs.
+
+```vb
+Dim sndHit As Long
+Dim v As Long
+
+sndHit = RiffLoad("C:\Game\Audio\hit.wav")
+v = RiffPlay(sndHit, RiffBusSfx)
+```
+
+The engine still begins with the original capacities because that keeps small projects fast and avoids allocating more memory than necessary. Large projects can ask Riff to prepare bigger pools up front:
+
+```vb
+Public Sub AudioPreloadLargeProject()
+    If Not RiffOpen() Then Exit Sub
+
+    RiffReserveBuffers 500
+    RiffReserveVoices 128
+    RiffReserveBuses 32
+End Sub
+```
+
+This does not mean infinite memory. It means the old fixed Riff-side limit is gone. Real limits now come from available memory, Office bitness, the host process, and how much decoded audio or DSP state the project keeps alive.
+
 ### Anti-Accumulation and Burst Safety
 
 The current stable Riff build includes additional guardrails for games that trigger very short sounds repeatedly. This specifically targets the situation where a gameplay loop fires the same SFX, noise burst, or oscillator many times per second and the engine appears to slow down because active voices or DSP state pile up.
@@ -168,7 +206,7 @@ The current stable Riff build includes additional guardrails for games that trig
 The safety model is:
 
 ```txt
-Short repeated SFX -> capped per buffer and per bus
+Short repeated SFX -> optional cap per buffer and per bus
 Noise one-shots    -> finite duration by default
 Oscillator beeps   -> optional finite duration
 Voice stealing     -> enabled by default and cleaned before reuse
@@ -180,6 +218,12 @@ Relevant runtime controls:
 
 ```vb
 RiffVoiceStealingEnabled = True
+
+' 0 disables explicit burst caps. This is the NEXT 1.2.1 default.
+RiffMaxVoicesPerBuffer = 0
+RiffMaxVoicesPerBus = 0
+
+' Optional game-style caps when you want stricter burst control.
 RiffMaxVoicesPerBuffer = 4
 RiffMaxVoicesPerBus = 18
 ```
@@ -211,11 +255,13 @@ RiffFadeOut windVoice, 1.5!
 
 ### Audio Buses
 
-Riff provides **16 buses**:
+Riff provides **16 built-in named buses** by default:
 
 ```txt
 Main, Sfx, Music, Voice, Ui, Aux1 ... Aux11
 ```
+
+The built-in enum covers IDs `0` to `15`. In NEXT 1.2.1, the internal bus pool can be reserved or grown beyond that for advanced custom routing, but the named `RiffBusId` values remain the recommended public routing layer for normal projects.
 
 Buses are used to group voices. For example, all music voices can be routed to `RiffBusMusic`, all effects to `RiffBusSfx`, and all interface sounds to `RiffBusUi`.
 
@@ -361,6 +407,43 @@ Public Sub DevAudioEmergencyStop()
     RiffEditorEmergencyStop
 End Sub
 ```
+
+
+### VBE Edit Protection for Live Code Changes
+
+Editing live VBA code while a native timer/callback is running is one of the riskiest workflows in Office. The VBE may recompile or rearrange project state while Riff is still rendering audio through the timer path. In that exact situation, a host crash can also leave the workbook/presentation in a corrupted state.
+
+NEXT 1.2.1 adds a manual editor-safe workflow:
+
+```vb
+RiffPrepareForVbeEdit
+' Change code in the VBE here.
+RiffResumeAfterVbeEdit
+```
+
+`RiffPrepareForVbeEdit` stops the render timer but keeps the engine, loaded buffers, and WASAPI resources alive. `RiffResumeAfterVbeEdit` restarts the timer after the edit window is safe again.
+
+For convenience, you can wrap this into development macros:
+
+```vb
+Public Sub EntrarModoEdicaoSeguro()
+    RiffPrepareForVbeEdit
+End Sub
+
+Public Sub SairModoEdicaoSeguro()
+    If Not RiffResumeAfterVbeEdit() Then
+        Debug.Print "Riff resume failed:", RiffLastError
+    End If
+End Sub
+```
+
+There is also an optional automatic foreground guard:
+
+```vb
+RiffEditorSafeMode = True
+```
+
+This mode suspends the render timer when the VBE receives focus. It is disabled by default because many developers test playback directly from the VBE, and an aggressive automatic guard can make it look like Riff opened but produced no sound.
 
 ### Performance Model
 
@@ -680,11 +763,11 @@ End Enum
 |:---|:---|
 | `RiffErrorNone` | Last operation completed without a Riff-level error. |
 | `RiffErrorNotInitialized` | The engine is not open. Call `RiffOpen`. |
-| `RiffErrorNoFreeBuffer` | All 64 buffer slots are occupied. |
-| `RiffErrorNoFreeVoice` | All 32 voice slots are active. |
+| `RiffErrorNoFreeBuffer` | Riff could not find or grow a free buffer slot. This usually means memory allocation failed or the engine state is invalid. |
+| `RiffErrorNoFreeVoice` | Riff could not find, steal, or grow a usable voice slot. Check memory pressure, caps, and active voice counts. |
 | `RiffErrorInvalidBuffer` | Buffer handle is outside range or inactive. |
 | `RiffErrorInvalidVoice` | Voice handle is outside range or invalid for the operation. |
-| `RiffErrorInvalidBus` | Bus id is outside `0` to `15`. |
+| `RiffErrorInvalidBus` | Bus id is outside the currently allocated bus capacity. Built-in named buses are still `0` to `15`. |
 | `RiffErrorInvalidArgument` | Argument is empty, invalid, or outside accepted range. |
 | `RiffErrorFileNotFound` | Source path does not exist. |
 | `RiffErrorComFailure` | Windows/COM/WASAPI/Media Foundation call failed. |
@@ -796,6 +879,41 @@ Public Sub PauseAudioSystem()
 End Sub
 ```
 
+
+### RiffPrepareForVbeEdit
+
+```vb
+Public Sub RiffPrepareForVbeEdit()
+```
+
+Stops the render timer before editing live VBA code while Riff is initialized. It does not unload buffers, release WASAPI resources, or close the engine.
+
+Use it when you need to change code in the VBE while audio may still be active or while the Riff timer may still be alive.
+
+```vb
+Public Sub BeforeEditingAudioCode()
+    RiffPrepareForVbeEdit
+End Sub
+```
+
+This is a development-safety helper. For final application shutdown, still use `RiffClose`.
+
+### RiffResumeAfterVbeEdit
+
+```vb
+Public Function RiffResumeAfterVbeEdit() As Boolean
+```
+
+Restarts the render timer after a manual VBE edit pause. Returns `True` when the timer is running or was started successfully. Returns `False` and sets `RiffLastError` if the engine is not initialized or the timer path cannot be restored.
+
+```vb
+Public Sub AfterEditingAudioCode()
+    If Not RiffResumeAfterVbeEdit() Then
+        Debug.Print "Riff resume failed:", RiffLastError
+    End If
+End Sub
+```
+
 ### RiffWake
 
 ```vb
@@ -807,6 +925,36 @@ Wakes/restarts the render path after `RiffSuspend`. If the engine is not initial
 ```vb
 If RiffWake() Then
     RiffPlay sndClick, RiffBusUi
+End If
+```
+
+
+### RiffEditorSafeMode
+
+```vb
+Public Property Get RiffEditorSafeMode() As Boolean
+Public Property Let RiffEditorSafeMode(ByVal value As Boolean)
+```
+
+Enables or disables the optional VBE foreground guard. When enabled, Riff may suspend the render timer when the VBE is the foreground window. This reduces the chance of editing code while a native callback is still touching VBA state.
+
+```vb
+RiffEditorSafeMode = True
+```
+
+This property is disabled by default in NEXT 1.2.1 because normal tests launched from the VBE should still produce sound. Prefer the explicit `RiffPrepareForVbeEdit` / `RiffResumeAfterVbeEdit` workflow while validating a project.
+
+### RiffEditorTimerSuspended
+
+```vb
+Public Property Get RiffEditorTimerSuspended() As Boolean
+```
+
+Returns `True` when the editor guard or manual edit workflow has suspended the render timer for VBE safety.
+
+```vb
+If RiffEditorTimerSuspended Then
+    Debug.Print "Riff timer is paused for editor safety."
 End If
 ```
 
@@ -860,7 +1008,7 @@ End If
 Public Property Get RiffMaxVoices() As Long
 ```
 
-Returns the fixed voice pool count: `32`.
+Returns the current allocated voice capacity. In NEXT 1.2.1 this starts at `32`, but it may grow automatically or through `RiffReserveVoices`.
 
 ```vb
 Dim i As Long
@@ -875,7 +1023,7 @@ Next
 Public Property Get RiffMaxBuffers() As Long
 ```
 
-Returns the fixed buffer pool count: `64`.
+Returns the current allocated buffer capacity. In NEXT 1.2.1 this starts at `64`, but it may grow automatically or through `RiffReserveBuffers`.
 
 ### RiffMaxBuses
 
@@ -883,7 +1031,60 @@ Returns the fixed buffer pool count: `64`.
 Public Property Get RiffMaxBuses() As Long
 ```
 
-Returns the bus count: `16`.
+Returns the current allocated bus capacity. It starts at the built-in `16` named buses and can grow through `RiffReserveBuses` for advanced routing.
+
+
+### Dynamic Pool Reservation API
+
+These functions are optional. Riff grows pools automatically when possible, but pre-reserving capacity during startup is better for large games, presentations, or audio-heavy tools because it avoids growth work during gameplay or animation.
+
+#### RiffReserveBuffers
+
+```vb
+Public Function RiffReserveBuffers(ByVal capacity As Long) As Boolean
+```
+
+Ensures the buffer pool can hold at least `capacity` decoded assets. Returns `True` when the requested capacity is available.
+
+```vb
+If Not RiffReserveBuffers(500) Then
+    Debug.Print "Could not reserve buffers:", RiffLastError
+End If
+```
+
+Use this before a large `RiffLoad` batch.
+
+#### RiffReserveVoices
+
+```vb
+Public Function RiffReserveVoices(ByVal capacity As Long) As Boolean
+```
+
+Ensures the voice pool can hold at least `capacity` simultaneous voice slots. This is useful for projects with heavy SFX bursts, layered ambience, dialogue, and music playing at the same time.
+
+```vb
+If Not RiffReserveVoices(128) Then
+    Debug.Print "Could not reserve voices:", RiffLastError
+End If
+```
+
+Because every voice carries its own state and effect memory, do not reserve thousands of voices without a real need. Reserve based on the maximum simultaneous playback your project actually expects.
+
+#### RiffReserveBuses
+
+```vb
+Public Function RiffReserveBuses(ByVal capacity As Long) As Boolean
+```
+
+Ensures the bus pool can hold at least `capacity` bus slots. The first 16 buses are the built-in named buses from `RiffBusId`. Extra bus IDs are for advanced users who want custom routing beyond the default enum.
+
+```vb
+If Not RiffReserveBuses(32) Then
+    Debug.Print "Could not reserve buses:", RiffLastError
+End If
+```
+
+Normal projects should keep using `RiffBusMusic`, `RiffBusSfx`, `RiffBusUi`, and the built-in aux buses unless they specifically need more routing groups.
 
 ### Runtime Voice Counters
 
@@ -948,9 +1149,13 @@ Public Property Get RiffMaxVoicesPerBuffer() As Long
 Public Property Let RiffMaxVoicesPerBuffer(ByVal value As Long)
 ```
 
-Limits how many instances of the same loaded buffer can be active at once. This prevents a rapid-fire sound such as footsteps, bullets, UI clicks, or collision hits from piling up into a heavy mixer load.
+Limits how many instances of the same loaded buffer can be active at once. This prevents a rapid-fire sound such as footsteps, bullets, UI clicks, or collision hits from piling up into a heavy mixer load. A value of `0` disables this explicit cap, which is the NEXT 1.2.1 default.
 
 ```vb
+' Default/unlimited-by-cap behavior.
+RiffMaxVoicesPerBuffer = 0
+
+' Optional stricter gameplay cap.
 RiffMaxVoicesPerBuffer = 4
 ```
 
@@ -961,9 +1166,13 @@ Public Property Get RiffMaxVoicesPerBus() As Long
 Public Property Let RiffMaxVoicesPerBus(ByVal value As Long)
 ```
 
-Limits the number of active voices routed to one bus. This helps protect the SFX bus from large gameplay bursts while still allowing music and UI buses to remain responsive.
+Limits the number of active voices routed to one bus. This helps protect the SFX bus from large gameplay bursts while still allowing music and UI buses to remain responsive. A value of `0` disables this explicit cap, which is the NEXT 1.2.1 default.
 
 ```vb
+' Default/unlimited-by-cap behavior.
+RiffMaxVoicesPerBus = 0
+
+' Optional stricter gameplay cap.
 RiffMaxVoicesPerBus = 18
 ```
 
@@ -1038,6 +1247,11 @@ End Sub
 Public Sub PrintRiffDiagnostics()
     Debug.Print "Initialized:", RiffIsInitialized
     Debug.Print "Auto suspend:", RiffAutoSuspendTimer
+    Debug.Print "Editor safe mode:", RiffEditorSafeMode
+    Debug.Print "Editor timer suspended:", RiffEditorTimerSuspended
+    Debug.Print "Buffer capacity:", RiffMaxBuffers
+    Debug.Print "Voice capacity:", RiffMaxVoices
+    Debug.Print "Bus capacity:", RiffMaxBuses
     Debug.Print "Adaptive queue ms:", RiffAdaptiveQueueMs
     Debug.Print "Underruns:", RiffUnderrunCount
     Debug.Print "Last padding frames:", RiffLastPaddingFrames
@@ -1478,7 +1692,7 @@ End Sub
 Public Function RiffLoad(ByVal filePath As String) As Long
 ```
 
-Decodes an audio file from disk through Media Foundation into Riff's buffer pool. Returns a buffer handle or `-1`.
+Decodes an audio file from disk through Media Foundation into Riff's dynamic buffer pool. Returns a buffer handle or `-1`. If the current buffer capacity is full, Riff attempts to grow the pool automatically before failing.
 
 Supported formats depend on Windows Media Foundation codecs installed on the system, commonly WAV, MP3, AAC/M4A, WMA, and some FLAC/other formats depending on Windows version and codecs.
 
@@ -1489,6 +1703,23 @@ click = RiffLoad(ActivePresentation.Path & "\audio\click.wav")
 If click = -1 Then
     MsgBox "Could not load click.wav. Error: " & CStr(RiffLastError)
 End If
+```
+
+### Large Asset Loading Pattern
+
+For projects with many sound effects, voice lines, or music tracks, reserve buffer capacity before loading everything. This keeps the load phase predictable and avoids repeated SafeArray growth during the preload loop.
+
+```vb
+Public Sub AudioLoadLargeLibrary()
+    If Not RiffOpen() Then Exit Sub
+
+    If Not RiffReserveBuffers(500) Then
+        Debug.Print "Buffer reserve failed:", RiffLastError
+        Exit Sub
+    End If
+
+    ' Load your asset table here.
+End Sub
 ```
 
 ### RiffLoadFromMemory
@@ -2971,7 +3202,7 @@ ambience = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.04!)
 
 ### Tune Burst Caps for Game Feel
 
-The default caps are conservative and safe for PowerPoint/Office hosts. For very dense action scenes, raise them carefully while watching diagnostics.
+In NEXT 1.2.1 the explicit burst caps default to `0`, meaning disabled. This keeps large projects from feeling artificially limited. For dense action scenes, you can opt into caps carefully while watching diagnostics.
 
 ```vb
 RiffMaxVoicesPerBuffer = 4
@@ -2993,7 +3224,7 @@ RiffVoiceSetFilterHz v, 0!, 80!      ' remove sub-rumble
 
 ### Keep the VBE Responsive During Development
 
-If you are testing inside the editor, prefer explicit cleanup in stop/shutdown paths. The VBE-safe timer reduces the chance of IntelliSense getting stuck, but explicit cleanup is still the cleanest workflow when editing a lot.
+If you are testing inside the editor, prefer explicit cleanup in stop/shutdown paths. The VBE-safe timer reduces the chance of IntelliSense getting stuck, but explicit cleanup is still the cleanest workflow when editing a lot. If you are going to change code while audio may still be active, pause the render timer first with `RiffPrepareForVbeEdit` and resume it with `RiffResumeAfterVbeEdit` after editing.
 
 ```vb
 Public Sub AudioDevReset()
@@ -3005,12 +3236,20 @@ Public Sub AudioEditorEmergencyStop()
     RiffEditorEmergencyStop
 End Sub
 
+Public Sub AudioPrepareCodeEdit()
+    RiffPrepareForVbeEdit
+End Sub
+
+Public Sub AudioResumeAfterCodeEdit()
+    If Not RiffResumeAfterVbeEdit() Then Debug.Print RiffLastError
+End Sub
+
 Public Sub AudioFullShutdown()
     RiffClose
 End Sub
 ```
 
-Use `RiffEditorEmergencyStop` only when the VBE/editor is stuck after a manual Stop/Reset or an interrupted test run. Use `RiffClose` for real shutdown and release of audio resources.
+Use `RiffPrepareForVbeEdit` before live code edits, `RiffResumeAfterVbeEdit` after the edit, and `RiffEditorEmergencyStop` only when the VBE/editor is stuck after a manual Stop/Reset or an interrupted test run. Use `RiffClose` for real shutdown and release of audio resources.
 
 For gameplay tests, `RiffAutoSuspendTimer = False` is acceptable because the current build keeps audio warm only briefly while idle. For macro tools, examples, and code snippets that users may run from the VBE, prefer `True`.
 
@@ -3156,6 +3395,46 @@ RiffAutoSuspendTimer = False
 
 If IntelliSense is still stuck after a manual break or host-level interruption, run `RiffEditorEmergencyStop` first. If you want a full engine restart, then run `RiffClose` and start again with `RiffOpen`.
 
+
+### Project crashes or corrupts after editing code while music is playing
+
+This is the live-edit scenario that NEXT 1.2.1 specifically tries to make safer. The risky pattern is:
+
+```txt
+Riff timer/callback is active
+VBE receives code edits
+VBA recompiles or changes project state
+callback touches VBA/native state at the wrong moment
+```
+
+Use the manual edit workflow before changing code while Riff is initialized:
+
+```vb
+RiffPrepareForVbeEdit
+' Edit the VBA project.
+RiffResumeAfterVbeEdit
+```
+
+For a team project, it is a good idea to expose these as simple dev buttons/macros so testers do not need to remember the exact function names.
+
+```vb
+Public Sub SafeEditOn()
+    RiffPrepareForVbeEdit
+End Sub
+
+Public Sub SafeEditOff()
+    If Not RiffResumeAfterVbeEdit() Then Debug.Print RiffLastError
+End Sub
+```
+
+Avoid relying on the automatic mode until the project has been tested in your workflow:
+
+```vb
+RiffEditorSafeMode = True
+```
+
+The automatic guard can be useful, but it is intentionally disabled by default because it may pause the render timer when you are only trying to test audio from the VBE.
+
 ### Fast repeated SFX eventually stutter or feel like they accumulate
 
 Use the runtime counters to confirm whether voices are actually accumulating:
@@ -3171,7 +3450,7 @@ Expected behavior after a short burst:
 ```txt
 Active voices should fall back toward 0 after finite sounds finish.
 Private memory should not climb continuously between test runs.
-Peak voices should not stay stuck at 32.
+Peak voices should not stay stuck at `RiffMaxVoices`, and `RiffMaxVoices` itself may be higher than 32 after dynamic growth or manual reservation.
 ```
 
 ### `RiffPlay` is fast but preset setup is still heavier
@@ -3259,7 +3538,7 @@ Check:
 
 - Buffer handle is valid.
 - Engine is initialized.
-- Voice pool is not full.
+- Voice capacity is available or can grow. If not, check memory pressure, `RiffMaxVoices`, `RiffActiveVoiceCount`, and any optional burst caps.
 - `RiffLastError`.
 
 ```vb
@@ -3273,8 +3552,10 @@ If v = -1 Then Debug.Print RiffLastError
 Check:
 
 - File path exists.
+- Buffer capacity can grow or was reserved successfully.
+- Office has enough memory for the decoded audio.
 - Media Foundation supports the file.
-- Buffer pool is not full.
+- Buffer capacity can grow and memory allocation is succeeding.
 - There is enough memory.
 
 ```vb
@@ -3370,7 +3651,12 @@ Public Property Get RiffIsInitialized() As Boolean
 Public Property Get RiffAutoSuspendTimer() As Boolean
 Public Property Let RiffAutoSuspendTimer(ByVal value As Boolean)
 Public Sub RiffSuspend()
+Public Sub RiffPrepareForVbeEdit()
+Public Function RiffResumeAfterVbeEdit() As Boolean
 Public Function RiffWake() As Boolean
+Public Property Get RiffEditorSafeMode() As Boolean
+Public Property Let RiffEditorSafeMode(ByVal value As Boolean)
+Public Property Get RiffEditorTimerSuspended() As Boolean
 ```
 
 ### Diagnostics
@@ -3380,6 +3666,9 @@ Public Property Get RiffLastError() As RiffErrorCode
 Public Property Get RiffMaxVoices() As Long
 Public Property Get RiffMaxBuffers() As Long
 Public Property Get RiffMaxBuses() As Long
+Public Function RiffReserveBuffers(ByVal capacity As Long) As Boolean
+Public Function RiffReserveVoices(ByVal capacity As Long) As Boolean
+Public Function RiffReserveBuses(ByVal capacity As Long) As Boolean
 Public Property Get RiffAdaptiveQueueMs() As Long
 Public Property Get RiffUnderrunCount() As Long
 Public Property Get RiffLastPaddingFrames() As Long
