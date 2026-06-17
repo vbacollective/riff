@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A high-performance, single-file audio engine for Microsoft Office.</b><br/>
-  Real-time WASAPI playback, Media Foundation decoding, Studio DSP, adaptive buffering, burst-safe playback, musical presets, master bus processing, and VBE-safe cleanup.
+  Real-time WASAPI playback, Media Foundation decoding, Studio DSP, adaptive buffering, dynamic SafeArray pools, burst-safe playback, musical presets, master bus processing, editor-safe development guards, and VBE-safe cleanup.
 </p>
 
 <p align="center">
@@ -27,7 +27,7 @@
 
 Whether you are building interactive dashboards in Excel, immersive presentations in PowerPoint, educational tools in Word, or automation systems in Access, Riff provides a practical real-time audio layer powered by the Windows Audio Session API (WASAPI), Media Foundation, and a native timer-driven DSP loop.
 
-Riff is designed for developers who want game-like audio behavior inside Office: responsive UI sounds, background music, routed buses, persistent scene effects, master bus processing, soft limiting, fades, procedural oscillators, one-shot and looped white/pink/brown noise, burst-safe SFX playback, fast preset setup, and safe cleanup when the host application or the VBA editor resets.
+Riff is designed for developers who want game-like audio behavior inside Office: responsive UI sounds, background music, routed buses, persistent scene effects, master bus processing, soft limiting, fades, procedural oscillators, one-shot and looped white/pink/brown noise, dynamic buffer/voice capacity, burst-safe SFX playback, fast preset setup, and safer cleanup when the host application or the VBA editor resets.
 
 ## Key Capabilities
 
@@ -38,6 +38,8 @@ Riff is designed for developers who want game-like audio behavior inside Office:
 - **WAV Fast Path:** Compatible WAV files bypass Media Foundation and load through a direct RIFF parser for much faster startup.
 - **Unified Playback API:** `RiffPlay` accepts bus, loop, volume, and pan parameters directly.
 - **Duplicate Prevention:** `RiffPlayOnce` prevents music or repeated ambience from stacking accidentally.
+- **Dynamic SafeArray Pools:** Buffers, voices, and bus state now start with practical defaults and grow automatically instead of being locked to a hardcoded ceiling.
+- **Capacity Reservation:** `RiffReserveBuffers`, `RiffReserveVoices`, and `RiffReserveBuses` let large projects preallocate room before loading or playing many sounds.
 - **Adaptive Buffering:** Dynamically increases render queue safety during host stalls and returns to low latency when stable.
 - **Burst Protection:** Voice stealing, per-buffer caps, and per-bus caps reduce stutter when many SFX are triggered rapidly.
 - **Anti-Accumulation Playback:** Repeated short sounds, procedural noise, and oscillator beeps are capped and cleaned so game loops do not silently pile up voices.
@@ -46,13 +48,14 @@ Riff is designed for developers who want game-like audio behavior inside Office:
 - **Hz-Based Filtering:** `RiffVoiceSetFilterHz` exposes low-pass and high-pass filters using real frequency values.
 - **Lazy DSP Buffer Preparation:** Delay, reverb, chorus, and flanger ring buffers are prepared only when they are actually needed, reducing `Play` and preset setup cost.
 - **VBE-Safe Timer Cleanup:** Idle and Stop/Reset-safe cleanup reduce the chance of the VBA Editor staying stuck in `Running` mode or breaking IntelliSense.
+- **Editor-Safe Development Guards:** `RiffPrepareForVbeEdit` and `RiffResumeAfterVbeEdit` provide a controlled way to pause the risky timer/callback path before editing VBA code while audio is active.
 - **Studio DSP Pipeline:** Independent per-voice effects including Reverb, Delay, Chorus, Flanger, Compressor, EQ, Filters, Distortion, Bitcrusher, Ring Modulation, Tremolo, Auto-Pan, and Stereo Width.
 - **Musical Preset Packs:** Expanded voice presets for tape, VHS, dream pads, caves, tiny speakers, megaphones, retro game effects, wind, rain, horror drones, cinematic booms, and soft-focus scenes.
 - **Persistent Bus Effects:** Apply a preset to a whole bus so current and future voices inherit the scene style automatically.
 - **Master Bus Processors:** Final mix chain with low-pass, high-pass, 3-band EQ, compressor, drive, stereo width, output gain, soft clipping, and master presets.
 - **Real-Time Synthesis:** BLEP-corrected oscillators for sine, square, and saw waveforms.
 - **Noise Generation:** White, pink, and brown noise for procedural ambience, wind, rain, static, rumble, and retro effects.
-- **Audio Routing:** 16 global buses for Music, SFX, UI, Voice, and auxiliary groups.
+- **Audio Routing:** Named buses for Music, SFX, UI, Voice, and auxiliary groups, backed by dynamically sized bus state.
 - **Mixer Controls:** Bus volume, mute, solo, fades, peak meters, and master peak monitoring.
 - **Smoothing:** Volume, pan, and pitch smoothing reduce clicks during parameter changes.
 - **Soft Clipping:** Master soft clipper helps prevent harsh digital clipping when many voices overlap.
@@ -93,9 +96,40 @@ Public Sub PlaySound()
     voice = RiffPlay(buf, RiffBusSfx, False, 0.8, 0)
 
     If voice < 0 Then
-        Debug.Print "No free voice. Error:", RiffLastError
+        Debug.Print "Playback failed. Error:", RiffLastError
     End If
 End Sub
+```
+
+### Optional Capacity Reservation
+
+Riff starts with practical default capacity for compatibility, but the internal buffer, voice, and bus pools are no longer fixed to the old hardcoded limits. When more room is needed, the engine can grow its internal `SafeArray` pools automatically.
+
+For small projects, you do not need to do anything special:
+
+```vb
+click = RiffLoad("C:\Audio\click.wav")
+voice = RiffPlay(click, RiffBusUi)
+```
+
+For larger games, presentations, or tools with many assets, you can reserve capacity during startup. This avoids repeated pool growth while the project is already busy loading or playing sounds.
+
+```vb
+Public Sub AudioReserveForLargeProject()
+    If Not RiffOpen() Then Exit Sub
+
+    RiffReserveBuffers 500
+    RiffReserveVoices 128
+    RiffReserveBuses 32
+End Sub
+```
+
+The diagnostic capacity properties now report the current pool size instead of a permanent hard limit:
+
+```vb
+Debug.Print "Buffer capacity:", RiffMaxBuffers
+Debug.Print "Voice capacity:", RiffMaxVoices
+Debug.Print "Bus capacity:", RiffMaxBuses
 ```
 
 ### Essential Cleanup
@@ -127,6 +161,20 @@ RiffEditorEmergencyStop
 
 This is an editor recovery helper, not normal application shutdown. Production code should still use `RiffClose`.
 
+When you need to edit VBA code while Riff audio is active, use the manual editor-safe workflow. This pauses the dangerous timer/callback path before the VBE recompiles or rearranges project memory, then resumes the engine after editing.
+
+```vb
+Public Sub EnterSafeEditMode()
+    RiffPrepareForVbeEdit
+End Sub
+
+Public Sub LeaveSafeEditMode()
+    RiffResumeAfterVbeEdit
+End Sub
+```
+
+`RiffEditorSafeMode` also exists for automatic experiments, but the recommended development workflow is still manual because automatic editor detection can pause audio when you are simply testing from the VBE.
+
 ## Basic Usage
 
 ### Load Assets Once
@@ -140,6 +188,10 @@ Private sndMusic As Long
 
 Public Sub AudioLoad()
     If Not RiffOpen() Then Exit Sub
+
+    ' Optional for larger projects: reserve before loading many assets.
+    RiffReserveBuffers 256
+    RiffReserveVoices 96
 
     sndClick = RiffLoad(ActivePresentation.Path & "\audio\click.wav")
     sndExplosion = RiffLoad(ActivePresentation.Path & "\audio\explosion.wav")
@@ -233,7 +285,7 @@ End Sub
 
 ## Professional Audio Routing
 
-Riff supports logical summing through 16 independent audio buses. Buses allow you to group related sounds, such as Music, SFX, UI, Voice, or Ambience, and control them as a single unit.
+Riff supports logical summing through named audio buses backed by dynamically sized bus state. Buses allow you to group related sounds, such as Music, SFX, UI, Voice, or Ambience, and control them as a single unit.
 
 This is more efficient and cleaner than iterating through active voices manually. It also enables mixer-like behavior such as lowering music during dialogue, muting UI sounds, soloing a bus for debugging, fading whole categories, or applying scene-wide effects.
 
@@ -677,7 +729,7 @@ RiffResetDiagnostics
 
 ## Burst Safety
 
-Triggering the same sound many times in a short time can overwhelm any small mixer. Riff includes safety controls to prevent rapid SFX spam from creating 32 overlapping copies of the same sound.
+Triggering the same sound many times in a short time can overwhelm any mixer, even with dynamic voice capacity. Riff includes safety controls to prevent rapid SFX spam from creating an unnecessary pile of overlapping copies of the same sound.
 
 ```vb
 RiffVoiceStealingEnabled = True
@@ -700,6 +752,15 @@ RiffMaxVoicesPerBuffer = 4
 RiffMaxVoicesPerBus = 18
 ```
 
+Set a cap to `0` when you intentionally want no limit for that category:
+
+```vb
+RiffMaxVoicesPerBuffer = 0
+RiffMaxVoicesPerBus = 0
+```
+
+Dynamic voice capacity gives the engine more room, while burst caps keep gameplay mistakes from turning into hundreds of redundant voices.
+
 ## Performance and Stability Notes
 
 The current performance pass focuses on making the common gameplay path cheap while keeping the earlier anti-accumulation fixes intact.
@@ -709,7 +770,8 @@ Key internal improvements include:
 - `RiffPlay` no longer clears large temporal ring buffers for dry one-shot voices.
 - `RiffVoiceApplyPreset` no longer eagerly clears delay/reverb/chorus/flanger buffers unless those stages are actually needed.
 - Temporal DSP buffer preparation is lazy and tied to the first render tick that needs it.
-- Voice allocation combines free-slot search, per-buffer caps, per-bus caps, and voice-steal candidates in a cheaper path.
+- Voice allocation combines free-slot search, dynamic pool growth, per-buffer caps, per-bus caps, and voice-steal candidates in a cheaper path.
+- Buffers, voices, and bus state use dynamic `SafeArray` pools instead of being locked to the old fixed capacities.
 - Generated noise and oscillator one-shots use finite lifetimes and short release ramps.
 - Idle warm-buffer behavior reduces underruns during rapid SFX bursts.
 - Stop/Reset-safe editor cleanup kills stale timer callbacks after a VBE reset.
@@ -729,15 +791,30 @@ These numbers are not guaranteed across machines, Office versions, or host load,
 
 ## VBA Editor Safety
 
-Riff uses a native timer callback to drive the render loop. That gives Office projects real-time audio behavior, but it also means the VBA Editor must not be left with an orphaned callback after a reset.
+Riff uses a native timer callback to drive the render loop. That gives Office projects real-time audio behavior, but it also means the VBA Editor must be treated carefully during development.
 
-The current stop-safe build includes additional cleanup for both idle and editor reset cases:
+The most dangerous situation is editing code while audio is active. The VBE may internally recompile modules, move project state, invalidate procedure addresses, or reset runtime structures while the render callback is still scheduled. In normal Office automation this is unusual, but an audio engine with native callbacks can hit that edge case if the developer changes code while the sound is still playing.
+
+The current stop-safe build includes cleanup for idle and editor reset cases:
 
 - when idle, the timer can auto-suspend to release the VBE;
 - when the VBE Stop/Reset button is clicked, stale timer callbacks attempt to kill themselves;
-- `RiffEditorEmergencyStop` is available as a manual recovery helper for development sessions.
+- `RiffEditorEmergencyStop` is available as a manual recovery helper for development sessions;
+- `RiffPrepareForVbeEdit` and `RiffResumeAfterVbeEdit` provide a safer manual workflow before and after editing code.
 
-Recommended development workflow:
+Recommended workflow before changing code while the engine is active:
+
+```vb
+Public Sub EnterSafeEditMode()
+    RiffPrepareForVbeEdit
+End Sub
+
+Public Sub LeaveSafeEditMode()
+    RiffResumeAfterVbeEdit
+End Sub
+```
+
+Emergency cleanup during development:
 
 ```vb
 Public Sub DevAudioReset()
@@ -746,17 +823,19 @@ Public Sub DevAudioReset()
 End Sub
 ```
 
-Use this only while developing. Normal applications should call `RiffClose` from their shutdown path.
+`RiffEditorSafeMode` can be enabled for automatic editor protection experiments, and `RiffEditorTimerSuspended` can be inspected for diagnostics. It is disabled by default so normal playback tests from the VBE do not get paused unexpectedly.
+
+Use these helpers only while developing. Normal applications should call `RiffClose` from their shutdown path.
 
 ## Feature Summary
 
 | Category | Features |
 |:---|:---|
-| **Core** | Single `.bas`, 32 voices, 64 buffers, 16 buses, x86/x64 support |
+| **Core** | Single `.bas`, dynamic buffers, dynamic voices, dynamic bus state, x86/x64 support |
 | **I/O** | Media Foundation decoding, in-memory loading, WAV fast path, WAV export |
 | **Playback** | Unified `RiffPlay`, `RiffPlayOnce`, finite oscillator/noise one-shots, seeking, looping, fades, stop/reset behavior |
 | **Routing** | Bus volume, mute, solo, fade, peak meters, persistent bus presets, master volume |
-| **Stability** | Adaptive buffering, burst protection, voice stealing, idle timer cleanup, Stop/Reset-safe editor cleanup |
+| **Stability** | Adaptive buffering, burst protection, voice stealing, dynamic pool growth, idle timer cleanup, Stop/Reset-safe editor cleanup, manual VBE edit guards |
 | **Presets** | Core FX presets, musical preset packs, persistent bus effects, master presets |
 | **Master Processing** | Soft clip, low-pass, high-pass, 3-band EQ, compressor, drive, stereo width, output gain |
 | **Synthesis** | BLEP sine/square/saw, finite oscillator beeps, one-shot and looped white/pink/brown noise |
@@ -766,6 +845,20 @@ Use this only while developing. Normal applications should call `RiffClose` from
 | **Filters** | Biquad low-pass, high-pass, Hz-based filter helper, 3-band EQ |
 | **Diagnostics** | Underruns, render errors, clipped samples, buffer state, active voice, bus voice, and buffer voice counters |
 | **Export** | Loaded buffer export and oscillator render to PCM WAV |
+
+## NEXT 1.1.2 Highlights
+
+- Reworked buffer and voice storage from fixed-size pools into dynamic `SafeArray` pools.
+- Removed the old hardcoded capacity ceiling for loaded buffers and active voices.
+- Added dynamic bus-state capacity while preserving the named bus workflow.
+- Added `RiffReserveBuffers`, `RiffReserveVoices`, and `RiffReserveBuses` for projects that want to preallocate capacity during startup.
+- Updated `RiffMaxBuffers`, `RiffMaxVoices`, and `RiffMaxBuses` so they describe current capacity instead of an old fixed limit.
+- Kept handle-based compatibility so existing code can continue using numeric buffer and voice handles.
+- Added manual editor-safe development helpers: `RiffPrepareForVbeEdit` and `RiffResumeAfterVbeEdit`.
+- Added `RiffEditorSafeMode` and `RiffEditorTimerSuspended` for optional automatic protection and diagnostics.
+- Improved safety around timer/callback state when the developer edits code in the VBE while audio is active.
+- Changed default burst-cap behavior so `0` means no cap when a project intentionally wants unrestricted layering.
+- Preserved the v1.0.9 playback, DSP, presets, adaptive buffering, WAV fast path, and editor emergency cleanup features.
 
 ## v1.0.9 Highlights
 
@@ -795,14 +888,14 @@ Use this only while developing. Normal applications should call `RiffClose` from
 
 ## Roadmap
 
-### Current Version (v1.0.9)
-
 - [x] WASAPI Shared Mode playback.
 - [x] Media Foundation decoding.
 - [x] WAV fast path loader.
 - [x] Unified playback API.
-- [x] 32-voice polyphonic mixer.
-- [x] 16-bus routing system.
+- [x] Dynamic SafeArray buffer pool.
+- [x] Dynamic polyphonic mixer with expandable voice capacity.
+- [x] Manual capacity reservation helpers.
+- [x] Named bus routing system backed by dynamically sized bus state.
 - [x] Bus mute, solo, fade, and peak meters.
 - [x] Persistent bus effect presets.
 - [x] Full per-voice Studio DSP pipeline.
@@ -818,10 +911,10 @@ Use this only while developing. Normal applications should call `RiffClose` from
 - [x] Adaptive buffering.
 - [x] Burst-safe voice management.
 - [x] Lazy temporal-buffer preparation for faster `Play` and preset setup.
-- [x] VBE-safe idle and Stop/Reset timer cleanup.
+- [x] VBE-safe idle, Stop/Reset timer cleanup, and manual safe-edit guards.
 - [x] x86/x64 native thunk driver.
 - [x] Offline WAV export.
-- [x] Diagnostics and render counters.
+- [x] Diagnostics, render counters, and current capacity counters.
 
 ### Planned
 
@@ -838,6 +931,7 @@ For best performance in Office:
 
 - Prefer WAV for short SFX and UI sounds.
 - Preload assets at startup with `RiffLoad`.
+- For large projects, reserve capacity at startup with `RiffReserveBuffers`, `RiffReserveVoices`, and `RiffReserveBuses`.
 - Avoid decoding MP3/OGG during interaction-heavy moments.
 - Use `RiffPlayOnce` for music and ambience loaded from buffers.
 - Use `RiffPlayNoiseLoop` for continuous procedural ambience instead of looping a default `RiffPlayNoise` one-shot.
@@ -846,9 +940,10 @@ For best performance in Office:
 - Use persistent bus presets for scene-wide effects.
 - Use master processors lightly for final polish rather than heavy per-sample coloration on every voice.
 - Keep effect-heavy processing for important voices only.
-- Use `RiffMaxVoicesPerBuffer` to prevent repeated button clicks from stacking too many copies.
+- Use `RiffMaxVoicesPerBuffer` to prevent repeated button clicks from stacking too many copies, or set it to `0` when you intentionally want no cap.
 - Use `RiffVoiceSetFilterHz` when frequency-based filtering is clearer than normalized filter values.
 - Keep `RiffAutoSuspendTimer` enabled for editor stability unless you intentionally need a warm timer during heavy gameplay bursts.
+- Use `RiffPrepareForVbeEdit` before editing code while audio is active, then `RiffResumeAfterVbeEdit` when finished.
 - Use `RiffEditorEmergencyStop` only as a development recovery helper if an old session leaves the VBE stuck.
 - Always call `RiffClose` on exit.
 
