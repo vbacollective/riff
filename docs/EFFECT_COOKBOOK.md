@@ -1,12 +1,13 @@
 # Effect Cookbook
 
-This cookbook contains practical Riff effect recipes you can paste into VBA projects. It covers the v1.0.9 preset system, musical preset packs, persistent bus effects, master bus processors, procedural noise, manual DSP recipes, gameplay-safe one-shots, Hz-based filtering, performance-oriented preset usage, and VBE-safe cleanup patterns.
+This cookbook contains practical Riff effect recipes you can paste into VBA projects. It covers the v1.1.3 preset system, musical preset packs, scene templates, asset-key playback recipes, persistent bus effects, master bus processors, procedural noise, manual DSP recipes, gameplay-safe one-shots, Hz-based filtering, stress-safe overload protection, limiter/metering workflows, performance-oriented preset usage, and VBE-safe cleanup patterns.
 
-Riff effects can be applied at three levels:
+Riff effects can be applied at four practical levels:
 
 1. **Voice effects**: apply to one active voice.
 2. **Bus effects**: apply to all current and/or future voices routed to a bus.
-3. **Master processors**: apply to the final mixed output.
+3. **Scene templates**: configure multiple buses and master processors in one call.
+4. **Master processors**: apply to the final mixed output.
 
 ```vb
 ' Voice-level effect
@@ -19,7 +20,81 @@ RiffBusApplyPreset RiffBusMusic, RiffFxUnderwater, 0.55
 RiffMasterApplyPreset RiffMasterFxGlue, 0.7
 ```
 
+
+## v1.1.3 Workflow Additions
+
+Riff v1.1.3 keeps all older effect recipes working, but adds a higher-level workflow for larger projects:
+
+```vb
+' Asset-key playback: no manual handle variable needed.
+RiffLoadAs "ui.click", "audio\click.wav"
+RiffPlayKey "ui.click", RiffBusUi, False, 0.8
+
+' Scene templates: configure bus color, volumes, and master processing at once.
+RiffApplyScene RiffSceneCave
+RiffApplyScene RiffSceneRadioCall
+
+' Stress-safe defaults: useful before SFX-heavy gameplay.
+RiffApplyStressSafeDefaults 64, 6, 32
+
+' Master limiter and meters.
+RiffMasterSetLimiter 0.92, 0.9
+Debug.Print RiffMasterPeakDb, RiffMasterClipCount
+```
+
+The most important mental model is still the same: route sounds to the correct bus. Scene templates work best when music goes to `RiffBusMusic`, sound effects go to `RiffBusSfx`, UI goes to `RiffBusUi`, and dialogue/radio/narration goes to `RiffBusVoice`.
+
+```vb
+RiffPlayKeyOnce "music.cave", RiffBusMusic, True, 0.45
+RiffPlayKey "sfx.step", RiffBusSfx, False, 0.75
+RiffPlayKey "ui.click", RiffBusUi, False, 0.8
+RiffPlayKey "voice.npc", RiffBusVoice, False, 1!
+```
+
 ## Quick Start
+
+
+### Play an Asset by Key
+
+For large projects, use the asset registry so effect recipes can refer to named sounds instead of global handle variables.
+
+```vb
+Public Sub LoadMenuAudio()
+    If Not RiffOpen() Then Exit Sub
+
+    RiffLoadAs "ui.click", "audio\click.wav"
+    RiffLoadAs "ui.cancel", "audio\cancel.wav"
+    RiffLoadAs "music.menu", "audio\menu.mp3"
+End Sub
+
+Public Sub PlayMenuClick()
+    RiffPlayKey "ui.click", RiffBusUi, False, 0.8, 0!
+End Sub
+
+Public Sub StartMenuMusic()
+    RiffPlayKeyOnce "music.menu", RiffBusMusic, True, 0.45, 0!
+End Sub
+```
+
+### Apply a Built-In Scene Template
+
+Use scene templates when you want to change the whole audio mood quickly. They configure persistent bus effects, bus volumes, and master processors.
+
+```vb
+Public Sub EnterCave()
+    RiffApplyScene RiffSceneCave
+    RiffPlayKeyOnce "music.cave", RiffBusMusic, True, 0.4
+End Sub
+
+Public Sub StartRadioCall()
+    RiffApplyScene RiffSceneRadioCall
+    RiffPlayKey "voice.commander", RiffBusVoice, False, 1!
+End Sub
+
+Public Sub ReturnToNormalMix()
+    RiffApplyScene RiffSceneNormal
+End Sub
+```
 
 ### Apply a Voice Preset
 
@@ -207,6 +282,17 @@ Presets are sanitized after application. Amounts and internal DSP values are cla
 | `RiffFxRain` | Soft natural noise bed | Rain, ambience, weather |
 | `RiffFxCinematicBoom` | Big low-heavy impact | Hits, booms, transitions |
 | `RiffFxSoftFocus` | Gentle smoothing and width | Emotional scenes, soft ambience |
+| `RiffFxCassette` | Cassette-style warmth and soft degradation | Retro menus, memory scenes, old recordings |
+| `RiffFxOldComputer` | Small digital speaker / vintage PC tone | Old terminals, computer voices, retro UI |
+| `RiffFxArcadeCabinet` | Punchy cabinet-like arcade color | Arcade menus, coin sounds, retro SFX |
+| `RiffFxDreamMenu` | Soft wide menu coloration | Title screens, dream menus, calm UI |
+| `RiffFxSpaceStation` | Clean sci-fi filtered ambience | Space rooms, comms, futuristic ambience |
+| `RiffFxDungeon` | Dark room/corridor tone | RPG dungeons, caves, ruins |
+| `RiffFxBossRoom` | Heavy dramatic coloration | Boss fights, arena scenes, danger states |
+| `RiffFxLowHealth` | Tense, muffled, urgent color | Low-health warning states |
+| `RiffFxMemoryFlashback` | Soft degraded memory tone | Flashbacks, dreams, recollections |
+| `RiffFxCutscene` | Polished cinematic voice/music tone | Cutscenes, narration, dramatic moments |
+| `RiffFxCombatImpact` | Punchy transient treatment | Hits, attacks, impacts, battle SFX |
 
 ## Master Preset Reference
 
@@ -348,6 +434,152 @@ Public Sub ApplySoftFocus(ByVal v As Long)
 
     RiffVoiceApplyPreset v, RiffFxSoftFocus, 0.55
     RiffVoiceStereoWidth(v) = 1.25
+End Sub
+```
+
+
+### Cassette Memory
+
+```vb
+Public Sub ApplyCassetteMemory(ByVal v As Long)
+    If v < 0 Then Exit Sub
+
+    RiffVoiceApplyPreset v, RiffFxCassette, 0.65
+    RiffVoiceStereoWidth(v) = 0.9
+    RiffVoiceVolume(v) = 0.75
+End Sub
+```
+
+### Old Computer Speaker
+
+```vb
+Public Sub ApplyOldComputerSpeaker(ByVal v As Long)
+    If v < 0 Then Exit Sub
+
+    RiffVoiceApplyPreset v, RiffFxOldComputer, 0.75
+    RiffVoiceSetFilterHz v, 4200!, 180!
+End Sub
+```
+
+### Arcade Cabinet UI
+
+```vb
+Public Sub ApplyArcadeCabinetUi(ByVal v As Long)
+    If v < 0 Then Exit Sub
+
+    RiffVoiceApplyPreset v, RiffFxArcadeCabinet, 0.75
+    RiffVoiceVolume(v) = 0.55
+End Sub
+```
+
+### Space Station Ambience
+
+```vb
+Public Sub ApplySpaceStationTone(ByVal v As Long)
+    If v < 0 Then Exit Sub
+
+    RiffVoiceApplyPreset v, RiffFxSpaceStation, 0.65
+    RiffVoiceStereoWidth(v) = 1.3
+End Sub
+```
+
+### Boss Room Music
+
+```vb
+Public Sub ApplyBossRoomMusic(ByVal v As Long)
+    If v < 0 Then Exit Sub
+
+    RiffVoiceApplyPreset v, RiffFxBossRoom, 0.75
+    RiffVoiceCompressorThreshold(v) = 0.62
+    RiffVoiceCompressorRatio(v) = 3.5
+End Sub
+```
+
+### Low Health Warning
+
+```vb
+Public Sub ApplyLowHealthWarning(ByVal v As Long)
+    If v < 0 Then Exit Sub
+
+    RiffVoiceApplyPreset v, RiffFxLowHealth, 0.85
+    RiffVoiceTremoloRate(v) = 5.5
+    RiffVoiceTremoloDepth(v) = 0.35
+End Sub
+```
+
+### Combat Impact Polish
+
+```vb
+Public Sub ApplyCombatImpact(ByVal v As Long)
+    If v < 0 Then Exit Sub
+
+    RiffVoiceApplyPreset v, RiffFxCombatImpact, 0.7
+    RiffVoiceCompressorThreshold(v) = 0.5
+    RiffVoiceCompressorRatio(v) = 6
+End Sub
+```
+
+
+## Built-In Scene Template Recipes
+
+`RiffApplyScene` is the fastest way to change the overall mood of a project. It applies a predefined mix recipe across buses and master processing. These recipes work best when your sounds are routed correctly:
+
+| Content | Recommended Bus |
+|:---|:---|
+| Music and ambience | `RiffBusMusic` |
+| Gameplay SFX | `RiffBusSfx` |
+| UI sounds | `RiffBusUi` |
+| Dialogue, narration, radio | `RiffBusVoice` |
+
+### Cave Scene Template
+
+```vb
+Public Sub EnterCaveWithTemplate()
+    RiffApplyScene RiffSceneCave
+    RiffPlayKeyOnce "music.cave", RiffBusMusic, True, 0.42
+End Sub
+```
+
+### Battle Scene Template
+
+```vb
+Public Sub EnterBattleWithTemplate()
+    RiffApplyScene RiffSceneBattle
+    RiffPlayKeyOnce "music.battle", RiffBusMusic, True, 0.55
+    RiffPlayKey "sfx.battle_start", RiffBusSfx, False, 1!
+End Sub
+```
+
+### Radio Call Template
+
+For `RiffSceneRadioCall`, put voice/dialogue on `RiffBusVoice`. Playing it on `RiffBusMain` may sound almost unchanged because the template is designed around voice/music routing.
+
+```vb
+Public Sub PlayRadioDialogue()
+    RiffApplyScene RiffSceneRadioCall
+    RiffPlayKey "voice.commander", RiffBusVoice, False, 1!
+End Sub
+```
+
+### Low-Level Scene Reset
+
+Use `RiffSceneNormal` when leaving a heavily colored scene.
+
+```vb
+Public Sub ResetSceneTemplate()
+    RiffApplyScene RiffSceneNormal
+End Sub
+```
+
+### Scene Template With Manual Extra Polish
+
+```vb
+Public Sub EnterBossRoom()
+    RiffApplyScene RiffSceneBattle
+
+    RiffBusApplyPreset RiffBusMusic, RiffFxBossRoom, 0.75, True, True
+    RiffMasterSetLimiter 0.92, 0.9
+    RiffMasterOutputGain = 0.82
 End Sub
 ```
 
@@ -524,6 +756,85 @@ Use this for SFX-heavy scenes where many one-shots may overlap.
 Public Sub ApplyLimiterSafety()
     RiffMasterApplyPreset RiffMasterFxSoftLimiter, 0.85
     RiffSoftClipEnabled = True
+End Sub
+```
+
+
+### v1.1.3 Stress-Safe Limiter Chain
+
+Use this before scenes that may trigger many one-shots at once. It keeps the mix controlled without requiring you to manually lower every SFX.
+
+```vb
+Public Sub ApplyStressSafeMaster()
+    RiffMasterProcessorEnabled = True
+    RiffMasterSetLimiter 0.92, 0.9
+    RiffMasterOutputGain = 0.78
+    RiffSoftClipEnabled = True
+End Sub
+```
+
+### Tilt EQ Scene Color
+
+Positive tilt makes the mix brighter; negative tilt makes it darker. This is useful for quick scene mood changes.
+
+```vb
+Public Sub ApplyBrightMenuTilt()
+    RiffMasterProcessorEnabled = True
+    RiffMasterTiltEq = 0.25
+End Sub
+
+Public Sub ApplyDarkDangerTilt()
+    RiffMasterProcessorEnabled = True
+    RiffMasterTiltEq = -0.35
+End Sub
+```
+
+### Master Balance Shift
+
+Use this for cinematic moments, headset-style effects, or subtle directional mix emphasis.
+
+```vb
+Public Sub PanMasterSlightlyRight()
+    RiffMasterProcessorEnabled = True
+    RiffMasterBalance = 0.18
+End Sub
+
+Public Sub CenterMasterBalance()
+    RiffMasterBalance = 0!
+End Sub
+```
+
+### Master Meter Debug
+
+```vb
+Public Sub PrintMasterMeter()
+    Dim l As Single
+    Dim r As Single
+
+    RiffMasterGetRms l, r
+
+    Debug.Print "Master RMS:", l, r
+    Debug.Print "Master RMS dB:", RiffMasterRmsDb
+    Debug.Print "Master Peak dB:", RiffMasterPeakDb
+    Debug.Print "Master clips:", RiffMasterClipCount
+End Sub
+```
+
+### Bus Meter Debug
+
+```vb
+Public Sub PrintBusMeter(ByVal busID As RiffBusId)
+    Dim l As Single
+    Dim r As Single
+    Dim lDb As Single
+    Dim rDb As Single
+
+    RiffBusGetRms busID, l, r
+    RiffBusGetRmsDb busID, lDb, rDb
+
+    Debug.Print "Bus RMS:", l, r
+    Debug.Print "Bus RMS dB:", lDb, rDb
+    Debug.Print "Bus clips:", RiffBusClipCount(busID)
 End Sub
 ```
 
@@ -709,6 +1020,60 @@ Public Sub ApplyGhostVoice(ByVal v As Long)
     RiffVoiceAutoPanRate(v) = 0.18
     RiffVoiceAutoPanDepth(v) = 0.45
     RiffVoiceHighPass(v) = 0.08
+End Sub
+```
+
+
+## Asset-Key Effect Recipes
+
+Asset-key playback keeps effect code readable. Instead of passing raw buffer handles everywhere, load sounds once with a string key and play them by name.
+
+### Load an Effect Library
+
+```vb
+Public Sub LoadEffectLibrary()
+    If Not RiffOpen() Then Exit Sub
+
+    RiffLoadAs "ui.click", "audio\ui_click.wav"
+    RiffLoadAs "ui.confirm", "audio\ui_confirm.wav"
+    RiffLoadAs "sfx.hit", "audio\hit.wav"
+    RiffLoadAs "sfx.explosion", "audio\explosion.wav"
+    RiffLoadAs "music.battle", "audio\battle.mp3"
+End Sub
+```
+
+### Play a Key With a Preset
+
+```vb
+Public Sub PlayHitWithImpactPreset()
+    Dim v As Long
+
+    v = RiffPlayKey("sfx.hit", RiffBusSfx, False, 1!, 0!)
+    If v >= 0 Then
+        RiffVoiceApplyPreset v, RiffFxCombatImpact, 0.65
+    End If
+End Sub
+```
+
+### Loop Music by Key
+
+```vb
+Public Sub StartBattleMusic()
+    RiffPlayKeyOnce "music.battle", RiffBusMusic, True, 0.55, 0!
+End Sub
+
+Public Sub StopBattleMusic()
+    RiffFadeOutKey "music.battle", 1.2
+End Sub
+```
+
+### Reload an Asset After Replacing the File
+
+```vb
+Public Sub ReloadHitSound()
+    If Not RiffReloadAsset("sfx.hit") Then
+        Debug.Print "Reload failed:", RiffLastError
+    End If
 End Sub
 ```
 
@@ -961,6 +1326,83 @@ End Sub
 
 ## Gameplay SFX Recipes
 
+### v1.1.3 Stress-Safe Setup
+
+For SFX-heavy games, call this once during initialization. It enables overload protection, voice stealing, per-buffer/per-bus caps, limiter/headroom, and safe master output settings.
+
+```vb
+Public Sub SetupStressSafeGameplayAudio()
+    If Not RiffOpen() Then Exit Sub
+
+    RiffApplyStressSafeDefaults 64, 6, 32
+End Sub
+```
+
+The arguments are:
+
+```txt
+max active voices, max voices per buffer, max voices per bus
+```
+
+A good default for PowerPoint/Excel games is:
+
+```vb
+RiffApplyStressSafeDefaults 64, 6, 32
+```
+
+For smaller projects, use a tighter budget:
+
+```vb
+RiffApplyStressSafeDefaults 32, 4, 18
+```
+
+### Inspect Overload Protection
+
+```vb
+Public Sub PrintOverloadStats()
+    Debug.Print "Active voices:", RiffActiveVoiceCount()
+    Debug.Print "Max active voices:", RiffMaxActiveVoices
+    Debug.Print "Stolen:", RiffOverloadStolenCount
+    Debug.Print "Dropped:", RiffOverloadDroppedCount
+    Debug.Print "Coalesced:", RiffOverloadCoalescedCount
+    Debug.Print "Clips:", RiffMasterClipCount
+End Sub
+```
+
+### Reset Stress Test Counters
+
+```vb
+Public Sub ResetAudioStressCounters()
+    RiffResetOverloadStats
+    RiffResetDiagnostics
+    RiffResetAdaptiveStats
+End Sub
+```
+
+### Spam-Safe UI Click
+
+The v1.1.3 auto-burst path can coalesce repeated identical calls internally. You can still write normal code; Riff protects the mixer when the same sound is spammed heavily.
+
+```vb
+Public Sub PlaySpamSafeClick()
+    RiffPlayKey "ui.click", RiffBusUi, False, 0.75, 0!
+End Sub
+```
+
+### Spam-Safe Impact
+
+```vb
+Public Sub PlaySpamSafeImpact()
+    Dim v As Long
+
+    v = RiffPlayKey("sfx.hit", RiffBusSfx, False, 0.9, 0!)
+    If v >= 0 Then
+        RiffVoiceApplyPreset v, RiffFxCombatImpact, 0.55
+    End If
+End Sub
+```
+
+
 These recipes are designed for high-frequency game loops where the same sound can be triggered many times per second.
 
 ### Footstep Tick With Burst Safety
@@ -979,9 +1421,7 @@ End Sub
 Recommended global safety for footsteps, bullets, UI ticks, and collision sounds:
 
 ```vb
-RiffVoiceStealingEnabled = True
-RiffMaxVoicesPerBuffer = 4
-RiffMaxVoicesPerBus = 18
+RiffApplyStressSafeDefaults 64, 6, 32
 ```
 
 ### Dust Puff / Landing Noise
@@ -1085,13 +1525,50 @@ RiffBusApplyPreset RiffBusUi, RiffFxGameBoy, 0.45
 ### Use Master Safety for SFX-Heavy Scenes
 
 ```vb
-RiffSoftClipEnabled = True
+RiffApplyStressSafeDefaults 64, 6, 32
 RiffMasterApplyPreset RiffMasterFxSoftLimiter, 0.7
-RiffMaxVoicesPerBuffer = 4
-RiffMaxVoicesPerBus = 16
 ```
 
 ## Pro Tips
+
+
+### Use Scene Templates First, Then Manual Tweaks
+
+Scene templates are convenient starting points. Apply the scene, then add any project-specific bus or master adjustments.
+
+```vb
+Public Sub EnterDreamBattle()
+    RiffApplyScene RiffSceneDream
+    RiffBusApplyPreset RiffBusSfx, RiffFxCombatImpact, 0.35, True, True
+    RiffMasterTiltEq = -0.15
+End Sub
+```
+
+### Keep Effects on the Right Bus
+
+If a scene seems like it did nothing, check the bus. For example, `RiffSceneRadioCall` is most obvious on `RiffBusVoice`, not `RiffBusMain`.
+
+```vb
+' Good for radio/phone dialogue.
+RiffPlayKey "voice.npc", RiffBusVoice, False, 1!
+
+' Music coloration.
+RiffPlayKeyOnce "music.radio_room", RiffBusMusic, True, 0.4
+```
+
+### Use Meters to Tune Presets
+
+```vb
+Public Sub DebugCurrentMix()
+    Dim l As Single
+    Dim r As Single
+
+    RiffMasterGetRms l, r
+    Debug.Print "RMS dB:", RiffMasterRmsDb
+    Debug.Print "Peak dB:", RiffMasterPeakDb
+    Debug.Print "Clips:", RiffMasterClipCount
+End Sub
+```
 
 ### Apply Presets Before Manual Tweaks
 
