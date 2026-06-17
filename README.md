@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A high-performance, single-file audio engine for Microsoft Office.</b><br/>
-  Real-time WASAPI playback, Media Foundation decoding, Studio DSP, adaptive buffering, dynamic SafeArray pools, burst-safe playback, musical presets, master bus processing, editor-safe development guards, and VBE-safe cleanup.
+  Real-time WASAPI playback, Media Foundation decoding, Studio DSP, asset-key playback, cooperative preload, scene templates, adaptive buffering, dynamic SafeArray pools, automatic overload protection, burst-safe playback, musical presets, limiter-safe master processing, editor-safe development guards, and VBE-safe cleanup.
 </p>
 
 <p align="center">
@@ -27,7 +27,8 @@
 
 Whether you are building interactive dashboards in Excel, immersive presentations in PowerPoint, educational tools in Word, or automation systems in Access, Riff provides a practical real-time audio layer powered by the Windows Audio Session API (WASAPI), Media Foundation, and a native timer-driven DSP loop.
 
-Riff is designed for developers who want game-like audio behavior inside Office: responsive UI sounds, background music, routed buses, persistent scene effects, master bus processing, soft limiting, fades, procedural oscillators, one-shot and looped white/pink/brown noise, dynamic buffer/voice capacity, burst-safe SFX playback, fast preset setup, and safer cleanup when the host application or the VBA editor resets.
+Riff is designed for developers who want game-like audio behavior inside Office: responsive UI sounds, background music, routed buses, named asset playback, cooperative loading screens, one-call scene templates, persistent scene effects, master bus processing, limiter/headroom safety, fades, procedural oscillators, one-shot and looped white/pink/brown noise, dynamic buffer/voice capacity, automatic burst coalescing, fast preset setup, and safer cleanup when the host application or the VBA editor resets.
+
 
 ## Key Capabilities
 
@@ -37,12 +38,17 @@ Riff is designed for developers who want game-like audio behavior inside Office:
 - **Media Foundation Decoding:** Loads common formats supported by the system, including WAV, MP3, AAC, FLAC, WMA, and more.
 - **WAV Fast Path:** Compatible WAV files bypass Media Foundation and load through a direct RIFF parser for much faster startup.
 - **Unified Playback API:** `RiffPlay` accepts bus, loop, volume, and pan parameters directly.
-- **Duplicate Prevention:** `RiffPlayOnce` prevents music or repeated ambience from stacking accidentally.
-- **Dynamic SafeArray Pools:** Buffers, voices, and bus state now start with practical defaults and grow automatically instead of being locked to a hardcoded ceiling.
+- **Asset Registry:** `RiffLoadAs`, `RiffPlayKey`, `RiffPlayKeyOnce`, `RiffPlayKeyLoop`, `RiffStopKey`, and `RiffFadeOutKey` let projects play audio by stable string keys instead of manually passing handles everywhere.
+- **Cooperative Preload:** `RiffPreloadAdd`, `RiffPreloadStart`, and `RiffPreloadUpdate` support loading-screen style asset preparation without forcing a giant one-frame load spike.
+- **Duplicate Prevention:** `RiffPlayOnce` and `RiffPlayKeyOnce` prevent music or repeated ambience from stacking accidentally.
+- **Scene Templates:** `RiffApplyScene` provides ready-made mixer states for battle, night, cave, underwater, radio call, dream, horror, retro, cinematic, pause menu, and normal playback.
+- **Dynamic SafeArray Pools:** Buffers, voices, and bus state start with practical defaults and grow automatically instead of being locked to a hardcoded ceiling.
 - **Capacity Reservation:** `RiffReserveBuffers`, `RiffReserveVoices`, and `RiffReserveBuses` let large projects preallocate room before loading or playing many sounds.
 - **Adaptive Buffering:** Dynamically increases render queue safety during host stalls and returns to low latency when stable.
-- **Burst Protection:** Voice stealing, per-buffer caps, and per-bus caps reduce stutter when many SFX are triggered rapidly.
-- **Anti-Accumulation Playback:** Repeated short sounds, procedural noise, and oscillator beeps are capped and cleaned so game loops do not silently pile up voices.
+- **Automatic Overload Protection:** The engine detects extreme play-call spam internally and coalesces/reuses voices without requiring the user to call manual begin/end burst functions.
+- **Burst Protection:** Voice stealing, active-voice budgets, per-buffer caps, per-bus caps, and loop coalescing reduce stutter when many SFX are triggered rapidly.
+- **Stress-Safe Defaults:** `RiffApplyStressSafeDefaults` applies practical voice budgets, overload protection, limiter/headroom safety, and clipping protection for SFX-heavy projects.
+- **Anti-Accumulation Playback:** Repeated short sounds, procedural noise, and oscillator beeps are capped, stolen, coalesced, or cleaned so game loops do not silently pile up voices.
 - **One-Shot Procedural Noise:** `RiffPlayNoise` is finite by default; use `RiffPlayNoiseLoop` for continuous ambience.
 - **Finite Oscillator Beeps:** `RiffPlayOscillator` accepts `durationSec` for procedural UI/game SFX that clean themselves automatically.
 - **Hz-Based Filtering:** `RiffVoiceSetFilterHz` exposes low-pass and high-pass filters using real frequency values.
@@ -50,16 +56,16 @@ Riff is designed for developers who want game-like audio behavior inside Office:
 - **VBE-Safe Timer Cleanup:** Idle and Stop/Reset-safe cleanup reduce the chance of the VBA Editor staying stuck in `Running` mode or breaking IntelliSense.
 - **Editor-Safe Development Guards:** `RiffPrepareForVbeEdit` and `RiffResumeAfterVbeEdit` provide a controlled way to pause the risky timer/callback path before editing VBA code while audio is active.
 - **Studio DSP Pipeline:** Independent per-voice effects including Reverb, Delay, Chorus, Flanger, Compressor, EQ, Filters, Distortion, Bitcrusher, Ring Modulation, Tremolo, Auto-Pan, and Stereo Width.
-- **Musical Preset Packs:** Expanded voice presets for tape, VHS, dream pads, caves, tiny speakers, megaphones, retro game effects, wind, rain, horror drones, cinematic booms, and soft-focus scenes.
+- **Musical Preset Packs:** Expanded voice presets for tape, cassette, VHS, old computer, arcade cabinets, dream menus, caves, dungeons, boss rooms, space stations, low health, memory flashbacks, cutscenes, combat impacts, tiny speakers, megaphones, retro game effects, wind, rain, horror drones, cinematic booms, and soft-focus scenes.
 - **Persistent Bus Effects:** Apply a preset to a whole bus so current and future voices inherit the scene style automatically.
-- **Master Bus Processors:** Final mix chain with low-pass, high-pass, 3-band EQ, compressor, drive, stereo width, output gain, soft clipping, and master presets.
+- **Master Bus Processors:** Final mix chain with low-pass, high-pass, 3-band EQ, compressor, drive, stereo width, output gain, soft clipping, limiter controls, balance, tilt EQ, master presets, and master meters.
 - **Real-Time Synthesis:** BLEP-corrected oscillators for sine, square, and saw waveforms.
 - **Noise Generation:** White, pink, and brown noise for procedural ambience, wind, rain, static, rumble, and retro effects.
 - **Audio Routing:** Named buses for Music, SFX, UI, Voice, and auxiliary groups, backed by dynamically sized bus state.
-- **Mixer Controls:** Bus volume, mute, solo, fades, peak meters, and master peak monitoring.
+- **Mixer Controls:** Bus volume, mute, solo, fades, peak meters, RMS meters, clip counters, and master peak/RMS monitoring.
 - **Smoothing:** Volume, pan, and pitch smoothing reduce clicks during parameter changes.
-- **Soft Clipping:** Master soft clipper helps prevent harsh digital clipping when many voices overlap.
-- **Diagnostics:** Render counters, underrun counters, clipping counters, buffer status, active voice counts, and adaptive queue information.
+- **Soft Clipping and Limiting:** Master soft clipper and limiter help prevent harsh digital clipping when many voices overlap.
+- **Diagnostics:** Render counters, underrun counters, overload counters, clipping counters, buffer status, active voice counts, RMS/peak meters, and adaptive queue information.
 - **WAV Export:** Export loaded buffers and generated oscillators as standard PCM WAV files.
 - **Architecture Aware:** Compatible with both 32-bit and 64-bit Office through `#If VBA7` / `#If Win64` declarations.
 
@@ -100,6 +106,50 @@ Public Sub PlaySound()
     End If
 End Sub
 ```
+
+
+### Modern Asset-Key Workflow
+
+For bigger projects, prefer the v1.1.3 asset registry. It lets you load sounds with names and play them later without keeping a global variable for every buffer handle.
+
+```vb
+Public Sub AudioLoadKeys()
+    If Not RiffOpen() Then Exit Sub
+
+    RiffLoadAs "ui.click", ActivePresentation.Path & "\audio\click.wav"
+    RiffLoadAs "sfx.hit", ActivePresentation.Path & "\audio\hit.wav"
+    RiffLoadAs "music.menu", ActivePresentation.Path & "\audio\menu.mp3"
+End Sub
+
+Public Sub PlayMenuClick()
+    RiffPlayKey "ui.click", RiffBusUi, False, 0.75!, 0!
+End Sub
+
+Public Sub PlayMenuMusic()
+    RiffPlayKeyOnce "music.menu", RiffBusMusic, True, 0.45!, 0!
+End Sub
+```
+
+This is especially useful in PowerPoint games and large Excel tools where asset names are easier to manage than dozens of `Long` variables.
+
+### Stress-Safe Game Setup
+
+For SFX-heavy projects, v1.1.3 provides one setup call that enables practical overload protection, limiter/headroom safety, and voice budgets.
+
+```vb
+Public Sub AudioInitForHeavyGameplay()
+    If Not RiffOpen() Then Exit Sub
+
+    RiffReserveBuffers 500
+    RiffReserveVoices 160
+    RiffReserveBuses 32
+
+    ' max active voices, max voices per buffer, max voices per bus
+    RiffApplyStressSafeDefaults 64, 6, 32
+End Sub
+```
+
+You still call `RiffPlay`, `RiffPlayKey`, `RiffPlayNoise`, and `RiffPlayOscillator` normally. The overload/coalescing behavior is internal.
 
 ### Optional Capacity Reservation
 
@@ -202,6 +252,68 @@ Public Sub AudioLoad()
     RiffBusVolume(RiffBusMusic) = 0.45
 End Sub
 ```
+
+
+### Load Assets by Key
+
+The asset registry keeps the code cleaner when a project has many sounds.
+
+```vb
+Public Sub AudioLoadRegistry()
+    If Not RiffOpen() Then Exit Sub
+
+    RiffLoadAs "ui.click", ActivePresentation.Path & "\audio\ui_click.wav"
+    RiffLoadAs "ui.cancel", ActivePresentation.Path & "\audio\ui_cancel.wav"
+    RiffLoadAs "sfx.explosion", ActivePresentation.Path & "\audio\explosion.wav"
+    RiffLoadAs "music.menu", ActivePresentation.Path & "\audio\music.wav"
+End Sub
+
+Public Sub PlayRegistryClick()
+    RiffPlayKey "ui.click", RiffBusUi, False, 0.7!, 0!
+End Sub
+
+Public Sub EnsureRegistryMusic()
+    RiffPlayKeyOnce "music.menu", RiffBusMusic, True, 0.5!, 0!
+End Sub
+```
+
+Useful helpers:
+
+```vb
+Debug.Print RiffAssetExists("ui.click")
+Debug.Print RiffAssetHandle("ui.click")
+Debug.Print RiffAssetPath("ui.click")
+
+RiffStopKey "music.menu"
+RiffFadeOutKey "music.menu", 0.75
+```
+
+### Cooperative Preload
+
+For a loading screen, queue assets and advance loading over multiple calls.
+
+```vb
+Public Sub BuildLoadingQueue()
+    RiffPreloadClear
+    RiffPreloadAdd "ui.click", ActivePresentation.Path & "\audio\ui_click.wav"
+    RiffPreloadAdd "sfx.explosion", ActivePresentation.Path & "\audio\explosion.wav"
+    RiffPreloadAdd "music.menu", ActivePresentation.Path & "\audio\music.wav"
+    RiffPreloadStart
+End Sub
+
+Public Sub LoadingTick()
+    RiffPreloadUpdate
+
+    Debug.Print "Loading:", Format$(RiffPreloadProgress * 100!, "0") & "%"
+
+    If RiffPreloadFinished Then
+        Debug.Print "Loaded:", RiffPreloadLoadedCount
+        Debug.Print "Failed:", RiffPreloadFailedCount
+    End If
+End Sub
+```
+
+Use `RiffPreloadUpdateAll` only when you intentionally want to finish the whole queue immediately.
 
 ### Play UI and SFX
 
@@ -353,13 +465,67 @@ Public Sub PrintBusPeaks()
 End Sub
 ```
 
+
+## Scene Templates
+
+v1.1.3 includes built-in scene templates. These are higher-level mixer recipes that adjust buses, persistent effects, and master color in one call.
+
+```vb
+Public Sub EnterBattle()
+    RiffApplyScene RiffSceneBattle
+End Sub
+
+Public Sub EnterCave()
+    RiffApplyScene RiffSceneCave
+End Sub
+
+Public Sub EnterRadioCall()
+    RiffApplyScene RiffSceneRadioCall
+End Sub
+
+Public Sub LeaveSpecialScene()
+    RiffApplyScene RiffSceneNormal
+End Sub
+```
+
+Available scenes:
+
+```vb
+RiffSceneNormal
+RiffScenePauseMenu
+RiffSceneBattle
+RiffSceneNight
+RiffSceneCave
+RiffSceneUnderwater
+RiffSceneRadioCall
+RiffSceneDream
+RiffSceneHorror
+RiffSceneRetro
+RiffSceneCinematic
+```
+
+Scenes work best when audio is routed to meaningful buses:
+
+```vb
+RiffPlayKey "music.battle", RiffBusMusic, True, 0.45!, 0!
+RiffPlayKey "sfx.hit", RiffBusSfx, False, 0.85!, 0!
+RiffPlayKey "ui.confirm", RiffBusUi, False, 0.65!, 0!
+RiffPlayKey "voice.npc", RiffBusVoice, False, 1!, 0!
+```
+
+If everything is played on `RiffBusMain`, scene templates have less useful routing information to work with.
+
+
 ## Unified Playback API
 
-The recommended public API is intentionally compact:
+The recommended public API is intentionally compact. Handle-based playback remains available, and v1.1.3 adds key-based playback for larger projects.
 
 ```vb
 voice = RiffPlay(bufferHandle, busID, looped, volume, pan)
 voice = RiffPlayOnce(bufferHandle, busID, looped, volume, pan)
+voice = RiffPlayKey("sfx.hit", busID, looped, volume, pan)
+voice = RiffPlayKeyOnce("music.menu", busID, looped, volume, pan)
+voice = RiffPlayKeyLoop("amb.wind", busID, volume, pan)
 voice = RiffPlayOscillator(waveType, frequencyHz, busID, volume, pan, durationSec)
 voice = RiffPlayNoise(noiseType, busID, volume, pan, durationSec)
 voice = RiffPlayNoiseLoop(noiseType, busID, volume, pan)
@@ -378,6 +544,34 @@ Use this for music, ambience, menu loops, and anything that should not duplicate
 
 ```vb
 musicVoice = RiffPlayOnce(sndMusic, RiffBusMusic, True, 0.5, 0)
+```
+
+### `RiffPlayKey`
+
+Use this when the sound was loaded with `RiffLoadAs` or registered through the asset registry.
+
+```vb
+RiffLoadAs "sfx.explosion", ActivePresentation.Path & "\audio\explosion.wav"
+RiffPlayKey "sfx.explosion", RiffBusSfx, False, 0.9!, 0!
+```
+
+### `RiffPlayKeyOnce` and `RiffPlayKeyLoop`
+
+Use these for music and ambience that should not stack.
+
+```vb
+RiffLoadAs "music.menu", ActivePresentation.Path & "\audio\menu.mp3"
+RiffPlayKeyOnce "music.menu", RiffBusMusic, True, 0.45!, 0!
+
+RiffLoadAs "amb.wind", ActivePresentation.Path & "\audio\wind.wav"
+RiffPlayKeyLoop "amb.wind", RiffBusMusic, 0.25!, 0!
+```
+
+### `RiffStopKey` and `RiffFadeOutKey`
+
+```vb
+RiffFadeOutKey "music.menu", 0.8
+RiffStopKey "amb.wind"
 ```
 
 ### `RiffPlayOscillator`
@@ -435,6 +629,7 @@ RiffPlayNoiseLoopOnBus busID, noiseType, volume, pan
 
 They forward internally to the unified playback path.
 
+
 ## Effect Presets
 
 Presets provide fast, musical starting points for common sound design situations.
@@ -479,6 +674,22 @@ RiffVoiceApplyPreset voice, RiffFxWarmTape, 0.5
 | `RiffFxCinematicBoom` | Big low-heavy impact treatment. |
 | `RiffFxSoftFocus` | Gentle smoothing and width. |
 
+### v1.1.3 Expanded Presets
+
+| Preset | Use Case |
+|:---|:---|
+| `RiffFxCassette` | Cassette-style warmth, dullness, and soft degradation. |
+| `RiffFxOldComputer` | Crunchy old PC / multimedia speaker character. |
+| `RiffFxArcadeCabinet` | Bright, narrow, arcade-machine style UI and SFX tone. |
+| `RiffFxDreamMenu` | Soft menu ambience with a dreamlike polished tone. |
+| `RiffFxSpaceStation` | Cold sci-fi room tone for machinery, ambience, and UI. |
+| `RiffFxDungeon` | Darker reverb and low-mid weight for RPG rooms. |
+| `RiffFxBossRoom` | Stronger, heavier scene color for combat areas. |
+| `RiffFxLowHealth` | Tense filtered state for low HP, warning, or danger moments. |
+| `RiffFxMemoryFlashback` | Soft degraded recollection / flashback coloration. |
+| `RiffFxCutscene` | Polished cinematic treatment for narrative moments. |
+| `RiffFxCombatImpact` | Punchier transient-heavy effect for hits and impacts. |
+
 ### Preset Amount
 
 `amount` usually ranges from `0.0` to `1.0`.
@@ -493,7 +704,7 @@ The current performance build sanitizes preset values and prepares temporal DSP 
 
 ## Persistent Bus Effects
 
-v1.0.9 can apply voice presets to a whole bus. This is useful for scene-wide states such as underwater, cave, radio, dream, horror, or retro menus.
+Riff can apply voice presets to a whole bus. This is useful for scene-wide states such as underwater, cave, radio, dream, horror, or retro menus.
 
 By default, `RiffBusApplyPreset` affects currently active voices and stores the preset for future voices routed to that bus.
 
@@ -531,9 +742,10 @@ Debug.Print RiffBusPreset(RiffBusMusic)
 Debug.Print RiffBusPresetAmount(RiffBusMusic)
 ```
 
+
 ## Master Bus Processors
 
-Master processors run after the full voice/bus mix. They are intended for final polish, safety limiting, and broad scene coloration.
+Master processors run after the full voice/bus mix. They are intended for final polish, safety limiting, broad scene coloration, diagnostics, and loud SFX protection.
 
 ```vb
 RiffMasterApplyPreset RiffMasterFxGlue, 0.7
@@ -553,6 +765,25 @@ RiffMasterApplyPreset RiffMasterFxCinematic, 0.6
 | `RiffMasterFxCinematic` | Wider, fuller, slightly compressed cinematic shaping. |
 | `RiffMasterFxNight` | Softer, lower-energy night mix. |
 | `RiffMasterFxSoftLimiter` | Safety limiting for SFX-heavy scenes. |
+
+### Limiter and Headroom Safety
+
+For scenes where many one-shots can overlap, enable the master processor, limiter, output headroom, and soft clipper.
+
+```vb
+Public Sub ApplySafeMasterForGameplay()
+    RiffMasterProcessorEnabled = True
+    RiffMasterSetLimiter 0.92!, 0.9!
+    RiffMasterOutputGain = 0.78!
+    RiffSoftClipEnabled = True
+End Sub
+```
+
+`RiffApplyStressSafeDefaults` applies this kind of setup automatically with practical voice budgets.
+
+```vb
+RiffApplyStressSafeDefaults 64, 6, 32
+```
 
 ### Manual Master Chain
 
@@ -575,6 +806,42 @@ Public Sub ApplyManualMasterChain()
     RiffMasterOutputGain = 0.96
     RiffSoftClipEnabled = True
 End Sub
+```
+
+### Tilt EQ and Balance
+
+```vb
+' Negative values lean darker; positive values lean brighter.
+RiffMasterTiltEq -0.15!
+
+' -1 = left, 0 = center, 1 = right.
+RiffMasterBalance 0!
+```
+
+### Master Meters
+
+```vb
+Public Sub PrintMasterMeters()
+    Dim l As Single
+    Dim r As Single
+
+    RiffMasterGetRms l, r
+
+    Debug.Print "Master RMS:", l, r
+    Debug.Print "Master RMS dB:", RiffMasterRmsDb
+    Debug.Print "Master Peak dB:", RiffMasterPeakDb
+    Debug.Print "Master Clips:", RiffMasterClipCount
+End Sub
+```
+
+Bus and voice-level RMS helpers are also available for visualizers, debug overlays, and balancing tools.
+
+```vb
+Dim l As Single
+Dim r As Single
+
+RiffBusGetRms RiffBusMusic, l, r
+RiffVoiceGetRms musicVoice, l, r
 ```
 
 Clear master processing:
@@ -727,14 +994,50 @@ RiffResetAdaptiveStats
 RiffResetDiagnostics
 ```
 
+
 ## Burst Safety
 
-Triggering the same sound many times in a short time can overwhelm any mixer, even with dynamic voice capacity. Riff includes safety controls to prevent rapid SFX spam from creating an unnecessary pile of overlapping copies of the same sound.
+Triggering the same sound many times in a short time can overwhelm any mixer, even with dynamic voice capacity. Riff v1.1.3 protects this path internally.
+
+The important part: the user does **not** need to call manual `Begin` / `End` burst functions. You keep using the normal API.
+
+```vb
+RiffPlay sndHit, RiffBusSfx, False, 0.8!, 0!
+RiffPlayKey "sfx.hit", RiffBusSfx, False, 0.8!, 0!
+RiffPlayNoise RiffWaveWhiteNoise, RiffBusSfx, 0.08!, 0!, 0.04!
+RiffPlayOscillator RiffWaveSquare, 880!, RiffBusUi, 0.15!, 0!, 0.05!
+```
+
+Internally, the overload path can:
+
+- coalesce repeated play requests;
+- reuse compatible voices during extreme spam;
+- steal old non-looping voices before touching important looped audio;
+- respect active-voice budgets;
+- respect per-buffer and per-bus budgets;
+- keep limiter/headroom safety active when stress defaults are enabled.
+
+Recommended heavy-game setup:
 
 ```vb
 RiffVoiceStealingEnabled = True
-RiffMaxVoicesPerBuffer = 4
-RiffMaxVoicesPerBus = 18
+RiffOverloadProtectionEnabled = True
+RiffLoopCoalescingEnabled = True
+
+RiffMaxActiveVoices = 64
+RiffMaxVoicesPerBuffer = 6
+RiffMaxVoicesPerBus = 32
+
+RiffMasterProcessorEnabled = True
+RiffMasterSetLimiter 0.92!, 0.9!
+RiffMasterOutputGain = 0.78!
+RiffSoftClipEnabled = True
+```
+
+Or use the helper:
+
+```vb
+RiffApplyStressSafeDefaults 64, 6, 32
 ```
 
 ### Diagnostics
@@ -743,51 +1046,59 @@ RiffMaxVoicesPerBus = 18
 Debug.Print "Active voices:", RiffActiveVoiceCount()
 Debug.Print "Click instances:", RiffBufferVoiceCount(sndClick, RiffBusUi)
 Debug.Print "SFX bus voices:", RiffBusVoiceCount(RiffBusSfx)
+Debug.Print "Stolen:", RiffOverloadStolenCount
+Debug.Print "Dropped:", RiffOverloadDroppedCount
+Debug.Print "Coalesced:", RiffOverloadCoalescedCount
+Debug.Print "Clips:", RiffMasterClipCount
 ```
 
-Recommended values for UI-heavy Office projects:
+Reset counters before stress tests:
 
 ```vb
-RiffMaxVoicesPerBuffer = 4
-RiffMaxVoicesPerBus = 18
+RiffResetOverloadStats
+RiffResetDiagnostics
+RiffResetAdaptiveStats
 ```
 
-Set a cap to `0` when you intentionally want no limit for that category:
+Dynamic voice capacity gives the engine more room, while overload protection keeps gameplay mistakes from turning into hundreds or thousands of redundant real voices.
 
-```vb
-RiffMaxVoicesPerBuffer = 0
-RiffMaxVoicesPerBus = 0
-```
-
-Dynamic voice capacity gives the engine more room, while burst caps keep gameplay mistakes from turning into hundreds of redundant voices.
 
 ## Performance and Stability Notes
 
-The current performance pass focuses on making the common gameplay path cheap while keeping the earlier anti-accumulation fixes intact.
+The v1.1.3 performance pass focuses on making the common gameplay path extremely cheap while keeping the earlier anti-accumulation and editor-safety fixes intact.
 
 Key internal improvements include:
 
 - `RiffPlay` no longer clears large temporal ring buffers for dry one-shot voices.
 - `RiffVoiceApplyPreset` no longer eagerly clears delay/reverb/chorus/flanger buffers unless those stages are actually needed.
 - Temporal DSP buffer preparation is lazy and tied to the first render tick that needs it.
-- Voice allocation combines free-slot search, dynamic pool growth, per-buffer caps, per-bus caps, and voice-steal candidates in a cheaper path.
+- Voice allocation combines free-slot search, dynamic pool growth, per-buffer caps, per-bus caps, active voice budgets, and voice-steal candidates in a cheaper path.
 - Buffers, voices, and bus state use dynamic `SafeArray` pools instead of being locked to the old fixed capacities.
 - Generated noise and oscillator one-shots use finite lifetimes and short release ramps.
 - Idle warm-buffer behavior reduces underruns during rapid SFX bursts.
 - Stop/Reset-safe editor cleanup kills stale timer callbacks after a VBE reset.
+- Automatic overload detection coalesces or reuses repeated play requests during extreme same-tick spam.
+- Stress-safe master settings keep limiter/headroom protection active during loud SFX-heavy bursts.
 
-Observed benchmark range from the stabilization/performance pass:
+Observed benchmark from the v1.1.3 local performance test:
 
 ```text
-Dry RiffPlay:          ~11–13 µs/call
-Noise one-shot:        ~13–15 µs/call
-Oscillator one-shot:   ~13–15 µs/call
-Preset/DSP setup:      ~20 µs/call
-Game-loop underruns:   0 in the final pumped benchmark
-Failed handles:        0 in the final benchmark
+Short dry RiffPlay burst:       5000 calls, ~22.921 ms total, ~4.584 us/call
+Long dry RiffPlay burst:        5000 calls, ~22.234 ms total, ~4.447 us/call
+Noise one-shot burst:           5000 calls, ~24.315 ms total, ~4.863 us/call
+Oscillator one-shot burst:      5000 calls, ~22.946 ms total, ~4.589 us/call
+Preset/DSP setup burst:         2500 calls, ~32.318 ms total, ~12.927 us/call
+Gameplay loop:                  3600 frames, 1827 play calls, 0 failed handles
+Missed frame budget:            0
+Peak active voices:             7
+Final active voices:            0
+Gameplay underrun delta:        0
+Gameplay memory peak-start:     0.000 MB
 ```
 
-These numbers are not guaranteed across machines, Office versions, or host load, but they describe the target behavior: fast one-shot playback, no voice accumulation, stable memory, and low underrun counts during normal Office-hosted game loops.
+These numbers are not guaranteed across machines, Office versions, or host load, but they describe the current target behavior: very fast one-shot playback, no voice accumulation, stable memory, low underrun counts, and safe handling of extreme SFX spam.
+
+When a benchmark reports thousands of successful handles during a burst, it means the calls were accepted successfully. It does not necessarily mean Riff created thousands of unique real voices. Under overload, v1.1.3 may coalesce or reuse voices internally to protect the mixer.
 
 ## VBA Editor Safety
 
@@ -827,26 +1138,47 @@ End Sub
 
 Use these helpers only while developing. Normal applications should call `RiffClose` from their shutdown path.
 
+
 ## Feature Summary
 
 | Category | Features |
 |:---|:---|
 | **Core** | Single `.bas`, dynamic buffers, dynamic voices, dynamic bus state, x86/x64 support |
 | **I/O** | Media Foundation decoding, in-memory loading, WAV fast path, WAV export |
-| **Playback** | Unified `RiffPlay`, `RiffPlayOnce`, finite oscillator/noise one-shots, seeking, looping, fades, stop/reset behavior |
-| **Routing** | Bus volume, mute, solo, fade, peak meters, persistent bus presets, master volume |
-| **Stability** | Adaptive buffering, burst protection, voice stealing, dynamic pool growth, idle timer cleanup, Stop/Reset-safe editor cleanup, manual VBE edit guards |
-| **Presets** | Core FX presets, musical preset packs, persistent bus effects, master presets |
-| **Master Processing** | Soft clip, low-pass, high-pass, 3-band EQ, compressor, drive, stereo width, output gain |
+| **Asset Management** | Asset registry, key-based playback, key-based stop/fade, cooperative preload queue |
+| **Playback** | Unified `RiffPlay`, `RiffPlayOnce`, `RiffPlayKey`, `RiffPlayKeyOnce`, finite oscillator/noise one-shots, seeking, looping, fades, stop/reset behavior |
+| **Routing** | Bus volume, mute, solo, fade, peak/RMS meters, persistent bus presets, master volume |
+| **Scenes** | Built-in templates for normal, pause, battle, night, cave, underwater, radio, dream, horror, retro, and cinematic states |
+| **Stability** | Adaptive buffering, automatic overload protection, burst coalescing, voice stealing, active voice budgets, dynamic pool growth, idle timer cleanup, Stop/Reset-safe editor cleanup, manual VBE edit guards |
+| **Presets** | Core FX presets, musical preset packs, v1.1.3 expanded presets, persistent bus effects, master presets |
+| **Master Processing** | Soft clip, limiter, low-pass, high-pass, 3-band EQ, tilt EQ, compressor, drive, stereo width, balance, output gain |
 | **Synthesis** | BLEP sine/square/saw, finite oscillator beeps, one-shot and looped white/pink/brown noise |
-| **Dynamics** | Compressor, soft clipping, distortion, bitcrusher |
+| **Dynamics** | Compressor, soft clipping, limiting, distortion, bitcrusher |
 | **Spatial** | Reverb, delay, stereo width, pan, auto-pan |
 | **Modulation** | Chorus, flanger, tremolo, ring modulation |
-| **Filters** | Biquad low-pass, high-pass, Hz-based filter helper, 3-band EQ |
-| **Diagnostics** | Underruns, render errors, clipped samples, buffer state, active voice, bus voice, and buffer voice counters |
+| **Filters** | Biquad low-pass, high-pass, Hz-based filter helper, 3-band EQ, master tilt EQ |
+| **Diagnostics** | Underruns, render errors, clipped samples, overload stolen/dropped/coalesced counters, buffer state, active voice, bus voice, buffer voice, RMS, peak, and capacity counters |
 | **Export** | Loaded buffer export and oscillator render to PCM WAV |
 
-## NEXT 1.1.2 Highlights
+
+## Riff v1.1.3 Highlights
+
+- Added the asset registry workflow with `RiffLoadAs`, `RiffRegisterAsset`, `RiffAssetExists`, `RiffAssetHandle`, `RiffAssetPath`, `RiffReloadAsset`, `RiffAssetCount`, `RiffAssetKey`, `RiffUnloadKey`, and `RiffClearAssets`.
+- Added key-based playback with `RiffPlayKey`, `RiffPlayKeyOnce`, `RiffPlayKeyLoop`, `RiffStopKey`, and `RiffFadeOutKey`.
+- Added cooperative preload helpers: `RiffPreloadAdd`, `RiffPreloadStart`, `RiffPreloadUpdate`, `RiffPreloadUpdateAll`, `RiffPreloadFinished`, `RiffPreloadProgress`, `RiffPreloadLoadedCount`, `RiffPreloadFailedCount`, `RiffPreloadTotalCount`, `RiffPreloadCurrentKey`, `RiffPreloadItemStatus`, `RiffPreloadItemKey`, `RiffPreloadItemHandle`, and `RiffPreloadClear`.
+- Added scene templates through `RiffApplyScene` and `RiffScenePreset` for normal, pause menu, battle, night, cave, underwater, radio call, dream, horror, retro, and cinematic states.
+- Added expanded v1.1.3 presets: `RiffFxCassette`, `RiffFxOldComputer`, `RiffFxArcadeCabinet`, `RiffFxDreamMenu`, `RiffFxSpaceStation`, `RiffFxDungeon`, `RiffFxBossRoom`, `RiffFxLowHealth`, `RiffFxMemoryFlashback`, `RiffFxCutscene`, and `RiffFxCombatImpact`.
+- Added automatic overload protection that detects extreme play-call spam internally without requiring public `Begin`/`End` burst calls.
+- Added internal auto-burst/coalescing behavior so repeated same-tick sounds can be accepted without forcing thousands of redundant real voices into the mixer.
+- Added `RiffOverloadProtectionEnabled`, `RiffLoopCoalescingEnabled`, `RiffMaxActiveVoices`, `RiffOverloadDroppedCount`, `RiffOverloadStolenCount`, `RiffOverloadCoalescedCount`, `RiffResetOverloadStats`, and `RiffApplyStressSafeDefaults`.
+- Added master limiter and safety tools: `RiffMasterSetLimiter`, `RiffMasterLimiterEnabled`, `RiffMasterLimiterCeiling`, `RiffMasterOutputGain`, and `RiffSoftClipEnabled` stress-safe setup.
+- Added master mix helpers and diagnostics: `RiffMasterBalance`, `RiffMasterTiltEq`, `RiffMasterGetRms`, `RiffMasterGetRmsDb`, `RiffMasterRmsDb`, `RiffMasterPeakDb`, `RiffMasterClipCount`, and `RiffResetDiagnostics`.
+- Added/expanded bus and voice RMS/clip diagnostics for balancing, visualizers, and stress tests.
+- Improved burst benchmarks from the older `~11–13 us/call` dry path to around `~4–5 us/call` in the latest local stress benchmark.
+- Preserved the normal user-facing workflow: existing code can keep calling `RiffPlay`, `RiffPlayKey`, `RiffPlayNoise`, and `RiffPlayOscillator` normally.
+
+## v1.1.2 Highlights
+
 
 - Reworked buffer and voice storage from fixed-size pools into dynamic `SafeArray` pools.
 - Removed the old hardcoded capacity ceiling for loaded buffers and active voices.
@@ -886,6 +1218,7 @@ Use these helpers only while developing. Normal applications should call `RiffCl
 - [**Examples**](examples/README.md) – Practical demos and integration patterns.
 - [**Benchmarks**](benchmarks/) – Optional local stress tests for burst playback, game-loop playback, memory, underruns, and VBE timer behavior.
 
+
 ## Roadmap
 
 - [x] WASAPI Shared Mode playback.
@@ -896,13 +1229,15 @@ Use these helpers only while developing. Normal applications should call `RiffCl
 - [x] Dynamic polyphonic mixer with expandable voice capacity.
 - [x] Manual capacity reservation helpers.
 - [x] Named bus routing system backed by dynamically sized bus state.
-- [x] Bus mute, solo, fade, and peak meters.
+- [x] Bus mute, solo, fade, peak meters, RMS meters, and clip counters.
 - [x] Persistent bus effect presets.
 - [x] Full per-voice Studio DSP pipeline.
 - [x] Core effect presets.
 - [x] Musical preset packs.
+- [x] Expanded v1.1.3 effect presets.
 - [x] Master bus processors.
 - [x] Master processor presets.
+- [x] Master limiter, output headroom, balance, tilt EQ, RMS, peak, and clip diagnostics.
 - [x] White, pink, and brown noise.
 - [x] One-shot and looped procedural noise helpers.
 - [x] BLEP oscillators.
@@ -910,37 +1245,49 @@ Use these helpers only while developing. Normal applications should call `RiffCl
 - [x] Hz-based voice filter helper.
 - [x] Adaptive buffering.
 - [x] Burst-safe voice management.
+- [x] Automatic overload protection and internal auto-burst coalescing.
+- [x] Stress-safe defaults for SFX-heavy projects.
 - [x] Lazy temporal-buffer preparation for faster `Play` and preset setup.
+- [x] Asset registry and key-based playback.
+- [x] Cooperative preload helpers.
+- [x] Built-in scene templates.
 - [x] VBE-safe idle, Stop/Reset timer cleanup, and manual safe-edit guards.
 - [x] x86/x64 native thunk driver.
 - [x] Offline WAV export.
-- [x] Diagnostics, render counters, and current capacity counters.
+- [x] Diagnostics, render counters, overload counters, meters, and current capacity counters.
 
 ### Planned
 
 - [ ] Optional native decode backend for faster MP3/OGG loading.
-- [ ] Background preload helpers.
-- [ ] Higher-level asset registry, such as `RiffLoadAs` and `RiffPlayKey`.
+- [ ] Optional priority groups for more explicit music/voice/SFX stealing rules.
 - [ ] More musical preset packs and scene templates.
-- [ ] Additional master bus processors and metering tools.
+- [ ] Additional visualizer helpers for PowerPoint/Excel UI meters.
 - [ ] macOS support through CoreAudio/AudioToolbox if the project expands beyond Windows.
+
 
 ## Performance Notes
 
 For best performance in Office:
 
 - Prefer WAV for short SFX and UI sounds.
-- Preload assets at startup with `RiffLoad`.
+- Preload assets at startup with `RiffLoad` or `RiffLoadAs`.
+- Use the asset registry for large projects so gameplay code can call `RiffPlayKey` instead of carrying many handle variables.
+- Use cooperative preload when a project needs a visible loading screen or a staged asset-loading flow.
 - For large projects, reserve capacity at startup with `RiffReserveBuffers`, `RiffReserveVoices`, and `RiffReserveBuses`.
+- For SFX-heavy games, call `RiffApplyStressSafeDefaults 64, 6, 32` as a strong baseline.
 - Avoid decoding MP3/OGG during interaction-heavy moments.
-- Use `RiffPlayOnce` for music and ambience loaded from buffers.
+- Use `RiffPlayOnce` or `RiffPlayKeyOnce` for music and ambience.
 - Use `RiffPlayNoiseLoop` for continuous procedural ambience instead of looping a default `RiffPlayNoise` one-shot.
 - Use `durationSec` for short oscillator beeps and procedural noise hits.
+- Route audio to meaningful buses such as `RiffBusMusic`, `RiffBusSfx`, `RiffBusUi`, and `RiffBusVoice`; this makes scene templates and bus effects much more useful.
+- Use `RiffApplyScene` for broad scene states instead of manually rebuilding the same bus/master settings everywhere.
 - Use bus volume/fades instead of changing many voices one by one.
 - Use persistent bus presets for scene-wide effects.
 - Use master processors lightly for final polish rather than heavy per-sample coloration on every voice.
 - Keep effect-heavy processing for important voices only.
-- Use `RiffMaxVoicesPerBuffer` to prevent repeated button clicks from stacking too many copies, or set it to `0` when you intentionally want no cap.
+- Use overload counters to inspect heavy scenes: `RiffOverloadStolenCount`, `RiffOverloadDroppedCount`, and `RiffOverloadCoalescedCount`.
+- Use `RiffMaxVoicesPerBuffer` and `RiffMaxVoicesPerBus` to prevent repeated button clicks or collision sounds from stacking too many copies, or set them to `0` when you intentionally want no explicit cap.
+- Use the master limiter/headroom path for loud scenes: `RiffMasterSetLimiter`, `RiffMasterOutputGain`, and `RiffSoftClipEnabled`.
 - Use `RiffVoiceSetFilterHz` when frequency-based filtering is clearer than normalized filter values.
 - Keep `RiffAutoSuspendTimer` enabled for editor stability unless you intentionally need a warm timer during heavy gameplay bursts.
 - Use `RiffPrepareForVbeEdit` before editing code while audio is active, then `RiffResumeAfterVbeEdit` when finished.
@@ -948,7 +1295,7 @@ For best performance in Office:
 - Always call `RiffClose` on exit.
 
 > [!NOTE]
-> Riff is a pure VBA engine with a native callback bridge. It is highly capable for Office, but it is still hosted inside Excel, PowerPoint, Word, or Access. If the host application or the entire system stalls hard enough, audio scheduling can be affected. Adaptive buffering reduces this, but a fully independent audio thread would require a native backend.
+> Riff is a pure VBA engine with a native callback bridge. It is highly capable for Office, but it is still hosted inside Excel, PowerPoint, Word, or Access. If the host application or the entire system stalls hard enough, audio scheduling can be affected. Adaptive buffering and overload protection reduce this, but a fully independent audio thread would require a native backend.
 
 ## License
 
