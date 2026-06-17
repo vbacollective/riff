@@ -1,8 +1,8 @@
 # Riff API Reference
 
-**Riff.bas** is a high-performance VBA audio engine for Windows Office hosts. It uses Media Foundation for decoding, WASAPI shared-mode output for playback, and a real-time DSP pipeline written directly in VBA with a small native timer thunk. It supports x86 and x64 VBA, SafeArray-backed dynamic audio buffers, polyphonic voices, expandable audio buses, synthetic oscillators, white/pink/brown noise, WAV export, peak meters, adaptive buffering, musical preset packs, master bus processors, and a full per-voice effects chain.
+**Riff.bas** is a high-performance VBA audio engine for Windows Office hosts. It uses Media Foundation for decoding, WASAPI shared-mode output for playback, and a real-time DSP pipeline written directly in VBA with a small native timer thunk. It supports x86 and x64 VBA, SafeArray-backed dynamic audio buffers, polyphonic voices, expandable audio buses, named asset loading, cooperative preload queues, scene templates, synthetic oscillators, white/pink/brown noise, WAV export, peak/RMS meters, adaptive buffering, musical preset packs, master bus processors, and a full per-voice effects chain.
 
-This reference includes the current stability/performance pass: dynamic buffer/voice/bus pools, manual pre-reservation APIs for large projects, anti-accumulation voice caps, finite procedural one-shots, Hz-based filter helpers, lazy temporal-buffer preparation, faster `RiffPlay`/preset setup, warm-silence underrun protection, the VBE-safe idle timer that prevents IntelliSense from being held in a permanent running state, optional VBE foreground protection, and stop/reset-safe editor cleanup for manual VBE interruptions.
+This reference includes the **v1.1.3** stability/performance pass: dynamic buffer/voice/bus pools, manual pre-reservation APIs for large projects, the named asset registry, cooperative preloading, scene templates, automatic overload protection, loop coalescing, ultra-fast internal burst coalescing, stress-safe master limiting, anti-accumulation voice caps, finite procedural one-shots, Hz-based filter helpers, lazy temporal-buffer preparation, faster `RiffPlay`/preset setup, warm-silence underrun protection, the VBE-safe idle timer that prevents IntelliSense from being held in a permanent running state, optional VBE foreground protection, and stop/reset-safe editor cleanup for manual VBE interruptions.
 
 ```vb
 voice = RiffPlay(bufferHandle, RiffBusSfx, False, 0.9, 0!)
@@ -10,6 +10,10 @@ music = RiffPlayOnce(musicBuffer, RiffBusMusic, True, 0.45, 0!)
 noise = RiffPlayNoise(RiffWavePinkNoise, RiffBusSfx, 0.08, 0!, 0.06!)
 wind = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.05!, 0!)
 osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!, 0.12!)
+
+RiffLoadAs "ui.click", "audio\click.wav"
+RiffPlayKey "ui.click", RiffBusUi
+RiffApplyScene RiffSceneBattle
 ```
 
 ## Table of Contents
@@ -20,6 +24,8 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!, 0.12!)
   - [Buffer Pool](#buffer-pool)
   - [Voice Pool](#voice-pool)
   - [Dynamic Resource Pools](#dynamic-resource-pools)
+  - [Asset Registry and Cooperative Preload](#asset-registry-and-cooperative-preload)
+  - [Automatic Overload Protection](#automatic-overload-protection)
   - [Anti-Accumulation and Burst Safety](#anti-accumulation-and-burst-safety)
   - [Audio Buses](#audio-buses)
   - [Adaptive Buffering](#adaptive-buffering)
@@ -37,21 +43,27 @@ osc = RiffPlayOscillator(RiffWaveSine, 440!, RiffBusUi, 0.25, 0!, 0.12!)
   - [RiffBusId](#riffbusid)
   - [RiffEffectPreset](#riffeffectpreset)
   - [RiffMasterPreset](#riffmasterpreset)
+  - [RiffPreloadStatus](#riffpreloadstatus)
+  - [RiffScenePreset](#riffscenepreset)
   - [RiffErrorCode](#rifferrorcode)
 - [Initialization and Teardown](#initialization-and-teardown)
 - [Diagnostics](#diagnostics)
   - [Dynamic Pool Reservation API](#dynamic-pool-reservation-api)
   - [Runtime Voice Counters](#runtime-voice-counters)
+  - [Overload Protection and Stress Safety](#overload-protection-and-stress-safety)
 - [Global Settings](#global-settings)
 - [Master Bus Processors](#master-bus-processors)
 - [Audio Buses](#audio-buses-api)
 - [Asset Loading and Memory](#asset-loading-and-memory)
+- [Named Asset Registry](#named-asset-registry)
+- [Cooperative Preload Queue](#cooperative-preload-queue)
 - [Export and Offline Rendering](#export-and-offline-rendering)
 - [Playback](#playback)
 - [Voice State and Transport](#voice-state-and-transport)
 - [Voice Properties](#voice-properties)
 - [Effect Helpers and Presets](#effect-helpers-and-presets)
 - [Musical Preset Packs](#musical-preset-packs)
+- [Scene Templates](#scene-templates)
 - [DSP Parameters](#dsp-parameters)
   - [Bitcrusher](#bitcrusher)
   - [Ring Modulator](#ring-modulator)
@@ -167,7 +179,7 @@ Each voice has its own source position, loop state, volume, pitch, pan, peak met
 
 ### Dynamic Resource Pools
 
-Riff NEXT 1.2.1 removes the old hardcoded practical limits for buffers and voices. Internally, the main pools are SafeArray-backed and grow on demand:
+Riff v1.1.3 removes the old hardcoded practical limits for buffers and voices. Internally, the main pools are SafeArray-backed and grow on demand:
 
 ```txt
 Buffers -> start at 64, grow when more loaded assets are needed
@@ -199,6 +211,63 @@ End Sub
 
 This does not mean infinite memory. It means the old fixed Riff-side limit is gone. Real limits now come from available memory, Office bitness, the host process, and how much decoded audio or DSP state the project keeps alive.
 
+
+### Asset Registry and Cooperative Preload
+
+v1.1.3 adds a lightweight named asset registry on top of the existing numeric buffer handles. You can still use `RiffLoad` and store `Long` handles manually, but larger projects can now load assets by key and play them by name:
+
+```vb
+RiffLoadAs "ui.click", "audio\click.wav"
+RiffLoadAs "music.menu", "audio\menu.mp3"
+
+RiffPlayKey "ui.click", RiffBusUi
+RiffPlayKeyOnce "music.menu", RiffBusMusic, True, 0.45!
+```
+
+The registry is implemented with dynamic arrays and small UDT entries. It does **not** require `Scripting.Dictionary`, `Collection`, external references, or late-bound COM helpers.
+
+v1.1.3 also adds a cooperative preload queue. It is not a background thread; that would be risky in a pure VBA/Office host. Instead, it lets a loading screen process a few assets per tick so the project can remain responsive:
+
+```vb
+RiffPreloadAdd "ui.click", "audio\click.wav"
+RiffPreloadAdd "sfx.hit", "audio\hit.wav"
+RiffPreloadAdd "music.menu", "audio\menu.mp3"
+
+RiffPreloadStart
+
+Do While Not RiffPreloadFinished()
+    RiffPreloadUpdate 1
+    Debug.Print "Loading:", RiffPreloadProgress & "%"
+    DoEvents
+Loop
+```
+
+### Automatic Overload Protection
+
+v1.1.3 is designed to survive accidental or intentional audio spam. A game loop can call `RiffPlay`, `RiffPlayKey`, `RiffPlayNoise`, or `RiffPlayOscillator` normally; the engine detects extreme bursts internally and avoids letting the mixer grow into thousands of simultaneously mixed voices.
+
+The protection model is:
+
+```txt
+User calls Play normally
+-> Riff detects repeated burst pressure internally
+-> repeated calls may be coalesced/reused
+-> old non-critical voices may be stolen
+-> looped music/ambience is protected by loop coalescing
+-> master limiter/headroom can prevent clipping in stress-safe mode
+```
+
+This is intentionally transparent. There is no public `BeginBurst` / `EndBurst` workflow. The normal playback API stays the same.
+
+The important distinction is:
+
+```txt
+successful handle returned = request accepted by Riff
+active real voices          = what the mixer actually needs to render
+```
+
+In extreme tests, thousands of accepted calls may result in only a few live voices because repeated calls are coalesced or reused. This is the intended behavior for keeping VBA/Office stable under game-like SFX spam.
+
 ### Anti-Accumulation and Burst Safety
 
 The current stable Riff build includes additional guardrails for games that trigger very short sounds repeatedly. This specifically targets the situation where a gameplay loop fires the same SFX, noise burst, or oscillator many times per second and the engine appears to slow down because active voices or DSP state pile up.
@@ -219,7 +288,7 @@ Relevant runtime controls:
 ```vb
 RiffVoiceStealingEnabled = True
 
-' 0 disables explicit burst caps. This is the NEXT 1.2.1 default.
+' 0 disables explicit burst caps. This is the v1.1.3 default.
 RiffMaxVoicesPerBuffer = 0
 RiffMaxVoicesPerBus = 0
 
@@ -261,7 +330,7 @@ Riff provides **16 built-in named buses** by default:
 Main, Sfx, Music, Voice, Ui, Aux1 ... Aux11
 ```
 
-The built-in enum covers IDs `0` to `15`. In NEXT 1.2.1, the internal bus pool can be reserved or grown beyond that for advanced custom routing, but the named `RiffBusId` values remain the recommended public routing layer for normal projects.
+The built-in enum covers IDs `0` to `15`. In v1.1.3, the internal bus pool can be reserved or grown beyond that for advanced custom routing, but the named `RiffBusId` values remain the recommended public routing layer for normal projects.
 
 Buses are used to group voices. For example, all music voices can be routed to `RiffBusMusic`, all effects to `RiffBusSfx`, and all interface sounds to `RiffBusUi`.
 
@@ -413,7 +482,7 @@ End Sub
 
 Editing live VBA code while a native timer/callback is running is one of the riskiest workflows in Office. The VBE may recompile or rearrange project state while Riff is still rendering audio through the timer path. In that exact situation, a host crash can also leave the workbook/presentation in a corrupted state.
 
-NEXT 1.2.1 adds a manual editor-safe workflow:
+v1.1.3 adds a manual editor-safe workflow:
 
 ```vb
 RiffPrepareForVbeEdit
@@ -462,10 +531,10 @@ Key performance changes:
 Expected practical impact from the internal benchmark suite:
 
 ```txt
-Dry RiffPlay path:       around 11-13 us/call in the tested Office/VBA host
-Noise one-shot:          around 14-15 us/call
-Oscillator one-shot:     around 13-15 us/call
-Preset/DSP setup path:   around 20 us/call after lazy temporal-buffer optimization
+Dry RiffPlay path:       around 4-5 us/call in v1.1.3 burst-friendly paths in the tested Office/VBA host
+Noise one-shot:          around 4-5 us/call in v1.1.3 burst-friendly paths
+Oscillator one-shot:     around 4-5 us/call in v1.1.3 burst-friendly paths
+Preset/DSP setup path:   around 13 us/call including preset/DSP setup in the v1.1.3 benchmark
 Game-loop benchmark:     0 failed handles, 0 final active voices, stable memory
 ```
 
@@ -675,6 +744,17 @@ Public Enum RiffEffectPreset
     RiffFxRain = 23
     RiffFxCinematicBoom = 24
     RiffFxSoftFocus = 25
+    RiffFxCassette = 26
+    RiffFxOldComputer = 27
+    RiffFxArcadeCabinet = 28
+    RiffFxDreamMenu = 29
+    RiffFxSpaceStation = 30
+    RiffFxDungeon = 31
+    RiffFxBossRoom = 32
+    RiffFxLowHealth = 33
+    RiffFxMemoryFlashback = 34
+    RiffFxCutscene = 35
+    RiffFxCombatImpact = 36
 End Enum
 ```
 
@@ -708,6 +788,17 @@ Presets are convenience recipes applied to a voice. Use `RiffVoiceApplyPreset vo
 | `RiffFxRain` | Soft filtered rain/noise ambience. |
 | `RiffFxCinematicBoom` | Big low-heavy impact treatment. |
 | `RiffFxSoftFocus` | Smooth, softened, gentle wide tone. |
+| `RiffFxCassette` | Cassette-style warm, slightly degraded coloration. |
+| `RiffFxOldComputer` | Old PC/small digital speaker character. |
+| `RiffFxArcadeCabinet` | Arcade cabinet coloration for retro UI/game sounds. |
+| `RiffFxDreamMenu` | Soft, wide, dreamy menu atmosphere. |
+| `RiffFxSpaceStation` | Sci-fi/space ambience coloration. |
+| `RiffFxDungeon` | Dark dungeon/stone-room tone. |
+| `RiffFxBossRoom` | Larger, more tense boss-room treatment. |
+| `RiffFxLowHealth` | Filtered urgent low-health style coloration. |
+| `RiffFxMemoryFlashback` | Nostalgic/washed flashback tone. |
+| `RiffFxCutscene` | Polished cinematic cutscene treatment. |
+| `RiffFxCombatImpact` | Punchier impact treatment for hits and combat SFX. |
 
 ### RiffMasterPreset
 
@@ -738,6 +829,59 @@ Master presets apply to the final mixed output. They are used with `RiffMasterAp
 | `RiffMasterFxCinematic` | Wider, fuller, slightly compressed cinematic shaping. |
 | `RiffMasterFxNight` | Lower, softer, less bright nighttime mix. |
 | `RiffMasterFxSoftLimiter` | Safety preset focused on limiting and clipping control. |
+
+
+### RiffPreloadStatus
+
+```vb
+Public Enum RiffPreloadStatus
+    RiffPreloadPending = 0
+    RiffPreloadLoaded = 1
+    RiffPreloadFailed = 2
+End Enum
+```
+
+Used by `RiffPreloadItemStatus` to inspect individual preload queue entries.
+
+| Value | Description |
+|:---|:---|
+| `RiffPreloadPending` | The item is still waiting to be loaded. |
+| `RiffPreloadLoaded` | The item loaded successfully and was registered by key. |
+| `RiffPreloadFailed` | The item failed to load. Check `RiffLastError` and the source path. |
+
+### RiffScenePreset
+
+```vb
+Public Enum RiffScenePreset
+    RiffSceneNormal = 0
+    RiffScenePauseMenu = 1
+    RiffSceneBattle = 2
+    RiffSceneNight = 3
+    RiffSceneCave = 4
+    RiffSceneUnderwater = 5
+    RiffSceneRadioCall = 6
+    RiffSceneDream = 7
+    RiffSceneHorror = 8
+    RiffSceneRetro = 9
+    RiffSceneCinematic = 10
+End Enum
+```
+
+Scene presets are high-level mix templates. They do not load or play audio by themselves. They configure buses, persistent bus effects, master processing, limiter/headroom, and fades so sounds routed to the right buses inherit the scene color.
+
+| Scene | Typical Use |
+|:---|:---|
+| `RiffSceneNormal` | Clean/default project mix. |
+| `RiffScenePauseMenu` | Lower-energy paused state with ducked music/SFX. |
+| `RiffSceneBattle` | More intense game/combat mix. |
+| `RiffSceneNight` | Softer, darker nighttime mix. |
+| `RiffSceneCave` | Dark cave/dungeon coloration. |
+| `RiffSceneUnderwater` | Muffled underwater scene. |
+| `RiffSceneRadioCall` | Voice/music routing for radio/phone calls. |
+| `RiffSceneDream` | Wide soft dream/menu scene. |
+| `RiffSceneHorror` | Dark tense horror/drone scene. |
+| `RiffSceneRetro` | Retro/game-device coloration. |
+| `RiffSceneCinematic` | Wider, more polished cinematic mix. |
 
 ### RiffErrorCode
 
@@ -942,7 +1086,7 @@ Enables or disables the optional VBE foreground guard. When enabled, Riff may su
 RiffEditorSafeMode = True
 ```
 
-This property is disabled by default in NEXT 1.2.1 because normal tests launched from the VBE should still produce sound. Prefer the explicit `RiffPrepareForVbeEdit` / `RiffResumeAfterVbeEdit` workflow while validating a project.
+This property is disabled by default in v1.1.3 because normal tests launched from the VBE should still produce sound. Prefer the explicit `RiffPrepareForVbeEdit` / `RiffResumeAfterVbeEdit` workflow while validating a project.
 
 ### RiffEditorTimerSuspended
 
@@ -1008,7 +1152,7 @@ End If
 Public Property Get RiffMaxVoices() As Long
 ```
 
-Returns the current allocated voice capacity. In NEXT 1.2.1 this starts at `32`, but it may grow automatically or through `RiffReserveVoices`.
+Returns the current allocated voice capacity. In v1.1.3 this starts at `32`, but it may grow automatically or through `RiffReserveVoices`.
 
 ```vb
 Dim i As Long
@@ -1023,7 +1167,7 @@ Next
 Public Property Get RiffMaxBuffers() As Long
 ```
 
-Returns the current allocated buffer capacity. In NEXT 1.2.1 this starts at `64`, but it may grow automatically or through `RiffReserveBuffers`.
+Returns the current allocated buffer capacity. In v1.1.3 this starts at `64`, but it may grow automatically or through `RiffReserveBuffers`.
 
 ### RiffMaxBuses
 
@@ -1149,7 +1293,7 @@ Public Property Get RiffMaxVoicesPerBuffer() As Long
 Public Property Let RiffMaxVoicesPerBuffer(ByVal value As Long)
 ```
 
-Limits how many instances of the same loaded buffer can be active at once. This prevents a rapid-fire sound such as footsteps, bullets, UI clicks, or collision hits from piling up into a heavy mixer load. A value of `0` disables this explicit cap, which is the NEXT 1.2.1 default.
+Limits how many instances of the same loaded buffer can be active at once. This prevents a rapid-fire sound such as footsteps, bullets, UI clicks, or collision hits from piling up into a heavy mixer load. A value of `0` disables this explicit cap, which is the v1.1.3 default.
 
 ```vb
 ' Default/unlimited-by-cap behavior.
@@ -1166,7 +1310,7 @@ Public Property Get RiffMaxVoicesPerBus() As Long
 Public Property Let RiffMaxVoicesPerBus(ByVal value As Long)
 ```
 
-Limits the number of active voices routed to one bus. This helps protect the SFX bus from large gameplay bursts while still allowing music and UI buses to remain responsive. A value of `0` disables this explicit cap, which is the NEXT 1.2.1 default.
+Limits the number of active voices routed to one bus. This helps protect the SFX bus from large gameplay bursts while still allowing music and UI buses to remain responsive. A value of `0` disables this explicit cap, which is the v1.1.3 default.
 
 ```vb
 ' Default/unlimited-by-cap behavior.
@@ -1175,6 +1319,96 @@ RiffMaxVoicesPerBus = 0
 ' Optional stricter gameplay cap.
 RiffMaxVoicesPerBus = 18
 ```
+
+
+### Overload Protection and Stress Safety
+
+v1.1.3 adds an internal stress-safety layer for burst-heavy games and presentations. It is designed to keep the mixer responsive even when the user triggers thousands of audio requests in a short time.
+
+#### RiffOverloadProtectionEnabled
+
+```vb
+Public Property Get RiffOverloadProtectionEnabled() As Boolean
+Public Property Let RiffOverloadProtectionEnabled(ByVal value As Boolean)
+```
+
+Enables or disables the high-level overload protection layer. Keep this enabled for games or any project where repeated SFX can happen.
+
+```vb
+RiffOverloadProtectionEnabled = True
+```
+
+#### RiffLoopCoalescingEnabled
+
+```vb
+Public Property Get RiffLoopCoalescingEnabled() As Boolean
+Public Property Let RiffLoopCoalescingEnabled(ByVal value As Boolean)
+```
+
+When enabled, repeated attempts to start the same looped buffer on the same bus can return/reuse an existing voice instead of creating many duplicate music/ambience layers.
+
+```vb
+RiffLoopCoalescingEnabled = True
+```
+
+#### RiffMaxActiveVoices
+
+```vb
+Public Property Get RiffMaxActiveVoices() As Long
+Public Property Let RiffMaxActiveVoices(ByVal value As Long)
+```
+
+Defines the active voice budget used by overload protection. This is different from `RiffMaxVoices`, which is the allocated voice capacity. `RiffMaxActiveVoices` is the intended real-time mix budget.
+
+```vb
+RiffMaxActiveVoices = 64
+```
+
+#### RiffOverloadDroppedCount / RiffOverloadStolenCount / RiffOverloadCoalescedCount
+
+```vb
+Public Property Get RiffOverloadDroppedCount() As Long
+Public Property Get RiffOverloadStolenCount() As Long
+Public Property Get RiffOverloadCoalescedCount() As Long
+```
+
+Diagnostic counters for overload behavior.
+
+| Counter | Meaning |
+|:---|:---|
+| `RiffOverloadDroppedCount` | Requests that could not be accepted. In a healthy stress test this should usually stay `0`. |
+| `RiffOverloadStolenCount` | Voices reused/stolen to keep the active mix under budget. |
+| `RiffOverloadCoalescedCount` | Repeated requests coalesced or reused by the automatic burst layer. |
+
+#### RiffResetOverloadStats
+
+```vb
+Public Sub RiffResetOverloadStats()
+```
+
+Clears overload counters before a benchmark or gameplay test.
+
+```vb
+RiffResetOverloadStats
+```
+
+#### RiffApplyStressSafeDefaults
+
+```vb
+Public Sub RiffApplyStressSafeDefaults( _
+    Optional ByVal maxActiveVoices As Long = RIFF_DEFAULT_MAX_ACTIVE_VOICES, _
+    Optional ByVal maxVoicesPerBuffer As Long = RIFF_DEFAULT_MAX_VOICES_PER_BUFFER, _
+    Optional ByVal maxVoicesPerBus As Long = RIFF_DEFAULT_MAX_VOICES_PER_BUS _
+)
+```
+
+Applies a recommended stress-safe setup: voice stealing, overload protection, loop coalescing, active voice budget, per-buffer/per-bus caps, master headroom, limiter, and soft clipping.
+
+```vb
+RiffApplyStressSafeDefaults 64, 6, 32
+```
+
+This is a convenient setup for projects that may trigger many SFX rapidly. You can still adjust individual settings afterward.
 
 ### RiffAdaptiveQueueMs
 
@@ -1436,6 +1670,93 @@ Final output gain after master processing.
 RiffMasterOutputGain = 0.95!
 ```
 
+
+### RiffMasterLimiterEnabled / RiffMasterLimiterCeiling / RiffMasterSetLimiter
+
+```vb
+Public Property Get RiffMasterLimiterEnabled() As Boolean
+Public Property Let RiffMasterLimiterEnabled(ByVal value As Boolean)
+
+Public Property Get RiffMasterLimiterCeiling() As Single
+Public Property Let RiffMasterLimiterCeiling(ByVal value As Single)
+
+Public Sub RiffMasterSetLimiter(Optional ByVal ceiling As Single = RIFF_MASTER_LIMITER_DEFAULT_CEILING, Optional ByVal amount As Single = 1!)
+```
+
+Controls the master limiter. The limiter is useful when many SFX overlap or when `RiffApplyStressSafeDefaults` is used for heavy game-style playback.
+
+```vb
+RiffMasterProcessorEnabled = True
+RiffMasterSetLimiter 0.92!, 0.9!
+RiffMasterLimiterEnabled = True
+RiffMasterOutputGain = 0.78!
+```
+
+`ceiling` is the output ceiling before final write/clamp. `amount` controls how strongly the limiter behavior is applied by the helper.
+
+### RiffMasterBalance
+
+```vb
+Public Property Get RiffMasterBalance() As Single
+Public Property Let RiffMasterBalance(ByVal value As Single)
+```
+
+Controls final stereo balance. `0.0` is centered, negative values lean left, and positive values lean right.
+
+```vb
+RiffMasterBalance = 0!
+```
+
+### RiffMasterTiltEq
+
+```vb
+Public Property Get RiffMasterTiltEq() As Single
+Public Property Let RiffMasterTiltEq(ByVal value As Single)
+```
+
+Applies broad master tonal tilt. Positive values brighten the mix; negative values darken it.
+
+```vb
+RiffMasterTiltEq = -0.25!  ' darker
+RiffMasterTiltEq = 0.25!   ' brighter
+```
+
+### RiffMasterGetRms / RiffMasterGetRmsDb / RiffMasterRmsDb / RiffMasterPeakDb / RiffMasterClipCount
+
+```vb
+Public Sub RiffMasterGetRms(ByRef rmsLeft As Single, ByRef rmsRight As Single)
+Public Sub RiffMasterGetRmsDb(ByRef rmsLeftDb As Single, ByRef rmsRightDb As Single)
+Public Property Get RiffMasterRmsDb() As Single
+Public Property Get RiffMasterPeakDb() As Single
+Public Property Get RiffMasterClipCount() As Long
+```
+
+Returns master RMS, peak, and clip diagnostics. These are useful for balancing projects and building VU meters/debug overlays.
+
+```vb
+Dim l As Single, r As Single
+
+RiffMasterGetRms l, r
+Debug.Print "RMS:", l, r
+Debug.Print "RMS dB:", RiffMasterRmsDb
+Debug.Print "Peak dB:", RiffMasterPeakDb
+Debug.Print "Clips:", RiffMasterClipCount
+```
+
+### RiffResetDiagnostics
+
+```vb
+Public Sub RiffResetDiagnostics()
+```
+
+Clears master/bus/voice meter and clipping diagnostics before a test run.
+
+```vb
+RiffResetDiagnostics
+RiffResetOverloadStats
+RiffResetAdaptiveStats
+```
+
 ### RiffMasterClearProcessors
 
 ```vb
@@ -1563,6 +1884,27 @@ Dim l As Single, r As Single
 RiffBusGetPeak RiffBusMusic, l, r
 Debug.Print "Music bus peak:", l, r
 ```
+
+
+### RiffBusGetRms / RiffBusGetRmsDb / RiffBusClipCount
+
+```vb
+Public Sub RiffBusGetRms(ByVal busID As RiffBusId, ByRef rmsLeft As Single, ByRef rmsRight As Single)
+Public Sub RiffBusGetRmsDb(ByVal busID As RiffBusId, ByRef rmsLeftDb As Single, ByRef rmsRightDb As Single)
+Public Property Get RiffBusClipCount(ByVal busID As RiffBusId) As Long
+```
+
+Returns RMS and clipping diagnostics for a specific bus.
+
+```vb
+Dim l As Single, r As Single
+
+RiffBusGetRms RiffBusSfx, l, r
+Debug.Print "SFX RMS:", l, r
+Debug.Print "SFX clips:", RiffBusClipCount(RiffBusSfx)
+```
+
+Use this when balancing music, SFX, voice, and UI independently.
 
 ### RiffBusReset
 
@@ -1783,6 +2125,220 @@ Public Function AudioLoadAll() As Boolean
 
     AudioLoadAll = (sndClick >= 0 And sndCancel >= 0 And sndExplosion >= 0 And sndMusic >= 0)
 End Function
+```
+
+
+## Named Asset Registry
+
+The asset registry is an optional layer above numeric buffer handles. It keeps code readable in large projects by letting you load and play sounds through string keys.
+
+The registry uses dynamic arrays internally and does not require `Dictionary`, `Collection`, or external references.
+
+### RiffRegisterAsset
+
+```vb
+Public Function RiffRegisterAsset(ByVal assetKey As String, ByVal bufferHandle As Long, Optional ByVal replaceExisting As Boolean = True) As Boolean
+```
+
+Registers an existing buffer handle under a string key.
+
+```vb
+Dim h As Long
+h = RiffLoad("audio\click.wav")
+RiffRegisterAsset "ui.click", h
+```
+
+### RiffLoadAs
+
+```vb
+Public Function RiffLoadAs(ByVal assetKey As String, ByVal filePath As String, Optional ByVal replaceExisting As Boolean = True) As Long
+```
+
+Loads a file and registers it under a key. Returns the buffer handle or `-1`.
+
+```vb
+RiffLoadAs "ui.click", "audio\click.wav"
+RiffLoadAs "music.menu", "audio\menu.mp3"
+```
+
+### RiffAssetExists / RiffAssetHandle / RiffAssetPath
+
+```vb
+Public Function RiffAssetExists(ByVal assetKey As String) As Boolean
+Public Function RiffAssetHandle(ByVal assetKey As String) As Long
+Public Function RiffAssetPath(ByVal assetKey As String) As String
+```
+
+Looks up an asset by key.
+
+```vb
+If RiffAssetExists("ui.click") Then
+    Debug.Print RiffAssetHandle("ui.click")
+    Debug.Print RiffAssetPath("ui.click")
+End If
+```
+
+### RiffReloadAsset
+
+```vb
+Public Function RiffReloadAsset(ByVal assetKey As String) As Long
+```
+
+Reloads an asset from its stored source path and updates the registry entry.
+
+```vb
+RiffReloadAsset "music.menu"
+```
+
+### RiffAssetCount / RiffAssetKey
+
+```vb
+Public Function RiffAssetCount() As Long
+Public Function RiffAssetKey(ByVal assetIndex As Long) As String
+```
+
+Enumerates active registered asset keys by index.
+
+```vb
+Dim i As Long
+For i = 0 To RiffAssetCount() - 1
+    Debug.Print RiffAssetKey(i)
+Next i
+```
+
+### RiffUnloadKey / RiffClearAssets
+
+```vb
+Public Sub RiffUnloadKey(ByVal assetKey As String)
+Public Sub RiffClearAssets(Optional ByVal unloadBuffers As Boolean = True)
+```
+
+Unloads one key or clears the registry. When `unloadBuffers` is `True`, associated buffers are also unloaded.
+
+```vb
+RiffUnloadKey "sfx.explosion"
+RiffClearAssets True
+```
+
+### RiffPlayKey / RiffPlayKeyOnce / RiffPlayKeyLoop
+
+```vb
+Public Function RiffPlayKey(ByVal assetKey As String, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayKeyOnce(ByVal assetKey As String, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+Public Function RiffPlayKeyLoop(ByVal assetKey As String, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+```
+
+Plays a registered asset by key.
+
+```vb
+RiffPlayKey "ui.click", RiffBusUi
+RiffPlayKeyOnce "music.menu", RiffBusMusic, True, 0.45!
+RiffPlayKeyLoop "ambience.rain", RiffBusMusic, 0.25!
+```
+
+### RiffStopKey / RiffFadeOutKey
+
+```vb
+Public Sub RiffStopKey(ByVal assetKey As String, Optional ByVal busID As Long = -1)
+Public Sub RiffFadeOutKey(ByVal assetKey As String, Optional ByVal durationSec As Single = 0.5!, Optional ByVal busID As Long = -1)
+```
+
+Stops or fades active voices playing a registered asset. When `busID` is `-1`, all buses are searched.
+
+```vb
+RiffFadeOutKey "music.battle", 1.2!, RiffBusMusic
+RiffStopKey "ambience.rain"
+```
+
+## Cooperative Preload Queue
+
+The preload queue lets you prepare a loading screen without creating a real background thread. Add entries, start the queue, and call `RiffPreloadUpdate` during your loading loop or timer.
+
+### RiffPreloadAdd
+
+```vb
+Public Function RiffPreloadAdd(ByVal assetKey As String, ByVal filePath As String) As Long
+```
+
+Adds an item to the preload queue. Returns the queue index or `-1`.
+
+```vb
+RiffPreloadAdd "ui.click", "audio\click.wav"
+RiffPreloadAdd "music.menu", "audio\menu.mp3"
+```
+
+### RiffPreloadStart
+
+```vb
+Public Function RiffPreloadStart() As Boolean
+```
+
+Starts or restarts queue processing.
+
+```vb
+RiffPreloadStart
+```
+
+### RiffPreloadUpdate / RiffPreloadUpdateAll
+
+```vb
+Public Function RiffPreloadUpdate(Optional ByVal maxItems As Long = RIFF_PRELOAD_DEFAULT_BATCH) As Boolean
+Public Function RiffPreloadUpdateAll() As Boolean
+```
+
+Processes one or more pending items. `RiffPreloadUpdateAll` processes all remaining entries synchronously.
+
+```vb
+Do While Not RiffPreloadFinished()
+    RiffPreloadUpdate 1
+    DoEvents
+Loop
+```
+
+### RiffPreloadFinished / Progress Properties
+
+```vb
+Public Function RiffPreloadFinished() As Boolean
+Public Property Get RiffPreloadProgress() As Single
+Public Property Get RiffPreloadLoadedCount() As Long
+Public Property Get RiffPreloadFailedCount() As Long
+Public Property Get RiffPreloadTotalCount() As Long
+Public Property Get RiffPreloadCurrentKey() As String
+```
+
+Reports queue progress.
+
+```vb
+Debug.Print "Progress:", RiffPreloadProgress & "%"
+Debug.Print "Loaded:", RiffPreloadLoadedCount
+Debug.Print "Failed:", RiffPreloadFailedCount
+Debug.Print "Current:", RiffPreloadCurrentKey
+```
+
+### RiffPreloadItemStatus / RiffPreloadItemKey / RiffPreloadItemHandle
+
+```vb
+Public Function RiffPreloadItemStatus(ByVal itemIndex As Long) As RiffPreloadStatus
+Public Function RiffPreloadItemKey(ByVal itemIndex As Long) As String
+Public Function RiffPreloadItemHandle(ByVal itemIndex As Long) As Long
+```
+
+Inspects a specific queue entry.
+
+```vb
+Debug.Print RiffPreloadItemKey(0), RiffPreloadItemStatus(0), RiffPreloadItemHandle(0)
+```
+
+### RiffPreloadClear
+
+```vb
+Public Sub RiffPreloadClear(Optional ByVal unloadLoaded As Boolean = False)
+```
+
+Clears the preload queue. When `unloadLoaded` is `True`, loaded buffers from the queue are also unloaded.
+
+```vb
+RiffPreloadClear
 ```
 
 ## Export and Offline Rendering
@@ -2202,6 +2758,24 @@ Dim l As Single, r As Single
 RiffVoiceGetPeak v, l, r
 ```
 
+
+### RiffVoiceGetRms / RiffVoiceGetRmsDb / RiffVoiceClipCount
+
+```vb
+Public Sub RiffVoiceGetRms(ByVal voiceHandle As Long, ByRef rmsLeft As Single, ByRef rmsRight As Single)
+Public Sub RiffVoiceGetRmsDb(ByVal voiceHandle As Long, ByRef rmsLeftDb As Single, ByRef rmsRightDb As Single)
+Public Property Get RiffVoiceClipCount(ByVal voiceHandle As Long) As Long
+```
+
+Returns RMS and clipping diagnostics for a specific voice.
+
+```vb
+Dim l As Single, r As Single
+RiffVoiceGetRms voiceId, l, r
+Debug.Print "Voice RMS:", l, r
+Debug.Print "Voice clips:", RiffVoiceClipCount(voiceId)
+```
+
 ### RiffVoiceLoop
 
 ```vb
@@ -2500,6 +3074,54 @@ Public Sub ExitCave()
     RiffBusClearEffects RiffBusMusic
     RiffBusClearEffects RiffBusSfx
     RiffMasterApplyPreset RiffMasterFxClean
+End Sub
+```
+
+
+## Scene Templates
+
+Scene templates are high-level mix presets. They configure buses, persistent bus presets, master processors, limiter/headroom, and optional fades. They do not load or play audio by themselves.
+
+### RiffApplyScene
+
+```vb
+Public Sub RiffApplyScene(ByVal scene As RiffScenePreset, Optional ByVal amount As Single = 1!, Optional ByVal fadeMs As Long = 350)
+```
+
+Applies a scene preset.
+
+```vb
+RiffApplyScene RiffSceneCave
+RiffApplyScene RiffSceneBattle, 1!, 250
+RiffApplyScene RiffSceneRadioCall
+```
+
+Scenes work best when sounds are routed to the correct buses:
+
+```vb
+RiffPlayKeyOnce "music.cave", RiffBusMusic, True, 0.45!
+RiffPlayKey "sfx.step", RiffBusSfx
+RiffPlayKey "ui.click", RiffBusUi
+RiffPlayKey "voice.npc", RiffBusVoice
+```
+
+If everything is played on `RiffBusMain`, some scenes may appear subtle because most templates target `Music`, `Sfx`, `Voice`, and `Ui` buses.
+
+### Scene Usage Example
+
+```vb
+Public Sub EnterBattle()
+    RiffApplyScene RiffSceneBattle
+    RiffPlayKeyOnce "music.battle", RiffBusMusic, True, 0.55!
+End Sub
+
+Public Sub StartRadioCall()
+    RiffApplyScene RiffSceneRadioCall
+    RiffPlayKey "voice.commander", RiffBusVoice, False, 1!
+End Sub
+
+Public Sub ReturnToNormalMix()
+    RiffApplyScene RiffSceneNormal
 End Sub
 ```
 
@@ -3202,7 +3824,7 @@ ambience = RiffPlayNoiseLoop(RiffWavePinkNoise, RiffBusMusic, 0.04!)
 
 ### Tune Burst Caps for Game Feel
 
-In NEXT 1.2.1 the explicit burst caps default to `0`, meaning disabled. This keeps large projects from feeling artificially limited. For dense action scenes, you can opt into caps carefully while watching diagnostics.
+In v1.1.3 the explicit burst caps default to `0`, meaning disabled. This keeps large projects from feeling artificially limited. For dense action scenes, you can opt into caps carefully while watching diagnostics.
 
 ```vb
 RiffMaxVoicesPerBuffer = 4
@@ -3273,31 +3895,55 @@ RiffVoiceApplyPreset v, RiffFxRadio, 0.7!
 
 ## Performance Benchmarks
 
-The benchmark modules used during the performance pass measured burst playback, generated sources, preset setup, memory stability, active-voice cleanup, and game-loop behavior. The exact values depend on host, CPU, Office version, and audio device, but the tested performance build reached roughly:
+The v1.1.3 performance pass focuses on heavy playback bursts and long-running gameplay loops. The most important change is automatic internal burst protection: repeated calls are accepted, but the engine may coalesce/reuse voices internally so the mixer is not forced to render thousands of identical simultaneous sources.
+
+Example benchmark results from an Office/VBA host:
 
 ```txt
-Short dry RiffPlay:       ~11 us/call
-Long dry RiffPlay:        ~13 us/call
-Noise one-shot:           ~14-15 us/call
-Oscillator one-shot:      ~13-15 us/call
-Preset/DSP setup:         ~20 us/call
-Failed handles:           0
-Active voices after wait: 0
-Game-loop underruns:      0 in the final pumped-wait benchmark
-Final active voices:      0
-Memory delta:             stable / no observed leak in the benchmark runs
+Short dry RiffPlay burst:      5000 calls, 22.921 ms total, 4.584 us/call
+Long dry RiffPlay burst:       5000 calls, 22.234 ms total, 4.447 us/call
+Noise one-shot burst:          5000 calls, 24.315 ms total, 4.863 us/call
+Oscillator one-shot burst:     5000 calls, 22.946 ms total, 4.589 us/call
+Preset/DSP RiffPlay burst:     2500 calls, 32.318 ms total, 12.927 us/call
 ```
 
-The most important benchmark signs are not just low `us/call`. For real gameplay stability, also watch:
+Gameplay loop benchmark summary:
 
 ```txt
-Failed handles            should remain 0 or intentionally capped/limited
-Active voices after wait  should return to 0 for finite sounds
-Underrun delta            should stay low, ideally 0 in normal test loops
-Private MB delta          should stay stable across repeated runs
+Duration:                     60 seconds
+Target FPS:                   60
+Frames:                       3600
+Total play calls:             1827
+Failed handles:               0
+Longest frame:                0.995 ms
+Missed frame budget:          0
+Peak active voices:           7
+Active voices after wait:     0
+Underrun delta:               0
+Memory peak-start delta:      0.000 MB
 ```
 
-If a synthetic benchmark uses `Sleep` without pumping messages, the VBE/Office timer may not process enough callbacks during the wait. For audio cleanup tests, a pumped wait that periodically calls `DoEvents` gives a more realistic result inside Office.
+Important interpretation:
+
+```txt
+Success handles = playback requests accepted by Riff
+Active voices   = real voices that remained necessary for the mixer
+```
+
+In v1.1.3, a stress test can return thousands of successful handles while showing only a few active voices immediately afterward. That is not a bug. It means automatic coalescing and voice reuse protected the mixer.
+
+For complete diagnostics during a benchmark, reset and print these counters:
+
+```vb
+RiffResetDiagnostics
+RiffResetOverloadStats
+RiffResetAdaptiveStats
+
+Debug.Print "Stolen:", RiffOverloadStolenCount
+Debug.Print "Dropped:", RiffOverloadDroppedCount
+Debug.Print "Coalesced:", RiffOverloadCoalescedCount
+Debug.Print "Clip count:", RiffMasterClipCount
+```
 
 ## Troubleshooting
 
@@ -3398,7 +4044,7 @@ If IntelliSense is still stuck after a manual break or host-level interruption, 
 
 ### Project crashes or corrupts after editing code while music is playing
 
-This is the live-edit scenario that NEXT 1.2.1 specifically tries to make safer. The risky pattern is:
+This is the live-edit scenario that v1.1.3 specifically tries to make safer. The risky pattern is:
 
 ```txt
 Riff timer/callback is active
@@ -3532,6 +4178,23 @@ Debug.Print RiffBusSolo(RiffBusMusic)
 
 If any bus is soloed, non-solo buses may be silent.
 
+### 5000 calls succeed but only a few voices are active
+
+This is expected in v1.1.3 when automatic overload protection and burst coalescing are active.
+
+A successful handle means the request was accepted. It does not guarantee that every repeated request becomes a separate long-lived mixer voice. Under extreme spam, Riff may reuse/coalesce repeated calls, steal safe old voices, and protect looped music/ambience from duplication.
+
+Use these diagnostics to inspect what happened:
+
+```vb
+Debug.Print "Active:", RiffActiveVoiceCount()
+Debug.Print "Stolen:", RiffOverloadStolenCount
+Debug.Print "Dropped:", RiffOverloadDroppedCount
+Debug.Print "Coalesced:", RiffOverloadCoalescedCount
+```
+
+If you need a sound to be protected from SFX spam, route it correctly and prefer `RiffPlayOnce`/`RiffPlayKeyOnce` for music and ambience.
+
 ### `RiffPlay` returns `-1`
 
 Check:
@@ -3630,6 +4293,77 @@ Underrun delta: low and not continuously rising
 ```
 
 ## Complete Public API Index
+
+### v1.1.3 Additions
+
+```txt
+Asset Registry:
+RiffRegisterAsset
+RiffLoadAs
+RiffAssetExists
+RiffAssetHandle
+RiffAssetPath
+RiffReloadAsset
+RiffAssetCount
+RiffAssetKey
+RiffUnloadKey
+RiffClearAssets
+RiffPlayKey
+RiffPlayKeyOnce
+RiffPlayKeyLoop
+RiffStopKey
+RiffFadeOutKey
+
+Cooperative Preload:
+RiffPreloadAdd
+RiffPreloadStart
+RiffPreloadUpdate
+RiffPreloadUpdateAll
+RiffPreloadFinished
+RiffPreloadProgress
+RiffPreloadLoadedCount
+RiffPreloadFailedCount
+RiffPreloadTotalCount
+RiffPreloadCurrentKey
+RiffPreloadItemStatus
+RiffPreloadItemKey
+RiffPreloadItemHandle
+RiffPreloadClear
+
+Scenes:
+RiffApplyScene
+RiffScenePreset
+
+Overload Protection:
+RiffOverloadProtectionEnabled
+RiffLoopCoalescingEnabled
+RiffMaxActiveVoices
+RiffOverloadDroppedCount
+RiffOverloadStolenCount
+RiffOverloadCoalescedCount
+RiffResetOverloadStats
+RiffApplyStressSafeDefaults
+
+Master and Metering:
+RiffMasterLimiterEnabled
+RiffMasterLimiterCeiling
+RiffMasterSetLimiter
+RiffMasterBalance
+RiffMasterTiltEq
+RiffMasterGetRms
+RiffMasterGetRmsDb
+RiffMasterRmsDb
+RiffMasterPeakDb
+RiffMasterClipCount
+RiffBusGetRms
+RiffBusGetRmsDb
+RiffBusClipCount
+RiffVoiceGetRms
+RiffVoiceGetRmsDb
+RiffVoiceClipCount
+RiffResetDiagnostics
+```
+
 
 ### Enums
 
