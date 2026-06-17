@@ -4,9 +4,9 @@ Attribute VB_Name = "Riff"
 ' * @description A high-performance, COM-based WASAPI audio engine for VBA (x86/x64 compatible).
 ' * Contains advanced Array Chunking for zero-latency mixing, Polyphony, and a full
 ' * Studio DSP Pipeline featuring Freeverb-style Reverb, Chorus, Flanger, Compressor, Biquad EQ, Bitcrusher,
-' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, Peak Meters, musical preset packs, and master bus processors.
+' * RingMod, AutoPan, Delay, BLEP Oscillators, In-Memory Loading, WAV Export, optimized decode v-table calls, Buses, RMS/Peak Meters, asset registry, cooperative preload, scene templates, musical preset packs, and master bus processors, overload-safe playback budgets, automatic internal burst coalescing, ultra-burst fast stealing, and stress-safe voice virtualization.
 ' * @author UesleiDev
-' * @version 1.1.2
+' * @version 1.1.3
 ' */
 
 Option Explicit
@@ -22,16 +22,58 @@ Private Const RIFF_INITIAL_VOICE_CAPACITY As Long = 32
 Private Const RIFF_POOL_GROWTH_MIN As Long = 16
 
 '/** @description Default maximum simultaneous instances of the same static buffer. Use 0 to disable. */
-Private Const RIFF_DEFAULT_MAX_VOICES_PER_BUFFER As Long = 0
+Private Const RIFF_DEFAULT_MAX_VOICES_PER_BUFFER As Long = 8
 
 '/** @description Default maximum simultaneous voices routed to the same bus. Use 0 to disable. */
-Private Const RIFF_DEFAULT_MAX_VOICES_PER_BUS As Long = 0
+Private Const RIFF_DEFAULT_MAX_VOICES_PER_BUS As Long = 64
 
 '/** @description Voice cap value that disables a cap. */
 Private Const RIFF_VOICE_CAP_DISABLED As Long = 0
 
+'/** @description Default hard mix budget used by overload protection. Capacity may grow, but active audible voices stay bounded. Use 0 to disable. */
+Private Const RIFF_DEFAULT_MAX_ACTIVE_VOICES As Long = 128
+
+'/** @description Number of play requests in the same render tick before internal auto-burst coalescing starts. */
+Private Const RIFF_AUTO_BURST_THRESHOLD As Long = 8
+
+'/** @description Small fixed cache used by generated-source burst coalescing. Power-of-two for cheap masking. */
+Private Const RIFF_AUTO_BURST_CACHE_SIZE As Long = 256
+
+'/** @description Bit mask for the generated-source burst cache. */
+Private Const RIFF_AUTO_BURST_CACHE_MASK As Long = 255
+
+'/** @description Request count where the internal burst allocator starts avoiding full voice-budget scans. */
+Private Const RIFF_AUTO_BURST_FAST_STEAL_THRESHOLD As Long = 24
+
+'/** @description Smallest allowed hard mix budget when overload protection is enabled. */
+Private Const RIFF_MIN_ACTIVE_VOICE_BUDGET As Long = 8
+
 '/** @description Initial audio bus slots. Built-in bus IDs still use 0..15, and custom IDs can grow the pool. */
 Private Const RIFF_INITIAL_BUS_CAPACITY As Long = 16
+
+'/** @description Initial named asset registry slots. The registry grows automatically. */
+Private Const RIFF_INITIAL_ASSET_CAPACITY As Long = 32
+
+'/** @description Initial queued preload slots. The queue grows automatically. */
+Private Const RIFF_INITIAL_PRELOAD_CAPACITY As Long = 32
+
+'/** @description Default number of preload items processed per RiffPreloadUpdate call. */
+Private Const RIFF_PRELOAD_DEFAULT_BATCH As Long = 1
+
+'/** @description Default master limiter ceiling used by RiffMasterSetLimiter. */
+Private Const RIFF_MASTER_LIMITER_DEFAULT_CEILING As Single = 0.95!
+
+'/** @description Smoothing coefficient used by master RMS meters. */
+Private Const RIFF_MASTER_RMS_ALPHA As Single = 0.035!
+
+'/** @description Lowest decibel value returned by meter dB helpers for silence. */
+Private Const RIFF_DB_FLOOR As Single = -96!
+
+'/** @description Default threshold for the optional master noise gate. */
+Private Const RIFF_MASTER_GATE_DEFAULT_THRESHOLD As Single = 0.012!
+
+'/** @description Default floor gain for the optional master noise gate. */
+Private Const RIFF_MASTER_GATE_DEFAULT_FLOOR As Single = 0.18!
 
 
 '/** @description Default master processor low-pass control. */
@@ -81,6 +123,9 @@ Private Type RiffBus
     FadeFramesTotal As Long
     PeakL As Single
     PeakR As Single
+    RmsL As Single
+    RmsR As Single
+    ClipCount As Long
     Muted As Boolean
     Solo As Boolean
     FxEnabled As Boolean
@@ -193,6 +238,9 @@ End Type
         Active As Boolean
         BufferPtr As LongPtr
         BufferLen As Long
+        LastPlayTick As Long
+        LastPlayVoice As Long
+        LastPlayBus As Long
     End Type
 
     '/**
@@ -253,9 +301,15 @@ End Type
         IdleTimerTicks As Long
         AutoSuspendTimer As Boolean
         PlaySequence As Long
-        MaxVoicesPerBuffer As Long
-        MaxVoicesPerBus As Long
+        maxVoicesPerBuffer As Long
+        maxVoicesPerBus As Long
+        maxActiveVoices As Long
         VoiceStealingEnabled As Boolean
+        OverloadProtectionEnabled As Boolean
+        LoopCoalescingEnabled As Boolean
+        DroppedVoiceCount As Long
+        StolenVoiceCount As Long
+        CoalescedVoiceCount As Long
         EditorSafeMode As Boolean
         EditorSuspendedTimer As Boolean
         PoolMutationActive As Boolean
@@ -366,6 +420,9 @@ End Type
         Active As Boolean
         BufferPtr As Long
         BufferLen As Long
+        LastPlayTick As Long
+        LastPlayVoice As Long
+        LastPlayBus As Long
     End Type
 
     '/**
@@ -426,9 +483,15 @@ End Type
         IdleTimerTicks As Long
         AutoSuspendTimer As Boolean
         PlaySequence As Long
-        MaxVoicesPerBuffer As Long
-        MaxVoicesPerBus As Long
+        maxVoicesPerBuffer As Long
+        maxVoicesPerBus As Long
+        maxActiveVoices As Long
         VoiceStealingEnabled As Boolean
+        OverloadProtectionEnabled As Boolean
+        LoopCoalescingEnabled As Boolean
+        DroppedVoiceCount As Long
+        StolenVoiceCount As Long
+        CoalescedVoiceCount As Long
         EditorSafeMode As Boolean
         EditorSuspendedTimer As Boolean
         PoolMutationActive As Boolean
@@ -504,6 +567,17 @@ Public Enum RiffEffectPreset
     RiffFxRain = 23
     RiffFxCinematicBoom = 24
     RiffFxSoftFocus = 25
+    RiffFxCassette = 26
+    RiffFxOldComputer = 27
+    RiffFxArcadeCabinet = 28
+    RiffFxDreamMenu = 29
+    RiffFxSpaceStation = 30
+    RiffFxDungeon = 31
+    RiffFxBossRoom = 32
+    RiffFxLowHealth = 33
+    RiffFxMemoryFlashback = 34
+    RiffFxCutscene = 35
+    RiffFxCombatImpact = 36
 End Enum
 
 '/**
@@ -520,6 +594,34 @@ Public Enum RiffMasterPreset
     RiffMasterFxCinematic = 6
     RiffMasterFxNight = 7
     RiffMasterFxSoftLimiter = 8
+End Enum
+
+'/**
+' * @enum RiffScenePreset
+' * @brief Ready-to-use scene templates that configure buses and master processing together.
+' */
+Public Enum RiffScenePreset
+    RiffSceneNormal = 0
+    RiffScenePauseMenu = 1
+    RiffSceneBattle = 2
+    RiffSceneNight = 3
+    RiffSceneCave = 4
+    RiffSceneUnderwater = 5
+    RiffSceneRadioCall = 6
+    RiffSceneDream = 7
+    RiffSceneHorror = 8
+    RiffSceneRetro = 9
+    RiffSceneCinematic = 10
+End Enum
+
+'/**
+' * @enum RiffPreloadStatus
+' * @brief Status values used by the cooperative preload queue.
+' */
+Public Enum RiffPreloadStatus
+    RiffPreloadPending = 0
+    RiffPreloadLoaded = 1
+    RiffPreloadFailed = 2
 End Enum
 
 '/**
@@ -571,6 +673,9 @@ Private Type RiffVoice
     
     PeakL As Single
     PeakR As Single
+    RmsL As Single
+    RmsR As Single
+    ClipCount As Long
     
     Position As Double
     volume As Single
@@ -679,6 +784,29 @@ Private Type RiffVoice
     FadeFramesCurrent As Long
     LifeFramesTotal As Long
     LifeFramesCurrent As Long
+End Type
+
+'/**
+' * @struct RiffAssetEntry
+' * @brief Named asset registry entry mapping a stable key to a decoded buffer handle.
+' */
+Private Type RiffAssetEntry
+    Active As Boolean
+    key As String
+    SourcePath As String
+    bufferHandle As Long
+End Type
+
+'/**
+' * @struct RiffPreloadEntry
+' * @brief Cooperative preload queue item processed through RiffPreloadUpdate.
+' */
+Private Type RiffPreloadEntry
+    Active As Boolean
+    key As String
+    filePath As String
+    bufferHandle As Long
+    Status As RiffPreloadStatus
 End Type
 
 '/**
@@ -1247,6 +1375,40 @@ Private rSrcArrI32Cap As Long
 Private rMixArr16Cap As Long
 Private rSrcArr16Cap As Long
 
+'/** @description Dynamic registry of user-friendly asset keys mapped to buffer handles. */
+Private rAssets() As RiffAssetEntry
+Private rAssetCount As Long
+Private rAssetCapacity As Long
+
+'/** @description Cooperative loading queue for splash/loading screens. */
+Private rPreloadQueue() As RiffPreloadEntry
+Private rPreloadCount As Long
+Private rPreloadCapacity As Long
+Private rPreloadIndex As Long
+Private rPreloadStarted As Boolean
+Private rPreloadLoadedCount As Long
+Private rPreloadFailedCount As Long
+
+'/** @description Additional lightweight master processors and meters. */
+Private rMasterLimiterEnabled As Boolean
+Private rMasterLimiterCeiling As Single
+Private rMasterBalance As Single
+Private rMasterTiltEq As Single
+Private rMasterGateEnabled As Boolean
+Private rMasterGateThreshold As Single
+Private rMasterGateFloor As Single
+Private rMasterRmsL As Single
+Private rMasterRmsR As Single
+Private rMasterClipCount As Long
+
+'/** @description Internal automatic burst detector state. No public Begin/End API is needed. */
+Private rAutoBurstTick As Long
+Private rAutoBurstRequestCount As Long
+Private rBurstStealCursor As Long
+Private rGeneratedBurstKey(0 To RIFF_AUTO_BURST_CACHE_SIZE - 1) As Long
+Private rGeneratedBurstTick(0 To RIFF_AUTO_BURST_CACHE_SIZE - 1) As Long
+Private rGeneratedBurstVoice(0 To RIFF_AUTO_BURST_CACHE_SIZE - 1) As Long
+
 '/**
 ' * @property RiffLastError
 ' * @brief Returns the most recent RiffErrorCode set by a public API call.
@@ -1436,6 +1598,132 @@ Private Function RiffEnsureEnginePools() As Boolean
 End Function
 
 '/**
+' * @function RiffNormalizeAssetKey
+' * @brief Normalizes an asset key for case-insensitive registry lookup.
+' */
+Private Function RiffNormalizeAssetKey(ByVal assetKey As String) As String
+    RiffNormalizeAssetKey = LCase$(Trim$(assetKey))
+End Function
+
+'/**
+' * @function RiffEnsureAssetCapacity
+' * @brief Ensures the named asset registry can hold at least the requested number of entries.
+' */
+Private Function RiffEnsureAssetCapacity(ByVal requiredCapacity As Long) As Boolean
+    Dim newCapacity As Long
+
+    If requiredCapacity < RIFF_INITIAL_ASSET_CAPACITY Then requiredCapacity = RIFF_INITIAL_ASSET_CAPACITY
+    If rAssetCapacity >= requiredCapacity Then
+        RiffEnsureAssetCapacity = True
+        Exit Function
+    End If
+
+    newCapacity = RiffNextPoolCapacity(rAssetCapacity, requiredCapacity)
+    If rAssetCapacity = 0 Then
+        ReDim rAssets(0 To newCapacity - 1)
+    Else
+        ReDim Preserve rAssets(0 To newCapacity - 1)
+    End If
+    rAssetCapacity = newCapacity
+    RiffEnsureAssetCapacity = True
+End Function
+
+'/**
+' * @function RiffFindAssetIndex
+' * @brief Finds an active asset registry entry by normalized key.
+' */
+Private Function RiffFindAssetIndex(ByVal assetKey As String) As Long
+    Dim normalizedKey As String
+    Dim i As Long
+
+    RiffFindAssetIndex = -1
+    normalizedKey = RiffNormalizeAssetKey(assetKey)
+    If LenB(normalizedKey) = 0 Then Exit Function
+
+    For i = 0 To rAssetCount - 1
+        If rAssets(i).Active Then
+            If rAssets(i).key = normalizedKey Then
+                RiffFindAssetIndex = i
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+'/**
+' * @function RiffAcquireAssetSlot
+' * @brief Reuses an inactive registry slot or grows the registry.
+' */
+Private Function RiffAcquireAssetSlot() As Long
+    Dim i As Long
+
+    RiffAcquireAssetSlot = -1
+    For i = 0 To rAssetCount - 1
+        If Not rAssets(i).Active Then
+            RiffAcquireAssetSlot = i
+            Exit Function
+        End If
+    Next i
+
+    If Not RiffEnsureAssetCapacity(rAssetCount + 1) Then Exit Function
+    RiffAcquireAssetSlot = rAssetCount
+    rAssetCount = rAssetCount + 1
+End Function
+
+'/**
+' * @function RiffAssetEntryHasLiveBuffer
+' * @brief Returns True when a registry entry points to an active decoded buffer.
+' */
+Private Function RiffAssetEntryHasLiveBuffer(ByVal entryIndex As Long) As Boolean
+    Dim h As Long
+
+    If entryIndex < 0 Or entryIndex >= rAssetCount Then Exit Function
+    If Not rAssets(entryIndex).Active Then Exit Function
+
+    h = rAssets(entryIndex).bufferHandle
+    If h < 0 Or h > RiffLastBufferIndex() Then Exit Function
+
+    RiffAssetEntryHasLiveBuffer = rBuffers(h).Active
+End Function
+
+'/**
+' * @function RiffEnsurePreloadCapacity
+' * @brief Ensures the cooperative preload queue can hold at least the requested number of items.
+' */
+Private Function RiffEnsurePreloadCapacity(ByVal requiredCapacity As Long) As Boolean
+    Dim newCapacity As Long
+
+    If requiredCapacity < RIFF_INITIAL_PRELOAD_CAPACITY Then requiredCapacity = RIFF_INITIAL_PRELOAD_CAPACITY
+    If rPreloadCapacity >= requiredCapacity Then
+        RiffEnsurePreloadCapacity = True
+        Exit Function
+    End If
+
+    newCapacity = RiffNextPoolCapacity(rPreloadCapacity, requiredCapacity)
+    If rPreloadCapacity = 0 Then
+        ReDim rPreloadQueue(0 To newCapacity - 1)
+    Else
+        ReDim Preserve rPreloadQueue(0 To newCapacity - 1)
+    End If
+    rPreloadCapacity = newCapacity
+    RiffEnsurePreloadCapacity = True
+End Function
+
+'/**
+' * @function RiffSampleToDecibels
+' * @brief Converts a normalized amplitude value to dBFS with a safe silence floor.
+' */
+Private Function RiffSampleToDecibels(ByVal value As Single) As Single
+    value = Abs(value)
+    If value <= 0.0000158! Then
+        RiffSampleToDecibels = RIFF_DB_FLOOR
+    Else
+        RiffSampleToDecibels = 20! * (Log(value) / Log(10!))
+        If RiffSampleToDecibels < RIFF_DB_FLOOR Then RiffSampleToDecibels = RIFF_DB_FLOOR
+    End If
+End Function
+
+'/**
 ' * @function RiffAcquireFreeBufferSlot
 ' * @brief Finds an inactive buffer slot or grows the dynamic buffer pool when it is full.
 ' * @return {Long} Buffer slot handle, or -1 if the pool could not be grown.
@@ -1542,6 +1830,9 @@ Private Sub RiffResetBusState(ByVal busID As Long)
     rBuses(busID).FadeFramesTotal = 0
     rBuses(busID).PeakL = 0!
     rBuses(busID).PeakR = 0!
+    rBuses(busID).RmsL = 0!
+    rBuses(busID).RmsR = 0!
+    rBuses(busID).ClipCount = 0
     rBuses(busID).Muted = False
     rBuses(busID).Solo = False
     rBuses(busID).FxEnabled = False
@@ -1594,6 +1885,8 @@ Private Sub RiffTickBusFades(ByVal renderedFrames As Long)
 
         rBuses(i).PeakL = rBuses(i).PeakL * RIFF_ACTIVE_PEAK_DECAY
         rBuses(i).PeakR = rBuses(i).PeakR * RIFF_ACTIVE_PEAK_DECAY
+        rBuses(i).RmsL = rBuses(i).RmsL * RIFF_ACTIVE_PEAK_DECAY
+        rBuses(i).RmsR = rBuses(i).RmsR * RIFF_ACTIVE_PEAK_DECAY
     Next i
 End Sub
 
@@ -1855,12 +2148,34 @@ Public Function RiffOpen() As Boolean
     rCtx.LastFramesAvailable = 0
     rCtx.LastFramesWritten = 0
     rCtx.PlaySequence = 0
-    rCtx.MaxVoicesPerBuffer = RIFF_DEFAULT_MAX_VOICES_PER_BUFFER
-    rCtx.MaxVoicesPerBus = RIFF_DEFAULT_MAX_VOICES_PER_BUS
+    rCtx.maxVoicesPerBuffer = RIFF_DEFAULT_MAX_VOICES_PER_BUFFER
+    rCtx.maxVoicesPerBus = RIFF_DEFAULT_MAX_VOICES_PER_BUS
+    rCtx.maxActiveVoices = RIFF_DEFAULT_MAX_ACTIVE_VOICES
     rCtx.VoiceStealingEnabled = True
+    rCtx.OverloadProtectionEnabled = True
+    rCtx.LoopCoalescingEnabled = True
+    rCtx.DroppedVoiceCount = 0
+    rCtx.StolenVoiceCount = 0
+    rCtx.CoalescedVoiceCount = 0
     rCtx.EditorSafeMode = False
     rCtx.EditorSuspendedTimer = False
     rCtx.PoolMutationActive = False
+    rMasterLimiterEnabled = False
+    rMasterLimiterCeiling = RIFF_MASTER_LIMITER_DEFAULT_CEILING
+    rMasterBalance = 0!
+    rMasterTiltEq = 0!
+    rMasterGateEnabled = False
+    rMasterGateThreshold = RIFF_MASTER_GATE_DEFAULT_THRESHOLD
+    rMasterGateFloor = RIFF_MASTER_GATE_DEFAULT_FLOOR
+    rMasterRmsL = 0!
+    rMasterRmsR = 0!
+    rMasterClipCount = 0
+    rAutoBurstTick = 0
+    rAutoBurstRequestCount = 0
+    rBurstStealCursor = 0
+    Erase rGeneratedBurstKey
+    Erase rGeneratedBurstTick
+    Erase rGeneratedBurstVoice
 
     If Not RiffEnsureEnginePools() Then
         RiffSetLastError RiffErrorMemoryAllocation
@@ -1928,6 +2243,16 @@ Public Sub RiffClose()
     rVoiceCapacity = 0
     rBufferCapacity = 0
     rBusCapacity = 0
+    Erase rAssets
+    rAssetCount = 0
+    rAssetCapacity = 0
+    Erase rPreloadQueue
+    rPreloadCount = 0
+    rPreloadCapacity = 0
+    rPreloadIndex = 0
+    rPreloadStarted = False
+    rPreloadLoadedCount = 0
+    rPreloadFailedCount = 0
     Erase rMixArr32
     Erase rMixInt32
     Erase rSrcArr32
@@ -1940,6 +2265,12 @@ Public Sub RiffClose()
     rSrcArrI32Cap = 0
     rMixArr16Cap = 0
     rSrcArr16Cap = 0
+    rAutoBurstTick = 0
+    rAutoBurstRequestCount = 0
+    rBurstStealCursor = 0
+    Erase rGeneratedBurstKey
+    Erase rGeneratedBurstTick
+    Erase rGeneratedBurstVoice
 
     ReleaseWASAPI
     MFShutdown
@@ -2126,6 +2457,559 @@ Public Property Get RiffMaxBuses() As Long
 End Property
 
 '/**
+' * @function RiffRegisterAsset
+' * @brief Registers an existing decoded buffer under a friendly string key.
+' * @param assetKey Case-insensitive asset key such as "ui.click".
+' * @param bufferHandle Existing Riff buffer handle.
+' * @param replaceExisting True to replace an existing entry with the same key.
+' * @return {Boolean} True when the key points to a valid buffer.
+' */
+Public Function RiffRegisterAsset(ByVal assetKey As String, ByVal bufferHandle As Long, Optional ByVal replaceExisting As Boolean = True) As Boolean
+    Dim normalizedKey As String
+    Dim idx As Long
+
+    RiffRegisterAsset = False
+    normalizedKey = RiffNormalizeAssetKey(assetKey)
+    If LenB(normalizedKey) = 0 Then
+        RiffSetLastError RiffErrorInvalidArgument
+        Exit Function
+    End If
+
+    If Not RiffRequireBufferHandle(bufferHandle) Then Exit Function
+    If Not rBuffers(bufferHandle).Active Then
+        RiffSetLastError RiffErrorInvalidBuffer
+        Exit Function
+    End If
+
+    idx = RiffFindAssetIndex(normalizedKey)
+    If idx >= 0 Then
+        If Not replaceExisting Then
+            RiffRegisterAsset = RiffAssetEntryHasLiveBuffer(idx)
+            Exit Function
+        End If
+    Else
+        idx = RiffAcquireAssetSlot()
+        If idx < 0 Then
+            RiffSetLastError RiffErrorMemoryAllocation
+            Exit Function
+        End If
+    End If
+
+    rAssets(idx).Active = True
+    rAssets(idx).key = normalizedKey
+    rAssets(idx).SourcePath = vbNullString
+    rAssets(idx).bufferHandle = bufferHandle
+    RiffSetLastError RiffErrorNone
+    RiffRegisterAsset = True
+End Function
+
+'/**
+' * @function RiffLoadAs
+' * @brief Loads an audio file and stores the returned buffer handle under a friendly key.
+' * @param assetKey Case-insensitive asset key.
+' * @param filePath Audio file path.
+' * @param replaceExisting True to replace and unload an older buffer registered with this key.
+' * @return {Long} Buffer handle, or -1 on failure.
+' */
+Public Function RiffLoadAs(ByVal assetKey As String, ByVal filePath As String, Optional ByVal replaceExisting As Boolean = True) As Long
+    Dim normalizedKey As String
+    Dim idx As Long
+    Dim oldHandle As Long
+    Dim newHandle As Long
+
+    RiffLoadAs = -1
+    normalizedKey = RiffNormalizeAssetKey(assetKey)
+    If LenB(normalizedKey) = 0 Then
+        RiffSetLastError RiffErrorInvalidArgument
+        Exit Function
+    End If
+
+    idx = RiffFindAssetIndex(normalizedKey)
+    If idx >= 0 And Not replaceExisting Then
+        If RiffAssetEntryHasLiveBuffer(idx) Then
+            RiffLoadAs = rAssets(idx).bufferHandle
+            RiffSetLastError RiffErrorNone
+            Exit Function
+        End If
+    End If
+
+    newHandle = RiffLoad(filePath)
+    If newHandle < 0 Then Exit Function
+
+    If idx >= 0 Then
+        oldHandle = rAssets(idx).bufferHandle
+        If replaceExisting And oldHandle >= 0 And oldHandle <> newHandle Then
+            If oldHandle <= RiffLastBufferIndex() Then
+                If rBuffers(oldHandle).Active Then RiffUnload oldHandle
+            End If
+        End If
+    Else
+        idx = RiffAcquireAssetSlot()
+        If idx < 0 Then
+            RiffUnload newHandle
+            RiffSetLastError RiffErrorMemoryAllocation
+            Exit Function
+        End If
+    End If
+
+    rAssets(idx).Active = True
+    rAssets(idx).key = normalizedKey
+    rAssets(idx).SourcePath = filePath
+    rAssets(idx).bufferHandle = newHandle
+    RiffSetLastError RiffErrorNone
+    RiffLoadAs = newHandle
+End Function
+
+'/**
+' * @function RiffAssetExists
+' * @brief Returns True when a key exists and points to a live decoded buffer.
+' */
+Public Function RiffAssetExists(ByVal assetKey As String) As Boolean
+    RiffAssetExists = RiffAssetEntryHasLiveBuffer(RiffFindAssetIndex(assetKey))
+End Function
+
+'/**
+' * @function RiffAssetHandle
+' * @brief Returns the buffer handle stored under an asset key, or -1 when missing/invalid.
+' */
+Public Function RiffAssetHandle(ByVal assetKey As String) As Long
+    Dim idx As Long
+
+    RiffAssetHandle = -1
+    idx = RiffFindAssetIndex(assetKey)
+    If RiffAssetEntryHasLiveBuffer(idx) Then
+        RiffAssetHandle = rAssets(idx).bufferHandle
+        RiffSetLastError RiffErrorNone
+    Else
+        RiffSetLastError RiffErrorInvalidBuffer
+    End If
+End Function
+
+'/**
+' * @function RiffAssetPath
+' * @brief Returns the source path stored for an asset loaded through RiffLoadAs.
+' */
+Public Function RiffAssetPath(ByVal assetKey As String) As String
+    Dim idx As Long
+
+    idx = RiffFindAssetIndex(assetKey)
+    If idx >= 0 Then
+        RiffAssetPath = rAssets(idx).SourcePath
+        RiffSetLastError RiffErrorNone
+    Else
+        RiffSetLastError RiffErrorInvalidBuffer
+    End If
+End Function
+
+'/**
+' * @function RiffReloadAsset
+' * @brief Reloads a named asset from its stored source path.
+' */
+Public Function RiffReloadAsset(ByVal assetKey As String) As Long
+    Dim idx As Long
+    Dim path As String
+
+    RiffReloadAsset = -1
+    idx = RiffFindAssetIndex(assetKey)
+    If idx < 0 Then
+        RiffSetLastError RiffErrorInvalidBuffer
+        Exit Function
+    End If
+
+    path = rAssets(idx).SourcePath
+    If LenB(Trim$(path)) = 0 Then
+        RiffSetLastError RiffErrorInvalidArgument
+        Exit Function
+    End If
+
+    RiffReloadAsset = RiffLoadAs(rAssets(idx).key, path, True)
+End Function
+
+'/**
+' * @function RiffAssetCount
+' * @brief Returns how many active named assets currently point to live buffers.
+' */
+Public Function RiffAssetCount() As Long
+    Dim i As Long
+
+    For i = 0 To rAssetCount - 1
+        If RiffAssetEntryHasLiveBuffer(i) Then RiffAssetCount = RiffAssetCount + 1
+    Next i
+End Function
+
+'/**
+' * @function RiffAssetKey
+' * @brief Returns the active asset key at a zero-based active-asset ordinal.
+' */
+Public Function RiffAssetKey(ByVal assetIndex As Long) As String
+    Dim i As Long
+    Dim seen As Long
+
+    If assetIndex < 0 Then Exit Function
+    For i = 0 To rAssetCount - 1
+        If RiffAssetEntryHasLiveBuffer(i) Then
+            If seen = assetIndex Then
+                RiffAssetKey = rAssets(i).key
+                Exit Function
+            End If
+            seen = seen + 1
+        End If
+    Next i
+End Function
+
+'/**
+' * @function RiffUnloadKey
+' * @brief Unloads and unregisters an asset by key.
+' */
+Public Sub RiffUnloadKey(ByVal assetKey As String)
+    Dim idx As Long
+    Dim h As Long
+
+    idx = RiffFindAssetIndex(assetKey)
+    If idx < 0 Then
+        RiffSetLastError RiffErrorInvalidBuffer
+        Exit Sub
+    End If
+
+    h = rAssets(idx).bufferHandle
+    If h >= 0 And h <= RiffLastBufferIndex() Then
+        If rBuffers(h).Active Then RiffUnload h
+    End If
+
+    rAssets(idx).Active = False
+    rAssets(idx).key = vbNullString
+    rAssets(idx).SourcePath = vbNullString
+    rAssets(idx).bufferHandle = -1
+    RiffSetLastError RiffErrorNone
+End Sub
+
+'/**
+' * @function RiffClearAssets
+' * @brief Clears the named asset registry and optionally unloads every registered buffer.
+' */
+Public Sub RiffClearAssets(Optional ByVal unloadBuffers As Boolean = True)
+    Dim i As Long
+    Dim h As Long
+
+    For i = 0 To rAssetCount - 1
+        If rAssets(i).Active Then
+            If unloadBuffers Then
+                h = rAssets(i).bufferHandle
+                If h >= 0 And h <= RiffLastBufferIndex() Then
+                    If rBuffers(h).Active Then RiffUnload h
+                End If
+            End If
+            rAssets(i).Active = False
+            rAssets(i).key = vbNullString
+            rAssets(i).SourcePath = vbNullString
+            rAssets(i).bufferHandle = -1
+        End If
+    Next i
+
+    rAssetCount = 0
+    Erase rAssets
+    rAssetCapacity = 0
+    RiffSetLastError RiffErrorNone
+End Sub
+
+'/**
+' * @function RiffPlayKey
+' * @brief Plays a named asset without the caller storing the numeric buffer handle.
+' */
+Public Function RiffPlayKey(ByVal assetKey As String, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    Dim h As Long
+
+    RiffPlayKey = -1
+    h = RiffAssetHandle(assetKey)
+    If h < 0 Then Exit Function
+    RiffPlayKey = RiffPlay(h, busID, looped, volume, pan)
+End Function
+
+'/**
+' * @function RiffPlayKeyOnce
+' * @brief Plays a named asset only if that asset is not already active on the selected bus.
+' */
+Public Function RiffPlayKeyOnce(ByVal assetKey As String, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal looped As Boolean = False, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    Dim h As Long
+
+    RiffPlayKeyOnce = -1
+    h = RiffAssetHandle(assetKey)
+    If h < 0 Then Exit Function
+    RiffPlayKeyOnce = RiffPlayOnce(h, busID, looped, volume, pan)
+End Function
+
+'/**
+' * @function RiffPlayKeyLoop
+' * @brief Plays a named asset as a looped voice.
+' */
+Public Function RiffPlayKeyLoop(ByVal assetKey As String, Optional ByVal busID As RiffBusId = RiffBusMain, Optional ByVal volume As Single = RIFF_DEFAULT_VOICE_VOLUME, Optional ByVal pan As Single = 0!) As Long
+    RiffPlayKeyLoop = RiffPlayKey(assetKey, busID, True, volume, pan)
+End Function
+
+'/**
+' * @function RiffStopKey
+' * @brief Stops every active voice using a named asset. Optionally restrict to one bus by passing a bus id, or -1 for all buses.
+' */
+Public Sub RiffStopKey(ByVal assetKey As String, Optional ByVal busID As Long = -1)
+    Dim h As Long
+    Dim i As Long
+
+    h = RiffAssetHandle(assetKey)
+    If h < 0 Then Exit Sub
+
+    For i = 0 To RiffLastVoiceIndex()
+        If rVoices(i).Active Then
+            If Not rVoices(i).IsOscillator Then
+                If rVoices(i).BufferIndex = h Then
+                    If busID < 0 Or CLng(rVoices(i).busID) = busID Then
+                        RiffStop i
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Sub
+
+'/**
+' * @function RiffFadeOutKey
+' * @brief Fades out every active voice using a named asset. Optionally restrict to one bus by passing a bus id, or -1 for all buses.
+' */
+Public Sub RiffFadeOutKey(ByVal assetKey As String, Optional ByVal durationSec As Single = 0.5!, Optional ByVal busID As Long = -1)
+    Dim h As Long
+    Dim i As Long
+
+    h = RiffAssetHandle(assetKey)
+    If h < 0 Then Exit Sub
+
+    For i = 0 To RiffLastVoiceIndex()
+        If rVoices(i).Active Then
+            If Not rVoices(i).IsOscillator Then
+                If rVoices(i).BufferIndex = h Then
+                    If busID < 0 Or CLng(rVoices(i).busID) = busID Then
+                        RiffFadeOut i, durationSec
+                    End If
+                End If
+            End If
+        End If
+    Next i
+End Sub
+
+'/**
+' * @function RiffPreloadAdd
+' * @brief Adds an asset to the cooperative preload queue.
+' * @return {Long} Queue item index, or -1 on failure.
+' */
+Public Function RiffPreloadAdd(ByVal assetKey As String, ByVal filePath As String) As Long
+    Dim normalizedKey As String
+
+    RiffPreloadAdd = -1
+    normalizedKey = RiffNormalizeAssetKey(assetKey)
+    If LenB(normalizedKey) = 0 Or LenB(Trim$(filePath)) = 0 Then
+        RiffSetLastError RiffErrorInvalidArgument
+        Exit Function
+    End If
+
+    If Not RiffEnsurePreloadCapacity(rPreloadCount + 1) Then
+        RiffSetLastError RiffErrorMemoryAllocation
+        Exit Function
+    End If
+
+    rPreloadQueue(rPreloadCount).Active = True
+    rPreloadQueue(rPreloadCount).key = normalizedKey
+    rPreloadQueue(rPreloadCount).filePath = filePath
+    rPreloadQueue(rPreloadCount).bufferHandle = -1
+    rPreloadQueue(rPreloadCount).Status = RiffPreloadPending
+    RiffPreloadAdd = rPreloadCount
+    rPreloadCount = rPreloadCount + 1
+    RiffSetLastError RiffErrorNone
+End Function
+
+'/**
+' * @function RiffPreloadStart
+' * @brief Starts or restarts the cooperative preload queue.
+' */
+Public Function RiffPreloadStart() As Boolean
+    Dim i As Long
+
+    If Not rCtx.Initialized Then
+        If Not RiffOpen() Then Exit Function
+    End If
+
+    rPreloadStarted = True
+    rPreloadIndex = 0
+    rPreloadLoadedCount = 0
+    rPreloadFailedCount = 0
+
+    For i = 0 To rPreloadCount - 1
+        If rPreloadQueue(i).Active Then
+            rPreloadQueue(i).Status = RiffPreloadPending
+            rPreloadQueue(i).bufferHandle = -1
+        End If
+    Next i
+
+    RiffPreloadStart = True
+End Function
+
+'/**
+' * @function RiffPreloadUpdate
+' * @brief Processes a small batch from the preload queue and returns True when finished.
+' */
+Public Function RiffPreloadUpdate(Optional ByVal maxItems As Long = RIFF_PRELOAD_DEFAULT_BATCH) As Boolean
+    Dim processed As Long
+    Dim h As Long
+
+    If rPreloadCount <= 0 Then
+        RiffPreloadUpdate = True
+        Exit Function
+    End If
+
+    If maxItems <= 0 Then maxItems = RIFF_PRELOAD_DEFAULT_BATCH
+    If Not rPreloadStarted Then
+        If Not RiffPreloadStart() Then Exit Function
+    End If
+
+    Do While rPreloadIndex < rPreloadCount And processed < maxItems
+        If rPreloadQueue(rPreloadIndex).Active And rPreloadQueue(rPreloadIndex).Status = RiffPreloadPending Then
+            h = RiffLoadAs(rPreloadQueue(rPreloadIndex).key, rPreloadQueue(rPreloadIndex).filePath, True)
+            rPreloadQueue(rPreloadIndex).bufferHandle = h
+            If h >= 0 Then
+                rPreloadQueue(rPreloadIndex).Status = RiffPreloadLoaded
+                rPreloadLoadedCount = rPreloadLoadedCount + 1
+            Else
+                rPreloadQueue(rPreloadIndex).Status = RiffPreloadFailed
+                rPreloadFailedCount = rPreloadFailedCount + 1
+            End If
+            processed = processed + 1
+        End If
+        rPreloadIndex = rPreloadIndex + 1
+    Loop
+
+    RiffPreloadUpdate = (rPreloadIndex >= rPreloadCount)
+End Function
+
+'/**
+' * @function RiffPreloadFinished
+' * @brief Returns True when the cooperative preload queue has no remaining pending items.
+' */
+Public Function RiffPreloadFinished() As Boolean
+    RiffPreloadFinished = (rPreloadCount <= 0 Or (rPreloadStarted And rPreloadIndex >= rPreloadCount))
+End Function
+
+'/**
+' * @property RiffPreloadProgress
+' * @brief Returns preload progress as a percentage from 0 to 100.
+' */
+Public Property Get RiffPreloadProgress() As Single
+    If rPreloadCount <= 0 Then
+        RiffPreloadProgress = 100!
+    Else
+        RiffPreloadProgress = (CSng(rPreloadLoadedCount + rPreloadFailedCount) / CSng(rPreloadCount)) * 100!
+    End If
+End Property
+
+'/** @property RiffPreloadLoadedCount @brief Number of queue entries loaded successfully. */
+Public Property Get RiffPreloadLoadedCount() As Long
+    RiffPreloadLoadedCount = rPreloadLoadedCount
+End Property
+
+'/** @property RiffPreloadFailedCount @brief Number of queue entries that failed to load. */
+Public Property Get RiffPreloadFailedCount() As Long
+    RiffPreloadFailedCount = rPreloadFailedCount
+End Property
+
+'/** @property RiffPreloadTotalCount @brief Total number of queued preload entries. */
+Public Property Get RiffPreloadTotalCount() As Long
+    RiffPreloadTotalCount = rPreloadCount
+End Property
+
+'/**
+' * @property RiffPreloadCurrentKey
+' * @brief Returns the next key that will be processed by RiffPreloadUpdate.
+' */
+Public Property Get RiffPreloadCurrentKey() As String
+    If rPreloadIndex >= 0 And rPreloadIndex < rPreloadCount Then
+        RiffPreloadCurrentKey = rPreloadQueue(rPreloadIndex).key
+    End If
+End Property
+
+'/**
+' * @function RiffPreloadUpdateAll
+' * @brief Processes every remaining preload item in the current queue. Useful for blocking loading screens.
+' */
+Public Function RiffPreloadUpdateAll() As Boolean
+    RiffPreloadUpdateAll = RiffPreloadUpdate(RiffPreloadTotalCount)
+End Function
+
+'/**
+' * @function RiffPreloadItemStatus
+' * @brief Returns the status of a preload item by queue index. Invalid indexes return RiffPreloadFailed.
+' */
+Public Function RiffPreloadItemStatus(ByVal itemIndex As Long) As RiffPreloadStatus
+    If itemIndex < 0 Or itemIndex >= rPreloadCount Then
+        RiffSetLastError RiffErrorInvalidArgument
+        RiffPreloadItemStatus = RiffPreloadFailed
+        Exit Function
+    End If
+
+    RiffPreloadItemStatus = rPreloadQueue(itemIndex).Status
+    RiffSetLastError RiffErrorNone
+End Function
+
+'/**
+' * @function RiffPreloadItemKey
+' * @brief Returns the normalized asset key stored at a preload queue index.
+' */
+Public Function RiffPreloadItemKey(ByVal itemIndex As Long) As String
+    If itemIndex < 0 Or itemIndex >= rPreloadCount Then
+        RiffSetLastError RiffErrorInvalidArgument
+        Exit Function
+    End If
+
+    RiffPreloadItemKey = rPreloadQueue(itemIndex).key
+    RiffSetLastError RiffErrorNone
+End Function
+
+'/**
+' * @function RiffPreloadItemHandle
+' * @brief Returns the buffer handle produced by a preload item, or -1 if it has not loaded.
+' */
+Public Function RiffPreloadItemHandle(ByVal itemIndex As Long) As Long
+    RiffPreloadItemHandle = -1
+    If itemIndex < 0 Or itemIndex >= rPreloadCount Then
+        RiffSetLastError RiffErrorInvalidArgument
+        Exit Function
+    End If
+
+    RiffPreloadItemHandle = rPreloadQueue(itemIndex).bufferHandle
+    RiffSetLastError RiffErrorNone
+End Function
+
+'/**
+' * @function RiffPreloadClear
+' * @brief Clears the cooperative preload queue and optionally unloads keys already loaded by it.
+' */
+Public Sub RiffPreloadClear(Optional ByVal unloadLoaded As Boolean = False)
+    Dim i As Long
+
+    If unloadLoaded Then
+        For i = 0 To rPreloadCount - 1
+            If rPreloadQueue(i).Status = RiffPreloadLoaded Then
+                RiffUnloadKey rPreloadQueue(i).key
+            End If
+        Next i
+    End If
+
+    Erase rPreloadQueue
+    rPreloadCount = 0
+    rPreloadCapacity = 0
+    rPreloadIndex = 0
+    rPreloadStarted = False
+    rPreloadLoadedCount = 0
+    rPreloadFailedCount = 0
+    RiffSetLastError RiffErrorNone
+End Sub
+
+'/**
 ' * @property RiffVoiceStealingEnabled
 ' * @brief Enables or disables automatic voice stealing when rapid playback fills the voice pool.
 ' * @return {Boolean} True when voice stealing is enabled.
@@ -2149,7 +3033,7 @@ End Property
 ' * @return {Long} Current per-buffer voice cap.
 ' */
 Public Property Get RiffMaxVoicesPerBuffer() As Long
-    RiffMaxVoicesPerBuffer = rCtx.MaxVoicesPerBuffer
+    RiffMaxVoicesPerBuffer = rCtx.maxVoicesPerBuffer
 End Property
 
 '/**
@@ -2159,7 +3043,7 @@ End Property
 ' */
 Public Property Let RiffMaxVoicesPerBuffer(ByVal value As Long)
     If value < RIFF_VOICE_CAP_DISABLED Then value = RIFF_VOICE_CAP_DISABLED
-    rCtx.MaxVoicesPerBuffer = value
+    rCtx.maxVoicesPerBuffer = value
 End Property
 
 '/**
@@ -2168,7 +3052,7 @@ End Property
 ' * @return {Long} Current per-bus voice cap.
 ' */
 Public Property Get RiffMaxVoicesPerBus() As Long
-    RiffMaxVoicesPerBus = rCtx.MaxVoicesPerBus
+    RiffMaxVoicesPerBus = rCtx.maxVoicesPerBus
 End Property
 
 '/**
@@ -2178,8 +3062,116 @@ End Property
 ' */
 Public Property Let RiffMaxVoicesPerBus(ByVal value As Long)
     If value < RIFF_VOICE_CAP_DISABLED Then value = RIFF_VOICE_CAP_DISABLED
-    rCtx.MaxVoicesPerBus = value
+    rCtx.maxVoicesPerBus = value
 End Property
+
+'/**
+' * @property RiffOverloadProtectionEnabled
+' * @brief Enables stress-safe playback budgeting so burst spam steals/reuses voices instead of growing the audible mixer forever.
+' * @return {Boolean} True when overload protection is enabled.
+' */
+Public Property Get RiffOverloadProtectionEnabled() As Boolean
+    RiffOverloadProtectionEnabled = rCtx.OverloadProtectionEnabled
+End Property
+
+'/**
+' * @property RiffOverloadProtectionEnabled
+' * @brief Enables stress-safe playback budgeting so burst spam steals/reuses voices instead of growing the audible mixer forever.
+' * @param value True to enable overload protection.
+' */
+Public Property Let RiffOverloadProtectionEnabled(ByVal value As Boolean)
+    rCtx.OverloadProtectionEnabled = value
+End Property
+
+'/**
+' * @property RiffLoopCoalescingEnabled
+' * @brief When enabled, repeated looped playback of the same buffer on the same bus returns the existing voice instead of stacking duplicates.
+' * @return {Boolean} True when loop coalescing is enabled.
+' */
+Public Property Get RiffLoopCoalescingEnabled() As Boolean
+    RiffLoopCoalescingEnabled = rCtx.LoopCoalescingEnabled
+End Property
+
+'/**
+' * @property RiffLoopCoalescingEnabled
+' * @brief When enabled, repeated looped playback of the same buffer on the same bus returns the existing voice instead of stacking duplicates.
+' * @param value True to coalesce duplicate loops.
+' */
+Public Property Let RiffLoopCoalescingEnabled(ByVal value As Boolean)
+    rCtx.LoopCoalescingEnabled = value
+End Property
+
+'/**
+' * @property RiffMaxActiveVoices
+' * @brief Hard audible voice budget used by overload protection. Capacity can be higher; this controls how many voices are mixed at once. Use 0 to disable.
+' * @return {Long} Current active voice budget.
+' */
+Public Property Get RiffMaxActiveVoices() As Long
+    RiffMaxActiveVoices = rCtx.maxActiveVoices
+End Property
+
+'/**
+' * @property RiffMaxActiveVoices
+' * @brief Hard audible voice budget used by overload protection. Capacity can be higher; this controls how many voices are mixed at once. Use 0 to disable.
+' * @param value New active voice budget.
+' */
+Public Property Let RiffMaxActiveVoices(ByVal value As Long)
+    If value < RIFF_VOICE_CAP_DISABLED Then value = RIFF_VOICE_CAP_DISABLED
+    If value > RIFF_VOICE_CAP_DISABLED And value < RIFF_MIN_ACTIVE_VOICE_BUDGET Then value = RIFF_MIN_ACTIVE_VOICE_BUDGET
+    rCtx.maxActiveVoices = value
+End Property
+
+'/** @property RiffOverloadDroppedCount @brief Number of playback requests rejected because no safe voice could be reused. */
+Public Property Get RiffOverloadDroppedCount() As Long
+    RiffOverloadDroppedCount = rCtx.DroppedVoiceCount
+End Property
+
+'/** @property RiffOverloadStolenCount @brief Number of old voices reused to keep the mixer inside the active voice budget. */
+Public Property Get RiffOverloadStolenCount() As Long
+    RiffOverloadStolenCount = rCtx.StolenVoiceCount
+End Property
+
+'/** @property RiffOverloadCoalescedCount @brief Number of duplicate loop play requests redirected to an already-playing voice. */
+Public Property Get RiffOverloadCoalescedCount() As Long
+    RiffOverloadCoalescedCount = rCtx.CoalescedVoiceCount
+End Property
+
+'/**
+' * @function RiffResetOverloadStats
+' * @brief Clears overload protection counters without touching active audio.
+' */
+Public Sub RiffResetOverloadStats()
+    rCtx.DroppedVoiceCount = 0
+    rCtx.StolenVoiceCount = 0
+    rCtx.CoalescedVoiceCount = 0
+    rAutoBurstTick = rCtx.RenderTickCount
+    rAutoBurstRequestCount = 0
+    rBurstStealCursor = 0
+    Erase rGeneratedBurstKey
+    Erase rGeneratedBurstTick
+    Erase rGeneratedBurstVoice
+End Sub
+
+'/**
+' * @function RiffApplyStressSafeDefaults
+' * @brief Applies recommended anti-freeze defaults for games and SFX-heavy PowerPoint projects.
+' */
+Public Sub RiffApplyStressSafeDefaults(Optional ByVal maxActiveVoices As Long = RIFF_DEFAULT_MAX_ACTIVE_VOICES, Optional ByVal maxVoicesPerBuffer As Long = RIFF_DEFAULT_MAX_VOICES_PER_BUFFER, Optional ByVal maxVoicesPerBus As Long = RIFF_DEFAULT_MAX_VOICES_PER_BUS)
+    RiffVoiceStealingEnabled = True
+    RiffOverloadProtectionEnabled = True
+    RiffLoopCoalescingEnabled = True
+    RiffMaxActiveVoices = maxActiveVoices
+    RiffMaxVoicesPerBuffer = maxVoicesPerBuffer
+    RiffMaxVoicesPerBus = maxVoicesPerBus
+
+    ' Stress mode should protect both CPU and output level.
+    ' The voice budget prevents runaway mixing; the master headroom/limiter
+    ' prevents heavy SFX bursts from turning into hard clipping.
+    RiffMasterProcessorEnabled = True
+    RiffMasterOutputGain = 0.78!
+    RiffMasterSetLimiter 0.92!, 0.9!
+    RiffSoftClipEnabled = True
+End Sub
 
 '/**
 ' * @function RiffActiveVoiceCount
@@ -2390,6 +3382,64 @@ Public Sub RiffBusGetPeak(ByVal busID As RiffBusId, ByRef peakLeft As Single, By
     peakLeft = rBuses(busID).PeakL
     peakRight = rBuses(busID).PeakR
 End Sub
+
+'/**
+' * @function RiffBusGetRms
+' * @brief Retrieves the smoothed routed RMS energy for a bus.
+' */
+Public Sub RiffBusGetRms(ByVal busID As RiffBusId, ByRef rmsLeft As Single, ByRef rmsRight As Single)
+    If Not RiffRequireInitialized() Then
+        rmsLeft = 0!
+        rmsRight = 0!
+        Exit Sub
+    End If
+
+    busID = RiffClampBusId(busID)
+    rmsLeft = Sqr(rBuses(busID).RmsL)
+    rmsRight = Sqr(rBuses(busID).RmsR)
+End Sub
+
+'/**
+' * @function RiffBusGetRmsDb
+' * @brief Retrieves the smoothed routed RMS energy for a bus in dBFS.
+' */
+Public Sub RiffBusGetRmsDb(ByVal busID As RiffBusId, ByRef rmsLeftDb As Single, ByRef rmsRightDb As Single)
+    Dim l As Single
+    Dim r As Single
+
+    RiffBusGetRms busID, l, r
+    rmsLeftDb = RiffSampleToDecibels(l)
+    rmsRightDb = RiffSampleToDecibels(r)
+End Sub
+
+'/**
+' * @property RiffBusPeakDb
+' * @brief Returns the louder peak meter for a bus in dBFS.
+' */
+Public Property Get RiffBusPeakDb(ByVal busID As RiffBusId) As Single
+    If Not RiffRequireInitialized() Then
+        RiffBusPeakDb = RIFF_DB_FLOOR
+        Exit Property
+    End If
+
+    busID = RiffClampBusId(busID)
+    If rBuses(busID).PeakL > rBuses(busID).PeakR Then
+        RiffBusPeakDb = RiffSampleToDecibels(rBuses(busID).PeakL)
+    Else
+        RiffBusPeakDb = RiffSampleToDecibels(rBuses(busID).PeakR)
+    End If
+End Property
+
+'/**
+' * @property RiffBusClipCount
+' * @brief Returns how many routed samples from this bus exceeded full scale before final master limiting.
+' */
+Public Property Get RiffBusClipCount(ByVal busID As RiffBusId) As Long
+    If Not RiffRequireInitialized() Then Exit Property
+
+    busID = RiffClampBusId(busID)
+    RiffBusClipCount = rBuses(busID).ClipCount
+End Property
 
 '/**
 ' * @function RiffBusReset
@@ -2690,6 +3740,205 @@ Public Property Let RiffMasterOutputGain(ByVal value As Single)
 End Property
 
 '/**
+' * @property RiffMasterLimiterEnabled
+' * @brief Enables a lightweight final peak limiter before the soft clipper.
+' */
+Public Property Get RiffMasterLimiterEnabled() As Boolean
+    RiffMasterLimiterEnabled = rMasterLimiterEnabled
+End Property
+Public Property Let RiffMasterLimiterEnabled(ByVal value As Boolean)
+    rMasterLimiterEnabled = value
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterLimiterCeiling
+' * @brief Final peak limiter ceiling. Values below 1.0 leave headroom for stacked SFX.
+' */
+Public Property Get RiffMasterLimiterCeiling() As Single
+    RiffMasterLimiterCeiling = rMasterLimiterCeiling
+End Property
+Public Property Let RiffMasterLimiterCeiling(ByVal value As Single)
+    rMasterLimiterCeiling = RiffClamp(value, 0.1!, 1!)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @function RiffMasterSetLimiter
+' * @brief Convenience helper that enables the limiter and configures compressor support for heavy scenes.
+' */
+Public Sub RiffMasterSetLimiter(Optional ByVal ceiling As Single = RIFF_MASTER_LIMITER_DEFAULT_CEILING, Optional ByVal amount As Single = 1!)
+    amount = RiffClampUnit(amount)
+    rMasterLimiterEnabled = True
+    rMasterLimiterCeiling = RiffClamp(ceiling, 0.1!, 1!)
+    rCtx.MasterCompressorThreshold = RiffClamp(rMasterLimiterCeiling - (0.2! * amount), 0.08!, 1!)
+    rCtx.MasterCompressorRatio = 1.5! + (6! * amount)
+    rCtx.MasterSoftClipEnabled = True
+    RiffUpdateMasterProcessorEnabled
+End Sub
+
+'/**
+' * @property RiffMasterNoiseGateEnabled
+' * @brief Enables a gentle final master noise gate for very quiet tails or noisy scenes. Disabled by default.
+' */
+Public Property Get RiffMasterNoiseGateEnabled() As Boolean
+    RiffMasterNoiseGateEnabled = rMasterGateEnabled
+End Property
+Public Property Let RiffMasterNoiseGateEnabled(ByVal value As Boolean)
+    rMasterGateEnabled = value
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterNoiseGateThreshold
+' * @brief Peak threshold below which the optional master gate starts reducing gain.
+' */
+Public Property Get RiffMasterNoiseGateThreshold() As Single
+    RiffMasterNoiseGateThreshold = rMasterGateThreshold
+End Property
+Public Property Let RiffMasterNoiseGateThreshold(ByVal value As Single)
+    rMasterGateThreshold = RiffClamp(value, 0!, 0.5!)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterNoiseGateFloor
+' * @brief Minimum gain used by the optional gate. 0 is hard gate; higher values are softer.
+' */
+Public Property Get RiffMasterNoiseGateFloor() As Single
+    RiffMasterNoiseGateFloor = rMasterGateFloor
+End Property
+Public Property Let RiffMasterNoiseGateFloor(ByVal value As Single)
+    rMasterGateFloor = RiffClampUnit(value)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @function RiffMasterSetNoiseGate
+' * @brief Enables and configures the optional gentle master gate.
+' */
+Public Sub RiffMasterSetNoiseGate(Optional ByVal threshold As Single = RIFF_MASTER_GATE_DEFAULT_THRESHOLD, Optional ByVal floorGain As Single = RIFF_MASTER_GATE_DEFAULT_FLOOR)
+    rMasterGateEnabled = True
+    rMasterGateThreshold = RiffClamp(threshold, 0!, 0.5!)
+    rMasterGateFloor = RiffClampUnit(floorGain)
+    RiffUpdateMasterProcessorEnabled
+End Sub
+
+'/**
+' * @property RiffMasterBalance
+' * @brief Final stereo balance from -1 left to 1 right.
+' */
+Public Property Get RiffMasterBalance() As Single
+    RiffMasterBalance = rMasterBalance
+End Property
+Public Property Let RiffMasterBalance(ByVal value As Single)
+    rMasterBalance = RiffClamp(value, -1!, 1!)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @property RiffMasterTiltEq
+' * @brief Musical tilt EQ control. Negative values warm/darken, positive values brighten.
+' */
+Public Property Get RiffMasterTiltEq() As Single
+    RiffMasterTiltEq = rMasterTiltEq
+End Property
+Public Property Let RiffMasterTiltEq(ByVal value As Single)
+    rMasterTiltEq = RiffClamp(value, -1!, 1!)
+    rCtx.MasterEqBass = RiffClamp(1! - (0.22! * rMasterTiltEq), 0!, RIFF_MASTER_MAX_EQ_GAIN)
+    rCtx.MasterEqTreble = RiffClamp(1! + (0.22! * rMasterTiltEq), 0!, RIFF_MASTER_MAX_EQ_GAIN)
+    RiffUpdateMasterProcessorEnabled
+End Property
+
+'/**
+' * @function RiffMasterGetRms
+' * @brief Retrieves smoothed RMS meters for the final master output.
+' */
+Public Sub RiffMasterGetRms(ByRef rmsLeft As Single, ByRef rmsRight As Single)
+    rmsLeft = Sqr(rMasterRmsL)
+    rmsRight = Sqr(rMasterRmsR)
+End Sub
+
+'/**
+' * @function RiffMasterGetRmsDb
+' * @brief Retrieves smoothed master RMS meters in dBFS.
+' */
+Public Sub RiffMasterGetRmsDb(ByRef rmsLeftDb As Single, ByRef rmsRightDb As Single)
+    rmsLeftDb = RiffSampleToDecibels(Sqr(rMasterRmsL))
+    rmsRightDb = RiffSampleToDecibels(Sqr(rMasterRmsR))
+End Sub
+
+'/**
+' * @property RiffMasterPeakDb
+' * @brief Returns the louder master peak meter in dBFS.
+' */
+Public Property Get RiffMasterPeakDb() As Single
+    If rCtx.MasterPeakL > rCtx.MasterPeakR Then
+        RiffMasterPeakDb = RiffSampleToDecibels(rCtx.MasterPeakL)
+    Else
+        RiffMasterPeakDb = RiffSampleToDecibels(rCtx.MasterPeakR)
+    End If
+End Property
+
+'/**
+' * @property RiffMasterRmsDb
+' * @brief Returns the louder smoothed master RMS meter in dBFS.
+' */
+Public Property Get RiffMasterRmsDb() As Single
+    If rMasterRmsL > rMasterRmsR Then
+        RiffMasterRmsDb = RiffSampleToDecibels(Sqr(rMasterRmsL))
+    Else
+        RiffMasterRmsDb = RiffSampleToDecibels(Sqr(rMasterRmsR))
+    End If
+End Property
+
+'/**
+' * @property RiffMasterClipCount
+' * @brief Returns how many final master samples exceeded the safe full-scale range before limiting/soft clipping.
+' */
+Public Property Get RiffMasterClipCount() As Long
+    RiffMasterClipCount = rMasterClipCount
+End Property
+
+'/**
+' * @function RiffResetDiagnostics
+' * @brief Clears render diagnostics, peak meters, RMS meters, and clip counters.
+' */
+Public Sub RiffResetDiagnostics()
+    Dim i As Long
+
+    rCtx.UnderrunCount = 0
+    rCtx.RenderTickCount = 0
+    rCtx.LastPaddingFrames = 0
+    rCtx.LastFramesAvailable = 0
+    rCtx.LastFramesWritten = 0
+    rCtx.MasterPeakL = 0!
+    rCtx.MasterPeakR = 0!
+    rMasterRmsL = 0!
+    rMasterRmsR = 0!
+    rMasterClipCount = 0
+    RiffResetOverloadStats
+
+    For i = 0 To RiffLastBusIndex()
+        rBuses(i).PeakL = 0!
+        rBuses(i).PeakR = 0!
+        rBuses(i).RmsL = 0!
+        rBuses(i).RmsR = 0!
+        rBuses(i).ClipCount = 0
+    Next i
+
+    For i = 0 To RiffLastVoiceIndex()
+        rVoices(i).PeakL = 0!
+        rVoices(i).PeakR = 0!
+        rVoices(i).RmsL = 0!
+        rVoices(i).RmsR = 0!
+        rVoices(i).ClipCount = 0
+    Next i
+
+    RiffSetLastError RiffErrorNone
+End Sub
+
+'/**
 ' * @function RiffMasterClearProcessors
 ' * @brief Resets the additional master processor chain to a clean neutral state.
 ' */
@@ -2764,6 +4013,100 @@ Public Sub RiffMasterApplyPreset(ByVal preset As RiffMasterPreset, Optional ByVa
     End Select
 
     RiffUpdateMasterProcessorEnabled
+End Sub
+
+'/**
+' * @function RiffApplyScene
+' * @brief Applies a ready-to-use scene template across buses and master processing.
+' * @param scene Built-in scene preset.
+' * @param amount Scene strength from 0 to 1.
+' * @param fadeMs Bus fade duration in milliseconds.
+' */
+Public Sub RiffApplyScene(ByVal scene As RiffScenePreset, Optional ByVal amount As Single = 1!, Optional ByVal fadeMs As Long = 350)
+    If Not RiffRequireInitialized() Then Exit Sub
+
+    amount = RiffClampUnit(amount)
+    If fadeMs < 0 Then fadeMs = 0
+
+    Select Case scene
+        Case RiffSceneNormal
+            RiffBusClearEffects RiffBusMusic
+            RiffBusClearEffects RiffBusSfx
+            RiffBusClearEffects RiffBusVoice
+            RiffBusClearEffects RiffBusUi
+            RiffMasterClearProcessors
+            RiffBusFadeTo RiffBusMusic, 0.45!, fadeMs
+            RiffBusFadeTo RiffBusSfx, 0.85!, fadeMs
+            RiffBusFadeTo RiffBusVoice, 1!, fadeMs
+            RiffBusFadeTo RiffBusUi, 0.9!, fadeMs
+        Case RiffScenePauseMenu
+            RiffBusApplyPreset RiffBusMusic, RiffFxSoftFocus, 0.25! + (0.35! * amount)
+            RiffMasterApplyPreset RiffMasterFxNight, 0.25! + (0.35! * amount)
+            RiffBusFadeTo RiffBusMusic, 0.18! + (0.08! * (1! - amount)), fadeMs
+            RiffBusFadeTo RiffBusSfx, 0.45!, fadeMs
+            RiffBusFadeTo RiffBusUi, 1!, fadeMs
+        Case RiffSceneBattle
+            RiffBusApplyPreset RiffBusSfx, RiffFxCombatImpact, 0.25! + (0.45! * amount)
+            RiffMasterApplyPreset RiffMasterFxGlue, 0.35! + (0.35! * amount)
+            RiffMasterSetLimiter 0.94!, 0.45! + (0.35! * amount)
+            RiffBusFadeTo RiffBusMusic, 0.55!, fadeMs
+            RiffBusFadeTo RiffBusSfx, 0.95!, fadeMs
+            RiffBusFadeTo RiffBusUi, 0.82!, fadeMs
+        Case RiffSceneNight
+            RiffBusApplyPreset RiffBusMusic, RiffFxSoftFocus, 0.35! + (0.25! * amount)
+            RiffBusApplyPreset RiffBusSfx, RiffFxWarmTape, 0.18! + (0.18! * amount)
+            RiffMasterApplyPreset RiffMasterFxNight, 0.45! + (0.35! * amount)
+            RiffBusFadeTo RiffBusMusic, 0.32!, fadeMs
+            RiffBusFadeTo RiffBusSfx, 0.62!, fadeMs
+        Case RiffSceneCave
+            RiffBusApplyPreset RiffBusMusic, RiffFxDarkCave, 0.55! + (0.25! * amount)
+            RiffBusApplyPreset RiffBusSfx, RiffFxDarkCave, 0.35! + (0.35! * amount)
+            RiffMasterApplyPreset RiffMasterFxDark, 0.45! + (0.3! * amount)
+            RiffBusFadeTo RiffBusMusic, 0.38!, fadeMs
+            RiffBusFadeTo RiffBusSfx, 0.78!, fadeMs
+        Case RiffSceneUnderwater
+            RiffBusApplyPreset RiffBusMusic, RiffFxUnderwater, 0.5! + (0.28! * amount)
+            RiffBusApplyPreset RiffBusSfx, RiffFxUnderwater, 0.65! + (0.25! * amount)
+            RiffBusApplyPreset RiffBusVoice, RiffFxUnderwater, 0.35! + (0.25! * amount)
+            RiffMasterApplyPreset RiffMasterFxDark, 0.3! + (0.25! * amount)
+            RiffBusFadeTo RiffBusMusic, 0.32!, fadeMs
+            RiffBusFadeTo RiffBusSfx, 0.7!, fadeMs
+        Case RiffSceneRadioCall
+            RiffBusApplyPreset RiffBusVoice, RiffFxRadio, 0.65! + (0.25! * amount)
+            RiffBusApplyPreset RiffBusMusic, RiffFxTinySpeaker, 0.15! + (0.25! * amount)
+            RiffMasterApplyPreset RiffMasterFxRadio, 0.2! + (0.25! * amount)
+            RiffBusFadeTo RiffBusMusic, 0.18!, fadeMs
+            RiffBusFadeTo RiffBusVoice, 1!, fadeMs
+        Case RiffSceneDream
+            RiffBusApplyPreset RiffBusMusic, RiffFxDreamMenu, 0.45! + (0.35! * amount)
+            RiffBusApplyPreset RiffBusSfx, RiffFxSoftFocus, 0.28! + (0.25! * amount)
+            RiffMasterApplyPreset RiffMasterFxWarm, 0.2! + (0.25! * amount)
+            RiffBusFadeTo RiffBusMusic, 0.4!, fadeMs
+            RiffBusFadeTo RiffBusSfx, 0.62!, fadeMs
+        Case RiffSceneHorror
+            RiffBusApplyPreset RiffBusMusic, RiffFxHorrorDrone, 0.45! + (0.35! * amount)
+            RiffBusApplyPreset RiffBusSfx, RiffFxDungeon, 0.45! + (0.3! * amount)
+            RiffMasterApplyPreset RiffMasterFxDark, 0.55! + (0.25! * amount)
+            RiffMasterSetLimiter 0.92!, 0.5!
+            RiffBusFadeTo RiffBusMusic, 0.42!, fadeMs
+            RiffBusFadeTo RiffBusSfx, 0.82!, fadeMs
+        Case RiffSceneRetro
+            RiffBusApplyPreset RiffBusMusic, RiffFxArcadeCabinet, 0.5! + (0.3! * amount)
+            RiffBusApplyPreset RiffBusSfx, RiffFxOldComputer, 0.4! + (0.35! * amount)
+            RiffBusApplyPreset RiffBusUi, RiffFxGameBoy, 0.45! + (0.35! * amount)
+            RiffMasterApplyPreset RiffMasterFxBright, 0.18! + (0.2! * amount)
+            RiffBusFadeTo RiffBusMusic, 0.48!, fadeMs
+            RiffBusFadeTo RiffBusSfx, 0.85!, fadeMs
+        Case RiffSceneCinematic
+            RiffBusApplyPreset RiffBusMusic, RiffFxCutscene, 0.35! + (0.3! * amount)
+            RiffBusApplyPreset RiffBusSfx, RiffFxCinematicBoom, 0.35! + (0.35! * amount)
+            RiffMasterApplyPreset RiffMasterFxCinematic, 0.55! + (0.3! * amount)
+            RiffMasterSetLimiter 0.94!, 0.55!
+            RiffBusFadeTo RiffBusMusic, 0.52!, fadeMs
+            RiffBusFadeTo RiffBusSfx, 0.86!, fadeMs
+        Case Else
+            RiffSetLastError RiffErrorInvalidArgument
+    End Select
 End Sub
 
 '/**
@@ -3945,6 +5288,9 @@ End Function
 ' * @brief Shared implementation for all static buffer playback entry points.
 ' */
 Private Function InternalPlayBuffer(ByVal bufferHandle As Long, ByVal busID As RiffBusId, ByVal looped As Boolean, ByVal volume As Single, ByVal pan As Single) As Long
+    Dim existingLoopVoice As Long
+    Dim voiceSlot As Long
+
     InternalPlayBuffer = -1
     RiffSetLastError RiffErrorNone
 
@@ -3960,10 +5306,24 @@ Private Function InternalPlayBuffer(ByVal bufferHandle As Long, ByVal busID As R
     volume = RiffClampVoiceVolume(volume)
     pan = RiffClampVoicePan(pan)
 
-    Dim voiceSlot As Long
+    If rCtx.OverloadProtectionEnabled And rCtx.LoopCoalescingEnabled Then
+        If looped Then
+            existingLoopVoice = RiffFindPlayingVoice(bufferHandle, CLng(busID))
+            If existingLoopVoice >= 0 Then
+                rCtx.CoalescedVoiceCount = RiffSaturatingLongAdd(rCtx.CoalescedVoiceCount, 1)
+                InternalPlayBuffer = existingLoopVoice
+                Exit Function
+            End If
+        ElseIf RiffTryCoalesceBufferBurst(bufferHandle, busID, existingLoopVoice) Then
+            InternalPlayBuffer = existingLoopVoice
+            Exit Function
+        End If
+    End If
+
     voiceSlot = InternalGetFreeVoice(bufferHandle, busID)
 
     If voiceSlot = -1 Then
+        RiffNoteVoiceDrop
         RiffSetLastError RiffErrorNoFreeVoice
         Exit Function
     End If
@@ -3984,17 +5344,20 @@ Private Function InternalPlayBuffer(ByVal bufferHandle As Long, ByVal busID As R
     rCtx.PlaySequence = rCtx.PlaySequence + 1
     rVoices(voiceSlot).StartSerial = rCtx.PlaySequence
 
-    If Not RiffEnsureRenderTimer() Then
-        RiffReleaseVoice voiceSlot
-        InternalPlayBuffer = -1
-        Exit Function
+    If rCtx.TimerID = 0 Then
+        If Not RiffEnsureRenderTimer() Then
+            RiffReleaseVoice voiceSlot
+            InternalPlayBuffer = -1
+            Exit Function
+        End If
     End If
 
     RiffStartVoiceAttack voiceSlot
     rVoices(voiceSlot).Playing = True
     rVoices(voiceSlot).Active = True
     rCtx.IdleTimerTicks = 0
-    RiffAdaptiveRaiseForVoiceBurst
+    If Not rCtx.OverloadProtectionEnabled Then RiffAdaptiveRaiseForVoiceBurst
+    RiffStoreBufferBurstVoice bufferHandle, busID, voiceSlot
 
     InternalPlayBuffer = voiceSlot
 End Function
@@ -4125,9 +5488,17 @@ Private Function InternalPlayOscillator(ByVal waveType As RiffWaveType, ByVal fr
     End If
 
     Dim voiceSlot As Long
+    If rCtx.OverloadProtectionEnabled And rCtx.LoopCoalescingEnabled Then
+        If RiffTryCoalesceGeneratedBurst(waveType, frequencyHz, busID, durationSec, voiceSlot) Then
+            InternalPlayOscillator = voiceSlot
+            Exit Function
+        End If
+    End If
+
     voiceSlot = InternalGetFreeOscillatorVoice(waveType, busID)
 
     If voiceSlot = -1 Then
+        RiffNoteVoiceDrop
         RiffSetLastError RiffErrorNoFreeVoice
         Exit Function
     End If
@@ -4149,17 +5520,20 @@ Private Function InternalPlayOscillator(ByVal waveType As RiffWaveType, ByVal fr
     rVoices(voiceSlot).StartSerial = rCtx.PlaySequence
     RiffSetGeneratedVoiceLifetime voiceSlot, durationSec
 
-    If Not RiffEnsureRenderTimer() Then
-        RiffReleaseVoice voiceSlot
-        InternalPlayOscillator = -1
-        Exit Function
+    If rCtx.TimerID = 0 Then
+        If Not RiffEnsureRenderTimer() Then
+            RiffReleaseVoice voiceSlot
+            InternalPlayOscillator = -1
+            Exit Function
+        End If
     End If
 
     RiffStartVoiceAttack voiceSlot
     rVoices(voiceSlot).Playing = True
     rVoices(voiceSlot).Active = True
     rCtx.IdleTimerTicks = 0
-    RiffAdaptiveRaiseForVoiceBurst
+    If Not rCtx.OverloadProtectionEnabled Then RiffAdaptiveRaiseForVoiceBurst
+    RiffStoreGeneratedBurstVoice waveType, frequencyHz, busID, durationSec, voiceSlot
 
     InternalPlayOscillator = voiceSlot
 End Function
@@ -4174,26 +5548,43 @@ End Function
 Private Function InternalGetFreeVoice(Optional ByVal bufferHandle As Long = -1, Optional ByVal busID As RiffBusId = RiffBusMain) As Long
     Dim i As Long
     Dim firstFree As Long
+    Dim activeCount As Long
     Dim bufferCount As Long
     Dim busCount As Long
     Dim bufferSteal As Long
     Dim busSteal As Long
     Dim globalSteal As Long
+    Dim hardSteal As Long
     Dim bufferSerial As Long
     Dim busSerial As Long
     Dim globalSerial As Long
+    Dim hardSerial As Long
 
     InternalGetFreeVoice = -1
     firstFree = -1
     bufferSteal = -1
     busSteal = -1
     globalSteal = -1
+    hardSteal = -1
     bufferSerial = 2147483647
     busSerial = 2147483647
     globalSerial = 2147483647
+    hardSerial = 2147483647
+
+    If RiffAutoBurstFastStealActive() Then
+        InternalGetFreeVoice = RiffTryFastBurstSteal(busID, bufferHandle)
+        If InternalGetFreeVoice >= 0 Then Exit Function
+    End If
 
     For i = 0 To RiffLastVoiceIndex()
         If rVoices(i).Active And rVoices(i).Playing Then
+            activeCount = activeCount + 1
+
+            If rVoices(i).StartSerial < hardSerial Then
+                hardSerial = rVoices(i).StartSerial
+                hardSteal = i
+            End If
+
             If rVoices(i).busID = busID Then
                 busCount = busCount + 1
 
@@ -4232,21 +5623,46 @@ Private Function InternalGetFreeVoice(Optional ByVal bufferHandle As Long = -1, 
 
     If rCtx.VoiceStealingEnabled Then
         If bufferHandle >= 0 Then
-            If rCtx.MaxVoicesPerBuffer > RIFF_VOICE_CAP_DISABLED Then
-                If bufferCount >= rCtx.MaxVoicesPerBuffer And bufferSteal >= 0 Then
+            If rCtx.maxVoicesPerBuffer > RIFF_VOICE_CAP_DISABLED Then
+                If bufferCount >= rCtx.maxVoicesPerBuffer And bufferSteal >= 0 Then
                     RiffReleaseVoice bufferSteal
+                    rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
                     InternalGetFreeVoice = bufferSteal
                     Exit Function
                 End If
             End If
         End If
 
-        If rCtx.MaxVoicesPerBus > RIFF_VOICE_CAP_DISABLED Then
-            If busCount >= rCtx.MaxVoicesPerBus And busSteal >= 0 Then
+        If rCtx.maxVoicesPerBus > RIFF_VOICE_CAP_DISABLED Then
+            If busCount >= rCtx.maxVoicesPerBus And busSteal >= 0 Then
                 RiffReleaseVoice busSteal
+                rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
                 InternalGetFreeVoice = busSteal
                 Exit Function
             End If
+        End If
+    End If
+
+    If rCtx.OverloadProtectionEnabled And rCtx.maxActiveVoices > RIFF_VOICE_CAP_DISABLED Then
+        If activeCount >= rCtx.maxActiveVoices Then
+            If rCtx.VoiceStealingEnabled Then
+                If globalSteal >= 0 Then
+                    RiffReleaseVoice globalSteal
+                    rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
+                    InternalGetFreeVoice = globalSteal
+                    Exit Function
+                End If
+
+                If hardSteal >= 0 Then
+                    RiffReleaseVoice hardSteal
+                    rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
+                    InternalGetFreeVoice = hardSteal
+                    Exit Function
+                End If
+            End If
+
+            InternalGetFreeVoice = -1
+            Exit Function
         End If
     End If
 
@@ -4261,11 +5677,278 @@ Private Function InternalGetFreeVoice(Optional ByVal bufferHandle As Long = -1, 
         Exit Function
     End If
 
-    If rCtx.VoiceStealingEnabled And globalSteal >= 0 Then
-        RiffReleaseVoice globalSteal
-        InternalGetFreeVoice = globalSteal
+    If rCtx.VoiceStealingEnabled Then
+        If globalSteal >= 0 Then
+            RiffReleaseVoice globalSteal
+            rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
+            InternalGetFreeVoice = globalSteal
+            Exit Function
+        End If
+
+        If rCtx.OverloadProtectionEnabled And hardSteal >= 0 Then
+            RiffReleaseVoice hardSteal
+            rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
+            InternalGetFreeVoice = hardSteal
+        End If
     End If
 End Function
+
+
+'/**
+' * @function RiffSaturatingLongAdd
+' * @brief Adds a positive value to a Long counter without overflowing during long stress tests.
+' */
+Private Function RiffSaturatingLongAdd(ByVal currentValue As Long, ByVal amount As Long) As Long
+    If amount <= 0 Then
+        RiffSaturatingLongAdd = currentValue
+    ElseIf currentValue >= 2147483000 Then
+        RiffSaturatingLongAdd = 2147483000
+    ElseIf currentValue > 2147483000 - amount Then
+        RiffSaturatingLongAdd = 2147483000
+    Else
+        RiffSaturatingLongAdd = currentValue + amount
+    End If
+End Function
+
+'/**
+' * @function RiffNoteVoiceDrop
+' * @brief Records a rejected playback request for overload diagnostics.
+' */
+Private Sub RiffNoteVoiceDrop()
+    rCtx.DroppedVoiceCount = RiffSaturatingLongAdd(rCtx.DroppedVoiceCount, 1)
+End Sub
+
+'/**
+' * @function RiffAutoBurstRequest
+' * @brief Detects many play requests inside the same render tick and enables internal coalescing automatically.
+' */
+Private Function RiffAutoBurstRequest() As Boolean
+    Dim tickNow As Long
+
+    If Not rCtx.OverloadProtectionEnabled Then Exit Function
+
+    tickNow = rCtx.RenderTickCount
+    If tickNow <> rAutoBurstTick Then
+        rAutoBurstTick = tickNow
+        rAutoBurstRequestCount = 0
+    End If
+
+    If rAutoBurstRequestCount < 2147483000 Then
+        rAutoBurstRequestCount = rAutoBurstRequestCount + 1
+    End If
+
+    If rAutoBurstRequestCount >= RIFF_AUTO_BURST_THRESHOLD Then
+        RiffAutoBurstRequest = True
+        If rCtx.AdaptiveTargetQueueMs < RIFF_QUEUE_SAFE_MS Then
+            rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_SAFE_MS
+            rCtx.AdaptiveStableTicks = 0
+        End If
+    End If
+End Function
+
+'/**
+' * @function RiffAutoBurstFastStealActive
+' * @brief Returns True when a single render tick has enough play requests to use the ultra-burst allocator path.
+' */
+Private Function RiffAutoBurstFastStealActive() As Boolean
+    If Not rCtx.OverloadProtectionEnabled Then Exit Function
+    If Not rCtx.VoiceStealingEnabled Then Exit Function
+    If rAutoBurstTick <> rCtx.RenderTickCount Then Exit Function
+    RiffAutoBurstFastStealActive = (rAutoBurstRequestCount >= RIFF_AUTO_BURST_FAST_STEAL_THRESHOLD)
+End Function
+
+'/**
+' * @function RiffTryFastBurstSteal
+' * @brief Reuses an already-active non-looping voice during extreme same-tick spam without running the full allocator scan.
+' * @remarks This is intentionally private: callers keep using RiffPlay/RiffPlayNoise normally while Riff protects itself internally.
+' */
+Private Function RiffTryFastBurstSteal(ByVal busID As RiffBusId, ByVal bufferHandle As Long) As Long
+    Dim i As Long
+    Dim idx As Long
+    Dim lastIndex As Long
+    Dim startIndex As Long
+
+    RiffTryFastBurstSteal = -1
+    If Not RiffAutoBurstFastStealActive() Then Exit Function
+
+    lastIndex = RiffLastVoiceIndex()
+    If lastIndex < 0 Then Exit Function
+
+    startIndex = rBurstStealCursor
+    If startIndex < 0 Or startIndex > lastIndex Then startIndex = 0
+
+    ' First pass: prefer an old non-looping voice from the same bus. For buffer playback,
+    ' prefer the same buffer when possible so unrelated important SFX are less likely to be touched.
+    For i = 0 To lastIndex
+        idx = startIndex + i
+        If idx > lastIndex Then idx = idx - lastIndex - 1
+
+        If rVoices(idx).Active And rVoices(idx).Playing Then
+            If Not rVoices(idx).Looping Then
+                If rVoices(idx).busID = busID Then
+                    If bufferHandle < 0 Then
+                        RiffReleaseVoice idx
+                        rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
+                        rBurstStealCursor = idx + 1
+                        If rBurstStealCursor > lastIndex Then rBurstStealCursor = 0
+                        RiffTryFastBurstSteal = idx
+                        Exit Function
+                    ElseIf Not rVoices(idx).IsOscillator Then
+                        If rVoices(idx).BufferIndex = bufferHandle Then
+                            RiffReleaseVoice idx
+                            rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
+                            rBurstStealCursor = idx + 1
+                            If rBurstStealCursor > lastIndex Then rBurstStealCursor = 0
+                            RiffTryFastBurstSteal = idx
+                            Exit Function
+                        End If
+                    End If
+                End If
+            End If
+        End If
+    Next i
+
+    ' Second pass: if the same buffer was not found, steal any non-looping voice on the same bus.
+    For i = 0 To lastIndex
+        idx = startIndex + i
+        If idx > lastIndex Then idx = idx - lastIndex - 1
+
+        If rVoices(idx).Active And rVoices(idx).Playing Then
+            If Not rVoices(idx).Looping Then
+                If rVoices(idx).busID = busID Then
+                    RiffReleaseVoice idx
+                    rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
+                    rBurstStealCursor = idx + 1
+                    If rBurstStealCursor > lastIndex Then rBurstStealCursor = 0
+                    RiffTryFastBurstSteal = idx
+                    Exit Function
+                End If
+            End If
+        End If
+    Next i
+
+    ' Final pass: use any non-looping voice. Looped music/ambience remains protected.
+    For i = 0 To lastIndex
+        idx = startIndex + i
+        If idx > lastIndex Then idx = idx - lastIndex - 1
+
+        If rVoices(idx).Active And rVoices(idx).Playing Then
+            If Not rVoices(idx).Looping Then
+                RiffReleaseVoice idx
+                rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
+                rBurstStealCursor = idx + 1
+                If rBurstStealCursor > lastIndex Then rBurstStealCursor = 0
+                RiffTryFastBurstSteal = idx
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+'/**
+' * @function RiffTryCoalesceBufferBurst
+' * @brief Reuses the most recent matching static-buffer voice when the same sound is spammed inside one render tick.
+' */
+Private Function RiffTryCoalesceBufferBurst(ByVal bufferHandle As Long, ByVal busID As RiffBusId, ByRef voiceSlot As Long) As Boolean
+    Dim candidate As Long
+
+    voiceSlot = -1
+    If Not RiffAutoBurstRequest() Then Exit Function
+
+    If bufferHandle < 0 Or bufferHandle > RiffLastBufferIndex() Then Exit Function
+    If rBuffers(bufferHandle).LastPlayTick <> rCtx.RenderTickCount Then Exit Function
+    If rBuffers(bufferHandle).LastPlayBus <> CLng(busID) Then Exit Function
+
+    candidate = rBuffers(bufferHandle).LastPlayVoice
+    If candidate < 0 Or candidate > RiffLastVoiceIndex() Then Exit Function
+    If Not rVoices(candidate).Active Then Exit Function
+    If Not rVoices(candidate).Playing Then Exit Function
+    If rVoices(candidate).IsOscillator Then Exit Function
+    If rVoices(candidate).BufferIndex <> bufferHandle Then Exit Function
+    If rVoices(candidate).busID <> busID Then Exit Function
+
+    rCtx.CoalescedVoiceCount = RiffSaturatingLongAdd(rCtx.CoalescedVoiceCount, 1)
+    voiceSlot = candidate
+    RiffTryCoalesceBufferBurst = True
+End Function
+
+'/**
+' * @function RiffStoreBufferBurstVoice
+' * @brief Stores the last static-buffer voice for automatic same-tick burst coalescing.
+' */
+Private Sub RiffStoreBufferBurstVoice(ByVal bufferHandle As Long, ByVal busID As RiffBusId, ByVal voiceSlot As Long)
+    If bufferHandle < 0 Or bufferHandle > RiffLastBufferIndex() Then Exit Sub
+    rBuffers(bufferHandle).LastPlayTick = rCtx.RenderTickCount
+    rBuffers(bufferHandle).LastPlayBus = CLng(busID)
+    rBuffers(bufferHandle).LastPlayVoice = voiceSlot
+End Sub
+
+'/**
+' * @function RiffGeneratedBurstSignature
+' * @brief Builds a lightweight key for generated oscillator/noise requests.
+' */
+Private Function RiffGeneratedBurstSignature(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, ByVal durationSec As Single) As Long
+    Dim freqCode As Long
+    Dim durationCode As Long
+    Dim k As Long
+
+    freqCode = CLng(frequencyHz * 10!)
+    durationCode = CLng(durationSec * 1000!)
+    k = (CLng(waveType) * 131) Xor (CLng(busID) * 17) Xor (freqCode * 3) Xor (durationCode * 7)
+    If k < 0 Then k = -k
+    If k = 0 Then k = 1
+    RiffGeneratedBurstSignature = k
+End Function
+
+'/**
+' * @function RiffTryCoalesceGeneratedBurst
+' * @brief Reuses a recent generated source when oscillator/noise spam repeats in one render tick.
+' */
+Private Function RiffTryCoalesceGeneratedBurst(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, ByVal durationSec As Single, ByRef voiceSlot As Long) As Boolean
+    Dim key As Long
+    Dim idx As Long
+    Dim candidate As Long
+
+    voiceSlot = -1
+    If durationSec <= 0! Then Exit Function
+    If Not RiffAutoBurstRequest() Then Exit Function
+
+    key = RiffGeneratedBurstSignature(waveType, frequencyHz, busID, durationSec)
+    idx = key And RIFF_AUTO_BURST_CACHE_MASK
+
+    If rGeneratedBurstKey(idx) <> key Then Exit Function
+    If rGeneratedBurstTick(idx) <> rCtx.RenderTickCount Then Exit Function
+
+    candidate = rGeneratedBurstVoice(idx)
+    If candidate < 0 Or candidate > RiffLastVoiceIndex() Then Exit Function
+    If Not rVoices(candidate).Active Then Exit Function
+    If Not rVoices(candidate).Playing Then Exit Function
+    If Not rVoices(candidate).IsOscillator Then Exit Function
+    If rVoices(candidate).OscType <> waveType Then Exit Function
+    If rVoices(candidate).busID <> busID Then Exit Function
+    If Abs(rVoices(candidate).OscFreq - frequencyHz) > 0.01! Then Exit Function
+
+    rCtx.CoalescedVoiceCount = RiffSaturatingLongAdd(rCtx.CoalescedVoiceCount, 1)
+    voiceSlot = candidate
+    RiffTryCoalesceGeneratedBurst = True
+End Function
+
+'/**
+' * @function RiffStoreGeneratedBurstVoice
+' * @brief Stores a generated source voice in the small automatic burst cache.
+' */
+Private Sub RiffStoreGeneratedBurstVoice(ByVal waveType As RiffWaveType, ByVal frequencyHz As Single, ByVal busID As RiffBusId, ByVal durationSec As Single, ByVal voiceSlot As Long)
+    Dim key As Long
+    Dim idx As Long
+
+    If durationSec <= 0! Then Exit Sub
+
+    key = RiffGeneratedBurstSignature(waveType, frequencyHz, busID, durationSec)
+    idx = key And RIFF_AUTO_BURST_CACHE_MASK
+    rGeneratedBurstKey(idx) = key
+    rGeneratedBurstTick(idx) = rCtx.RenderTickCount
+    rGeneratedBurstVoice(idx) = voiceSlot
+End Sub
 
 '/**
 ' * @function RiffReleaseVoice
@@ -4376,6 +6059,7 @@ Private Function InternalGetFreeOscillatorVoice(ByVal waveType As RiffWaveType, 
                 InternalGetFreeOscillatorVoice = RiffFindStealVoiceForOscillator(waveType, busID)
                 If InternalGetFreeOscillatorVoice >= 0 Then
                     RiffReleaseVoice InternalGetFreeOscillatorVoice
+                    rCtx.StolenVoiceCount = RiffSaturatingLongAdd(rCtx.StolenVoiceCount, 1)
                     Exit Function
                 End If
             End If
@@ -4521,6 +6205,9 @@ Private Sub InternalResetVoiceDSP(ByVal slot As Long)
     rVoices(slot).NoiseBrown = 0!
     rVoices(slot).PeakL = 0!
     rVoices(slot).PeakR = 0!
+    rVoices(slot).RmsL = 0!
+    rVoices(slot).RmsR = 0!
+    rVoices(slot).ClipCount = 0
 
     rVoices(slot).Distortion = RIFF_DEFAULT_DISTORTION
     rVoices(slot).lowPass = RIFF_DEFAULT_FILTER_CONTROL
@@ -4966,6 +6653,60 @@ Public Sub RiffVoiceGetPeak(ByVal voiceHandle As Long, ByRef peakLeft As Single,
     peakRight = rVoices(voiceHandle).PeakR
 End Sub
 
+'/**
+' * @function RiffVoiceGetRms
+' * @brief Retrieves the smoothed RMS meter for a voice.
+' */
+Public Sub RiffVoiceGetRms(ByVal voiceHandle As Long, ByRef rmsLeft As Single, ByRef rmsRight As Single)
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        rmsLeft = 0!
+        rmsRight = 0!
+        Exit Sub
+    End If
+
+    rmsLeft = Sqr(rVoices(voiceHandle).RmsL)
+    rmsRight = Sqr(rVoices(voiceHandle).RmsR)
+End Sub
+
+'/**
+' * @function RiffVoiceGetRmsDb
+' * @brief Retrieves the smoothed RMS meter for a voice in dBFS.
+' */
+Public Sub RiffVoiceGetRmsDb(ByVal voiceHandle As Long, ByRef rmsLeftDb As Single, ByRef rmsRightDb As Single)
+    Dim l As Single
+    Dim r As Single
+
+    RiffVoiceGetRms voiceHandle, l, r
+    rmsLeftDb = RiffSampleToDecibels(l)
+    rmsRightDb = RiffSampleToDecibels(r)
+End Sub
+
+'/**
+' * @property RiffVoicePeakDb
+' * @brief Returns the louder peak meter for a voice in dBFS.
+' */
+Public Property Get RiffVoicePeakDb(ByVal voiceHandle As Long) As Single
+    If Not RiffRequireVoiceHandle(voiceHandle) Then
+        RiffVoicePeakDb = RIFF_DB_FLOOR
+        Exit Property
+    End If
+
+    If rVoices(voiceHandle).PeakL > rVoices(voiceHandle).PeakR Then
+        RiffVoicePeakDb = RiffSampleToDecibels(rVoices(voiceHandle).PeakL)
+    Else
+        RiffVoicePeakDb = RiffSampleToDecibels(rVoices(voiceHandle).PeakR)
+    End If
+End Property
+
+'/**
+' * @property RiffVoiceClipCount
+' * @brief Returns how many routed samples from this voice exceeded full scale before final master limiting.
+' */
+Public Property Get RiffVoiceClipCount(ByVal voiceHandle As Long) As Long
+    If Not RiffRequireVoiceHandle(voiceHandle) Then Exit Property
+    RiffVoiceClipCount = rVoices(voiceHandle).ClipCount
+End Property
+
 
 '/**
 ' * @function RiffVoiceClearEffects
@@ -5336,6 +7077,80 @@ Public Sub RiffVoiceApplyPreset(ByVal voiceHandle As Long, ByVal preset As RiffE
             RiffVoiceSetReverb voiceHandle, 0.22! * amount, 0.48! + (0.22! * amount)
             RiffVoiceSetChorus voiceHandle, 0.12! * amount, 0.35! + (0.12! * amount)
             rVoices(voiceHandle).StereoWidth = 1! + (0.35! * amount)
+        Case RiffFxCassette
+            rVoices(voiceHandle).BitcrushSteps = 2 ^ (14.5! - (2.2! * amount))
+            rVoices(voiceHandle).BitcrushDownsample = 1
+            rVoices(voiceHandle).Distortion = 1! + (0.22! * amount)
+            rVoices(voiceHandle).lowPass = 1! - (0.22! * amount)
+            If rVoices(voiceHandle).lowPass < 0.72! Then rVoices(voiceHandle).lowPass = 0.72!
+            rVoices(voiceHandle).EqBass = 1! + (0.12! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.16! * amount)
+            RiffVoiceSetChorus voiceHandle, 0.035! * amount, 0.18! + (0.08! * amount)
+        Case RiffFxOldComputer
+            rVoices(voiceHandle).BitcrushSteps = 2 ^ (9! + (2! * (1! - amount)))
+            rVoices(voiceHandle).BitcrushDownsample = 2 + CLng(3! * amount)
+            rVoices(voiceHandle).lowPass = 1! - (0.38! * amount)
+            rVoices(voiceHandle).highPass = 0.08! * amount
+            rVoices(voiceHandle).EqMid = 1! + (0.25! * amount)
+        Case RiffFxArcadeCabinet
+            rVoices(voiceHandle).BitcrushSteps = 2 ^ (11! - (2! * amount))
+            rVoices(voiceHandle).BitcrushDownsample = 1 + CLng(2! * amount)
+            rVoices(voiceHandle).EqBass = 1! + (0.1! * amount)
+            rVoices(voiceHandle).EqMid = 1! + (0.2! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.08! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.68! - (0.12! * amount)
+            rVoices(voiceHandle).CompRatio = 1.6! + (1.8! * amount)
+        Case RiffFxDreamMenu
+            RiffVoiceSetReverb voiceHandle, 0.34! * amount, 0.62! + (0.22! * amount)
+            RiffVoiceSetChorus voiceHandle, 0.24! * amount, 0.42! + (0.2! * amount)
+            RiffVoiceSetDelay voiceHandle, 0.36!, 0.18! * amount, 0.14! * amount
+            rVoices(voiceHandle).StereoWidth = 1! + (0.75! * amount)
+            rVoices(voiceHandle).lowPass = 1! - (0.12! * amount)
+        Case RiffFxSpaceStation
+            rVoices(voiceHandle).RingModFreq = 18! + (72! * amount)
+            rVoices(voiceHandle).RingModMix = 0.05! + (0.18! * amount)
+            RiffVoiceSetChorus voiceHandle, 0.18! * amount, 0.34! + (0.18! * amount)
+            RiffVoiceSetReverb voiceHandle, 0.24! * amount, 0.52! + (0.2! * amount)
+            rVoices(voiceHandle).StereoWidth = 1! + (0.55! * amount)
+        Case RiffFxDungeon
+            RiffVoiceSetReverb voiceHandle, 0.46! * amount, 0.72! + (0.18! * amount)
+            RiffVoiceSetDelay voiceHandle, 0.52!, 0.18! * amount, 0.14! * amount
+            rVoices(voiceHandle).lowPass = 1! - (0.36! * amount)
+            If rVoices(voiceHandle).lowPass < 0.48! Then rVoices(voiceHandle).lowPass = 0.48!
+            rVoices(voiceHandle).EqBass = 1! + (0.16! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.28! * amount)
+        Case RiffFxBossRoom
+            rVoices(voiceHandle).EqBass = 1! + (0.32! * amount)
+            rVoices(voiceHandle).EqMid = 1! + (0.08! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.12! * amount)
+            RiffVoiceSetReverb voiceHandle, 0.24! * amount, 0.48! + (0.22! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.6! - (0.1! * amount)
+            rVoices(voiceHandle).CompRatio = 2.2! + (2.2! * amount)
+        Case RiffFxLowHealth
+            rVoices(voiceHandle).lowPass = 1! - (0.28! * amount)
+            rVoices(voiceHandle).TremoloRate = 1.8! + (1.2! * amount)
+            rVoices(voiceHandle).TremoloDepth = 0.18! + (0.32! * amount)
+            rVoices(voiceHandle).EqBass = 1! + (0.12! * amount)
+            rVoices(voiceHandle).EqTreble = 1! - (0.22! * amount)
+        Case RiffFxMemoryFlashback
+            rVoices(voiceHandle).lowPass = 1! - (0.32! * amount)
+            rVoices(voiceHandle).StereoWidth = 1! + (0.9! * amount)
+            RiffVoiceSetReverb voiceHandle, 0.38! * amount, 0.68! + (0.18! * amount)
+            RiffVoiceSetDelay voiceHandle, 0.28!, 0.18! * amount, 0.16! * amount
+            RiffVoiceSetChorus voiceHandle, 0.18! * amount, 0.28! + (0.14! * amount)
+        Case RiffFxCutscene
+            RiffVoiceSetReverb voiceHandle, 0.26! * amount, 0.55! + (0.2! * amount)
+            rVoices(voiceHandle).StereoWidth = 1! + (0.5! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.74! - (0.12! * amount)
+            rVoices(voiceHandle).CompRatio = 1.4! + (1.1! * amount)
+            rVoices(voiceHandle).EqBass = 1! + (0.1! * amount)
+        Case RiffFxCombatImpact
+            rVoices(voiceHandle).EqBass = 1! + (0.26! * amount)
+            rVoices(voiceHandle).EqMid = 1! + (0.14! * amount)
+            rVoices(voiceHandle).Distortion = 1! + (0.22! * amount)
+            rVoices(voiceHandle).CompThreshold = 0.58! - (0.1! * amount)
+            rVoices(voiceHandle).CompRatio = 2! + (2.4! * amount)
+            RiffVoiceSetReverb voiceHandle, 0.08! * amount, 0.24! + (0.12! * amount)
 
         Case Else
             RiffSetLastError RiffErrorInvalidArgument
@@ -5352,7 +7167,7 @@ End Sub
 ' */
 Private Function RiffIsValidEffectPreset(ByVal preset As RiffEffectPreset) As Boolean
     Select Case preset
-        Case RiffFxDry, RiffFxSmallRoom, RiffFxHall, RiffFxCathedral, RiffFxSlapback, RiffFxEcho, RiffFxChorus, RiffFxFlanger, RiffFxLoFi, RiffFxRadio, RiffFxUnderwater, RiffFxWide, RiffFxRobot, RiffFxAmbient, RiffFxWarmTape, RiffFxVHS, RiffFxDreamPad, RiffFxDarkCave, RiffFxTinySpeaker, RiffFxMegaphone, RiffFxGameBoy, RiffFxHorrorDrone, RiffFxWind, RiffFxRain, RiffFxCinematicBoom, RiffFxSoftFocus
+        Case RiffFxDry, RiffFxSmallRoom, RiffFxHall, RiffFxCathedral, RiffFxSlapback, RiffFxEcho, RiffFxChorus, RiffFxFlanger, RiffFxLoFi, RiffFxRadio, RiffFxUnderwater, RiffFxWide, RiffFxRobot, RiffFxAmbient, RiffFxWarmTape, RiffFxVHS, RiffFxDreamPad, RiffFxDarkCave, RiffFxTinySpeaker, RiffFxMegaphone, RiffFxGameBoy, RiffFxHorrorDrone, RiffFxWind, RiffFxRain, RiffFxCinematicBoom, RiffFxSoftFocus, RiffFxCassette, RiffFxOldComputer, RiffFxArcadeCabinet, RiffFxDreamMenu, RiffFxSpaceStation, RiffFxDungeon, RiffFxBossRoom, RiffFxLowHealth, RiffFxMemoryFlashback, RiffFxCutscene, RiffFxCombatImpact
             RiffIsValidEffectPreset = True
     End Select
 End Function
@@ -6308,6 +8123,13 @@ Private Sub RiffResetMasterProcessorState()
     rCtx.MasterEqLowR = 0!
     rCtx.MasterEqHighL = 0!
     rCtx.MasterEqHighR = 0!
+    rMasterLimiterEnabled = False
+    rMasterLimiterCeiling = RIFF_MASTER_LIMITER_DEFAULT_CEILING
+    rMasterBalance = 0!
+    rMasterTiltEq = 0!
+    rMasterGateEnabled = False
+    rMasterGateThreshold = RIFF_MASTER_GATE_DEFAULT_THRESHOLD
+    rMasterGateFloor = RIFF_MASTER_GATE_DEFAULT_FLOOR
 End Sub
 
 '/**
@@ -6325,7 +8147,11 @@ Private Sub RiffUpdateMasterProcessorEnabled()
         (Abs(rCtx.MasterCompressorRatio - RIFF_MASTER_DEFAULT_COMP_RATIO) > 0.0001!) Or _
         (Abs(rCtx.MasterDrive - RIFF_MASTER_DEFAULT_DRIVE) > 0.0001!) Or _
         (Abs(rCtx.MasterStereoWidth - RIFF_UNITY_GAIN) > 0.0001!) Or _
-        (Abs(rCtx.MasterOutputGain - RIFF_MASTER_DEFAULT_OUTPUT_GAIN) > 0.0001!)
+        (Abs(rCtx.MasterOutputGain - RIFF_MASTER_DEFAULT_OUTPUT_GAIN) > 0.0001!) Or _
+        rMasterLimiterEnabled Or _
+        rMasterGateEnabled Or _
+        (Abs(rMasterBalance) > 0.0001!) Or _
+        (Abs(rMasterTiltEq) > 0.0001!)
 End Sub
 
 '/**
@@ -6430,12 +8256,48 @@ Private Sub RiffProcessMasterPair(ByRef leftSample As Single, ByRef rightSample 
         End If
     End If
 
+    If rMasterGateEnabled Then
+        pk = Abs(l)
+        If Abs(r) > pk Then pk = Abs(r)
+        If rMasterGateThreshold > 0! And pk < rMasterGateThreshold Then
+            gain = rMasterGateFloor + ((1! - rMasterGateFloor) * (pk / rMasterGateThreshold))
+            l = l * gain
+            r = r * gain
+        End If
+    End If
+
+    If Abs(rMasterBalance) > 0.0001! Then
+        If rMasterBalance > 0! Then
+            l = l * (1! - rMasterBalance)
+        Else
+            r = r * (1! + rMasterBalance)
+        End If
+    End If
+
+    If rMasterLimiterEnabled Then
+        pk = Abs(l)
+        If Abs(r) > pk Then pk = Abs(r)
+        If pk > rMasterLimiterCeiling And pk > 0.000001! Then
+            gain = rMasterLimiterCeiling / pk
+            l = l * gain
+            r = r * gain
+        End If
+    End If
+
+    rMasterRmsL = rMasterRmsL + (((l * l) - rMasterRmsL) * RIFF_MASTER_RMS_ALPHA)
+    rMasterRmsR = rMasterRmsR + (((r * r) - rMasterRmsR) * RIFF_MASTER_RMS_ALPHA)
+
     If rCtx.MasterSoftClipEnabled Then
         leftSample = RiffSoftLimitSample(l)
         rightSample = RiffSoftLimitSample(r)
     Else
         leftSample = RiffSanitizeSample(l)
         rightSample = RiffSanitizeSample(r)
+    End If
+
+    ' Count actual post-protection output clips, not raw pre-limiter burst peaks.
+    If Abs(leftSample) >= 1! Or Abs(rightSample) >= 1! Then
+        If rMasterClipCount < 2147483000 Then rMasterClipCount = rMasterClipCount + 1
     End If
 End Sub
 
@@ -7158,6 +9020,15 @@ End Function
 ' */
 Private Sub RiffAdaptiveRaiseForVoiceBurst()
     Dim activeCount As Long
+
+    If rCtx.OverloadProtectionEnabled Then
+        If rCtx.AdaptiveTargetQueueMs < RIFF_QUEUE_SAFE_MS Then
+            rCtx.AdaptiveTargetQueueMs = RIFF_QUEUE_SAFE_MS
+            rCtx.AdaptiveStableTicks = 0
+        End If
+        Exit Sub
+    End If
+
     activeCount = RiffActiveVoiceCount()
     If rVoiceCapacity > 0 And activeCount >= (rVoiceCapacity \ 2) Then
         If rCtx.AdaptiveTargetQueueMs < RIFF_QUEUE_SAFE_MS Then
@@ -7470,6 +9341,8 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
     If Not hasActivePlayback Then
         rCtx.MasterPeakL = rCtx.MasterPeakL * RIFF_MASTER_IDLE_PEAK_DECAY
         rCtx.MasterPeakR = rCtx.MasterPeakR * RIFF_MASTER_IDLE_PEAK_DECAY
+        rMasterRmsL = rMasterRmsL * RIFF_MASTER_IDLE_PEAK_DECAY
+        rMasterRmsR = rMasterRmsR * RIFF_MASTER_IDLE_PEAK_DECAY
 
         If rCtx.AutoSuspendTimer Then
             rCtx.IdleTimerTicks = rCtx.IdleTimerTicks + 1
@@ -7712,8 +9585,14 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     
                     Dim currentVoicePeakL As Single
                     Dim currentVoicePeakR As Single
+                    Dim currentVoiceRmsL As Single
+                    Dim currentVoiceRmsR As Single
+                    Dim currentVoiceFrames As Long
                     currentVoicePeakL = 0!
                     currentVoicePeakR = 0!
+                    currentVoiceRmsL = 0!
+                    currentVoiceRmsR = 0!
+                    currentVoiceFrames = 0
                     rVoices(i).PeakL = rVoices(i).PeakL * RIFF_ACTIVE_PEAK_DECAY
                     rVoices(i).PeakR = rVoices(i).PeakR * RIFF_ACTIVE_PEAK_DECAY
 
@@ -7994,6 +9873,15 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                             
                             If Abs(fL) > currentVoicePeakL Then currentVoicePeakL = Abs(fL)
                             If Abs(fR) > currentVoicePeakR Then currentVoicePeakR = Abs(fR)
+                            currentVoiceRmsL = currentVoiceRmsL + (fL * fL)
+                            currentVoiceRmsR = currentVoiceRmsR + (fR * fR)
+                            currentVoiceFrames = currentVoiceFrames + 1
+                            If Abs(fL) > 1! Or Abs(fR) > 1! Then
+                                If rVoices(i).ClipCount < 2147483000 Then rVoices(i).ClipCount = rVoices(i).ClipCount + 1
+                                If currentVoiceBus >= 0 And currentVoiceBus <= RiffLastBusIndex() Then
+                                    If rBuses(currentVoiceBus).ClipCount < 2147483000 Then rBuses(currentVoiceBus).ClipCount = rBuses(currentVoiceBus).ClipCount + 1
+                                End If
+                            End If
                             
                             rMixArr32(writeIdx) = rMixArr32(writeIdx) + fL
                             rMixArr32(writeIdx + 1) = rMixArr32(writeIdx + 1) + fR
@@ -8009,9 +9897,19 @@ Private Sub RiffTimerCallback(ByVal hWnd As Long, ByVal uMsg As Long, ByVal idEv
                     
                     If currentVoicePeakL > rVoices(i).PeakL Then rVoices(i).PeakL = currentVoicePeakL
                     If currentVoicePeakR > rVoices(i).PeakR Then rVoices(i).PeakR = currentVoicePeakR
+                    If currentVoiceFrames > 0 Then
+                        currentVoiceRmsL = currentVoiceRmsL / CSng(currentVoiceFrames)
+                        currentVoiceRmsR = currentVoiceRmsR / CSng(currentVoiceFrames)
+                        rVoices(i).RmsL = rVoices(i).RmsL + ((currentVoiceRmsL - rVoices(i).RmsL) * RIFF_MASTER_RMS_ALPHA)
+                        rVoices(i).RmsR = rVoices(i).RmsR + ((currentVoiceRmsR - rVoices(i).RmsR) * RIFF_MASTER_RMS_ALPHA)
+                    End If
                     
                     If currentVoicePeakL > rBuses(currentVoiceBus).PeakL Then rBuses(currentVoiceBus).PeakL = currentVoicePeakL
                     If currentVoicePeakR > rBuses(currentVoiceBus).PeakR Then rBuses(currentVoiceBus).PeakR = currentVoicePeakR
+                    If currentVoiceBus >= 0 And currentVoiceBus <= RiffLastBusIndex() Then
+                        rBuses(currentVoiceBus).RmsL = rBuses(currentVoiceBus).RmsL + ((rVoices(i).RmsL - rBuses(currentVoiceBus).RmsL) * RIFF_MASTER_RMS_ALPHA)
+                        rBuses(currentVoiceBus).RmsR = rBuses(currentVoiceBus).RmsR + ((rVoices(i).RmsR - rBuses(currentVoiceBus).RmsR) * RIFF_MASTER_RMS_ALPHA)
+                    End If
                     
                     rVoices(i).Position = pos
                     rVoices(i).TremoloPhase = trmPhase
@@ -8195,8 +10093,14 @@ NextVoice32:
                     
                     Dim cVoicePeakL16 As Single
                     Dim cVoicePeakR16 As Single
+                    Dim cVoiceRmsL16 As Single
+                    Dim cVoiceRmsR16 As Single
+                    Dim cVoiceFrames16 As Long
                     cVoicePeakL16 = 0!
                     cVoicePeakR16 = 0!
+                    cVoiceRmsL16 = 0!
+                    cVoiceRmsR16 = 0!
+                    cVoiceFrames16 = 0
                     rVoices(i).PeakL = rVoices(i).PeakL * RIFF_ACTIVE_PEAK_DECAY
                     rVoices(i).PeakR = rVoices(i).PeakR * RIFF_ACTIVE_PEAK_DECAY
                     
@@ -8466,6 +10370,15 @@ NextVoice32:
                             
                             If Abs(fL) > cVoicePeakL16 Then cVoicePeakL16 = Abs(fL)
                             If Abs(fR) > cVoicePeakR16 Then cVoicePeakR16 = Abs(fR)
+                            cVoiceRmsL16 = cVoiceRmsL16 + (fL * fL)
+                            cVoiceRmsR16 = cVoiceRmsR16 + (fR * fR)
+                            cVoiceFrames16 = cVoiceFrames16 + 1
+                            If Abs(fL) > 1! Or Abs(fR) > 1! Then
+                                If rVoices(i).ClipCount < 2147483000 Then rVoices(i).ClipCount = rVoices(i).ClipCount + 1
+                                If cVoiceBus16 >= 0 And cVoiceBus16 <= RiffLastBusIndex() Then
+                                    If rBuses(cVoiceBus16).ClipCount < 2147483000 Then rBuses(cVoiceBus16).ClipCount = rBuses(cVoiceBus16).ClipCount + 1
+                                End If
+                            End If
                             
                             l1 = CLng(rMixArr16(writeIdx)) + CLng(fL * CSng(RIFF_PCM16_MAX))
                             l2 = CLng(rMixArr16(writeIdx + 1)) + CLng(fR * CSng(RIFF_PCM16_MAX))
@@ -8496,9 +10409,19 @@ NextVoice32:
                     
                     If cVoicePeakL16 > rVoices(i).PeakL Then rVoices(i).PeakL = cVoicePeakL16
                     If cVoicePeakR16 > rVoices(i).PeakR Then rVoices(i).PeakR = cVoicePeakR16
+                    If cVoiceFrames16 > 0 Then
+                        cVoiceRmsL16 = cVoiceRmsL16 / CSng(cVoiceFrames16)
+                        cVoiceRmsR16 = cVoiceRmsR16 / CSng(cVoiceFrames16)
+                        rVoices(i).RmsL = rVoices(i).RmsL + ((cVoiceRmsL16 - rVoices(i).RmsL) * RIFF_MASTER_RMS_ALPHA)
+                        rVoices(i).RmsR = rVoices(i).RmsR + ((cVoiceRmsR16 - rVoices(i).RmsR) * RIFF_MASTER_RMS_ALPHA)
+                    End If
                     
                     If cVoicePeakL16 > rBuses(cVoiceBus16).PeakL Then rBuses(cVoiceBus16).PeakL = cVoicePeakL16
                     If cVoicePeakR16 > rBuses(cVoiceBus16).PeakR Then rBuses(cVoiceBus16).PeakR = cVoicePeakR16
+                    If cVoiceBus16 >= 0 And cVoiceBus16 <= RiffLastBusIndex() Then
+                        rBuses(cVoiceBus16).RmsL = rBuses(cVoiceBus16).RmsL + ((rVoices(i).RmsL - rBuses(cVoiceBus16).RmsL) * RIFF_MASTER_RMS_ALPHA)
+                        rBuses(cVoiceBus16).RmsR = rBuses(cVoiceBus16).RmsR + ((rVoices(i).RmsR - rBuses(cVoiceBus16).RmsR) * RIFF_MASTER_RMS_ALPHA)
+                    End If
                     
                     rVoices(i).Position = pos
                     rVoices(i).TremoloPhase = trmPhase
@@ -8523,6 +10446,7 @@ NextVoice16:
         If currentMasterPeakL > rCtx.MasterPeakL Then rCtx.MasterPeakL = currentMasterPeakL
         If currentMasterPeakR > rCtx.MasterPeakR Then rCtx.MasterPeakR = currentMasterPeakR
         
+        RiffProcessMasterInterleavedPcm16 rMixArr16, sampleCount16
         RtlMoveMemory ByVal pData, VarPtr(rMixArr16(0)), bytesToWrite
     Else
         RtlZeroMemory pData, bytesToWrite
